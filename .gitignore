@@ -39,3 +39,6 @@ credentials
 *.p8
 *.mobileconfig
 clash-speedtest
+docs/*.png
+docs/SCHEME_*.md
+* 2.*

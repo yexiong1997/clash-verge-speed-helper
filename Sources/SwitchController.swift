@@ -74,8 +74,14 @@ public final class ClashController: Sendable {
 
     // Selector groups with at least one direct member matching nodeNames by
     // UTF-8 bytes. Unsafe-to-address names are omitted; order is UTF-8 order.
+    // The legacy Set<String> API cannot distinguish canonically equivalent
+    // spellings. New callers with byte-exact identities must use the array API.
     public func eligibleGroups(nodeNames: Set<String>,
                                completion: @escaping (Result<[ProxyGroup], SwitchFailure>) -> Void) {
+        eligibleGroupsPreservingNodeBytes(nodeNames: Array(nodeNames), completion: completion)
+    }
+    public func eligibleGroupsPreservingNodeBytes(nodeNames: [String],
+                                                   completion: @escaping (Result<[ProxyGroup], SwitchFailure>) -> Void) {
         let callback = MainCompletion(completion)
         queue.async { callback.deliver(self.fetchEligibleGroups(nodeNames: nodeNames)) }
     }
@@ -129,6 +135,173 @@ public final class ClashController: Sendable {
         }
         return String(decoding: result, as: UTF8.self)
     }
+    // Validate the original bytes before Foundation or JSONDecoder can collapse
+    // duplicate keys. Set<String> intentionally uses Swift's Unicode canonical
+    // equivalence, matching the dictionaries used after validation. This small
+    // scanner is standalone because this file is also compiled on its own.
+    private struct StrictJSON {
+        private static let maximumDepth = 64
+        private let bytes: [UInt8]
+        private var index = 0
+
+        private init(_ data: Data) { bytes = Array(data) }
+
+        static func validate(_ data: Data, maximumBytes: Int) -> Bool {
+            guard data.count <= maximumBytes else { return false }
+            var scanner = StrictJSON(data)
+            guard scanner.value(depth: 0) else { return false }
+            scanner.whitespace()
+            return scanner.index == scanner.bytes.count
+        }
+
+        private mutating func whitespace() {
+            while index < bytes.count {
+                switch bytes[index] {
+                case 0x20, 0x09, 0x0a, 0x0d: index += 1
+                default: return
+                }
+            }
+        }
+
+        private mutating func take(_ byte: UInt8) -> Bool {
+            guard index < bytes.count, bytes[index] == byte else { return false }
+            index += 1
+            return true
+        }
+
+        private mutating func value(depth: Int) -> Bool {
+            whitespace()
+            guard index < bytes.count else { return false }
+            switch bytes[index] {
+            case 0x7b: return depth < Self.maximumDepth && object(depth: depth + 1)
+            case 0x5b: return depth < Self.maximumDepth && array(depth: depth + 1)
+            case 0x22: return string() != nil
+            case 0x74: return literal([0x74, 0x72, 0x75, 0x65])
+            case 0x66: return literal([0x66, 0x61, 0x6c, 0x73, 0x65])
+            case 0x6e: return literal([0x6e, 0x75, 0x6c, 0x6c])
+            case 0x2d, 0x30...0x39: return number()
+            default: return false
+            }
+        }
+
+        private mutating func object(depth: Int) -> Bool {
+            index += 1 // {
+            whitespace()
+            if take(0x7d) { return true }
+            var keys = Set<String>()
+            while true {
+                guard let key = string(), keys.insert(key).inserted else { return false }
+                whitespace()
+                guard take(0x3a), value(depth: depth) else { return false }
+                whitespace()
+                if take(0x7d) { return true }
+                guard take(0x2c) else { return false }
+                whitespace()
+            }
+        }
+
+        private mutating func array(depth: Int) -> Bool {
+            index += 1 // [
+            whitespace()
+            if take(0x5d) { return true }
+            while true {
+                guard value(depth: depth) else { return false }
+                whitespace()
+                if take(0x5d) { return true }
+                guard take(0x2c) else { return false }
+            }
+        }
+
+        private mutating func literal(_ expected: [UInt8]) -> Bool {
+            for byte in expected where !take(byte) { return false }
+            return true
+        }
+
+        private mutating func number() -> Bool {
+            _ = take(0x2d)
+            if !take(0x30) {
+                guard index < bytes.count, (0x31...0x39).contains(bytes[index]) else { return false }
+                index += 1
+                digits()
+            }
+            if take(0x2e) {
+                guard digit() else { return false }
+                digits()
+            }
+            if take(0x65) || take(0x45) {
+                if !take(0x2b) { _ = take(0x2d) }
+                guard digit() else { return false }
+                digits()
+            }
+            return true
+        }
+
+        private mutating func digit() -> Bool {
+            guard index < bytes.count, (0x30...0x39).contains(bytes[index]) else { return false }
+            index += 1
+            return true
+        }
+        private mutating func digits() { while digit() {} }
+
+        private mutating func hexQuad() -> UInt32? {
+            var result: UInt32 = 0
+            for _ in 0..<4 {
+                guard index < bytes.count else { return nil }
+                let byte = bytes[index]
+                index += 1
+                let part: UInt32
+                switch byte {
+                case 0x30...0x39: part = UInt32(byte - 0x30)
+                case 0x41...0x46: part = UInt32(byte - 0x41 + 10)
+                case 0x61...0x66: part = UInt32(byte - 0x61 + 10)
+                default: return nil
+                }
+                result = result * 16 + part
+            }
+            return result
+        }
+
+        private mutating func string() -> String? {
+            guard take(0x22) else { return nil }
+            var decoded = [UInt8]()
+            while index < bytes.count {
+                let byte = bytes[index]
+                index += 1
+                switch byte {
+                // Foundation's UTF-8 initializer also strips one leading BOM,
+                // as JSONSerialization can for keys; conservatively reject
+                // those collisions too, before its dictionary is built.
+                case 0x22: return String(bytes: decoded, encoding: .utf8)
+                case 0x00...0x1f: return nil
+                case 0x5c:
+                    guard index < bytes.count else { return nil }
+                    let escape = bytes[index]
+                    index += 1
+                    switch escape {
+                    case 0x22, 0x5c, 0x2f: decoded.append(escape)
+                    case 0x62: decoded.append(0x08)
+                    case 0x66: decoded.append(0x0c)
+                    case 0x6e: decoded.append(0x0a)
+                    case 0x72: decoded.append(0x0d)
+                    case 0x74: decoded.append(0x09)
+                    case 0x75:
+                        guard var code = hexQuad() else { return nil }
+                        if (0xd800...0xdbff).contains(code) {
+                            guard take(0x5c), take(0x75), let low = hexQuad(),
+                                  (0xdc00...0xdfff).contains(low) else { return nil }
+                            code = 0x10000 + ((code - 0xd800) << 10) + low - 0xdc00
+                        } else if (0xdc00...0xdfff).contains(code) { return nil }
+                        guard let scalar = UnicodeScalar(code) else { return nil }
+                        decoded.append(contentsOf: String(scalar).utf8)
+                    default: return nil
+                    }
+                default: decoded.append(byte)
+                }
+            }
+            return nil
+        }
+    }
+
     private struct WireGroup: Decodable { let name: String; let type: String; let now: String; let all: [String] }
     private func fetchGroup(_ name: String) -> Result<ProxyGroup, SwitchFailure> {
         guard validSettings() else { return .failure(.invalidSettings) }
@@ -139,12 +312,13 @@ public final class ClashController: Sendable {
         case .success(let value): response = value
         }
         guard response.status == 200 else { return .failure(.unexpectedHTTPStatus) }
-        guard let parsed = try? JSONDecoder().decode(WireGroup.self, from: response.body),
+        guard StrictJSON.validate(response.body, maximumBytes: Self.maximumResponseBytes),
+              let parsed = try? JSONDecoder().decode(WireGroup.self, from: response.body),
               Self.sameBytes(parsed.name, name) else { return .failure(.invalidResponse) }
         guard Self.sameBytes(parsed.type, "Selector") else { return .failure(.notSelector) }
         return .success(ProxyGroup(name: parsed.name, now: parsed.now, all: parsed.all))
     }
-    private func fetchEligibleGroups(nodeNames: Set<String>) -> Result<[ProxyGroup], SwitchFailure> {
+    private func fetchEligibleGroups(nodeNames: [String]) -> Result<[ProxyGroup], SwitchFailure> {
         guard validSettings() else { return .failure(.invalidSettings) }
         let response: Response
         switch request(method: .get, path: "/proxies", body: nil) {
@@ -152,7 +326,8 @@ public final class ClashController: Sendable {
         case .success(let value): response = value
         }
         guard response.status == 200 else { return .failure(.unexpectedHTTPStatus) }
-        guard let object = try? JSONSerialization.jsonObject(with: response.body),
+        guard StrictJSON.validate(response.body, maximumBytes: Self.maximumResponseBytes),
+              let object = try? JSONSerialization.jsonObject(with: response.body),
               let root = object as? [String: Any], let proxies = root["proxies"] as? [String: Any]
         else { return .failure(.invalidResponse) }
         let wanted = Set(nodeNames.map { Array($0.utf8) })

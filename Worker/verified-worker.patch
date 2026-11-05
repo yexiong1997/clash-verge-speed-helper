@@ -1,0 +1,740 @@
+--- a/speedtester/speedtester.go
++++ b/speedtester/speedtester.go
+@@ -309,7 +309,7 @@
+ type Result struct {
+ 	ProxyName     string         `json:"proxy_name"`
+ 	ProxyType     string         `json:"proxy_type"`
+-	ProxyConfig   map[string]any `json:"proxy_config"`
++	ProxyConfig   map[string]any `json:"-"`
+ 	Latency       time.Duration  `json:"latency"`
+ 	Jitter        time.Duration  `json:"jitter"`
+ 	PacketLoss    float64        `json:"packet_loss"`
+--- /dev/null
++++ b/cmd/verified-worker/main.go
+@@ -0,0 +1,541 @@
++// Verified JSON worker, derived from faceair/clash-speedtest v1.8.6
++// (GPL-3.0); see the accompanying source patch and provenance notice.
++package main
++
++import (
++	"context"
++	"encoding/json"
++	"flag"
++	"io"
++	"math"
++	"net"
++	"net/http"
++	"net/url"
++	"os"
++	"regexp"
++	"strconv"
++	"strings"
++	"sync"
++	"time"
++
++	_ "github.com/faceair/clash-speedtest/cmd/verified-worker/safeinit"
++
++	"github.com/metacubex/mihomo/adapter"
++	"github.com/metacubex/mihomo/constant"
++	mihomolog "github.com/metacubex/mihomo/log"
++	"golang.org/x/sys/unix"
++	"gopkg.in/yaml.v2"
++)
++
++const maxConfigBytes = 32 << 20
++const maxStreams = 128
++
++// This intentionally contains no proxy configuration or raw errors.
++type resultV1 struct {
++	Version                int     `json:"version"`
++	NodeName               string  `json:"node_name"`
++	NodeType               string  `json:"node_type"`
++	HeadAttempts           int     `json:"head_attempts"`
++	HeadSuccesses          int     `json:"head_successes"`
++	LatencyMS              float64 `json:"latency_ms"`
++	JitterMS               float64 `json:"jitter_ms"`
++	ExpectedBytes          int64   `json:"expected_bytes"`
++	ReceivedBytes          int64   `json:"received_bytes"`
++	DownloadComplete       bool    `json:"download_complete"`
++	DownloadBytesPerSecond float64 `json:"download_bytes_per_second"`
++}
++
++type rawConfig struct {
++	Proxies   []map[string]any `yaml:"proxies"`
++	Providers map[string]any   `yaml:"proxy-providers"`
++}
++
++type options struct {
++	config, filter, server string
++	size                   int64
++	streams                int
++	timeout, latency       time.Duration
++	rename, json           bool
++}
++
++func parseOptions() (options, bool) {
++	var o options
++	fs := flag.NewFlagSet("verified-worker", flag.ContinueOnError)
++	fs.SetOutput(io.Discard)
++	fs.StringVar(&o.config, "c", "", "")
++	fs.StringVar(&o.filter, "f", "", "")
++	fs.StringVar(&o.server, "server-url", "", "")
++	fs.Int64Var(&o.size, "download-size", 0, "")
++	fs.IntVar(&o.streams, "concurrent", 0, "")
++	fs.DurationVar(&o.timeout, "timeout", 0, "")
++	fs.DurationVar(&o.latency, "max-latency", 0, "")
++	fs.BoolVar(&o.rename, "rename", true, "")
++	fs.BoolVar(&o.json, "json-v1", false, "")
++	if fs.Parse(os.Args[1:]) != nil || fs.NArg() != 0 || o.config != "/dev/stdin" ||
++		o.filter == "" || o.server == "" || !o.json || o.rename || o.streams < 1 ||
++		o.streams > maxStreams || o.size < int64(o.streams) ||
++		o.size > math.MaxInt64-maxStreams || o.timeout <= 0 || o.latency <= 0 {
++		return o, false
++	}
++	return o, true
++}
++
++// Inherited descriptors are silenced before parsing any private data; only
++// the explicitly constructed result is written to the saved stdout descriptor.
++func resultOutput() (*os.File, bool) {
++	fd, err := unix.Dup(1)
++	if err != nil {
++		return nil, false
++	}
++	result := os.NewFile(uintptr(fd), "result")
++	null, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
++	if err != nil {
++		result.Close()
++		return nil, false
++	}
++	defer null.Close()
++	if unix.Dup2(int(null.Fd()), 1) != nil || unix.Dup2(int(null.Fd()), 2) != nil {
++		result.Close()
++		return nil, false
++	}
++	return result, true
++}
++
++func main() {
++	out, ok := resultOutput()
++	if !ok {
++		os.Exit(1)
++	}
++	defer out.Close()
++	mihomolog.SetLevel(mihomolog.SILENT)
++	if run(out) != 0 {
++		os.Exit(1)
++	}
++}
++
++func run(out io.Writer) (status int) {
++	status = 1
++	defer func() {
++		if recover() != nil {
++			status = 1
++		}
++	}()
++	o, ok := parseOptions()
++	if !ok {
++		return 1
++	}
++	filter, err := regexp.Compile(o.filter)
++	if err != nil {
++		return 1
++	}
++	u, err := url.Parse(o.server)
++	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.Opaque != "" || u.Fragment != "" {
++		return 1
++	}
++	bytes, err := io.ReadAll(io.LimitReader(os.Stdin, maxConfigBytes+1))
++	if err != nil || len(bytes) > maxConfigBytes {
++		return 1
++	}
++	// Reject duplicate mapping keys before permissive struct decoding can hide them.
++	var checked any
++	if yaml.UnmarshalStrict(bytes, &checked) != nil {
++		return 1
++	}
++	var cfg rawConfig
++	if yaml.Unmarshal(bytes, &cfg) != nil || len(cfg.Providers) != 0 {
++		return 1
++	}
++	var selected map[string]any
++	var name string
++	for _, p := range cfg.Proxies {
++		n, valid := p["name"].(string)
++		if !valid || n == "" || !filter.MatchString(n) {
++			continue
++		}
++		if selected != nil {
++			return 1
++		}
++		selected, name = p, n
++	}
++	if selected == nil {
++		return 1
++	}
++	// Reject unsafe nodes before invoking any adapter constructor.
++	p, err := constructValidated(selected, func(node map[string]any) (constant.Proxy, error) {
++		return adapter.ParseProxy(node)
++	})
++	if err != nil {
++		return 1
++	}
++	// Match the upstream speedtester allow-list, rather than groups/providers.
++	switch p.Type() {
++	case constant.Shadowsocks, constant.ShadowsocksR, constant.Snell, constant.Socks5, constant.Http,
++		constant.Vmess, constant.Vless, constant.Trojan, constant.Hysteria, constant.Hysteria2,
++		constant.Tuic, constant.Mieru, constant.AnyTLS, constant.Sudoku:
++	default:
++		return 1
++	}
++	chunk := o.size / int64(o.streams)
++	target := o.server
++	// Preserve upstream's download-server base URL mode.
++	if strings.Trim(u.Path, "/") == "" && u.RawQuery == "" {
++		target = strings.TrimRight(o.server, "/") + "/__down?bytes=" + strconv.FormatInt(chunk, 10)
++	}
++	res := resultV1{Version: 1, NodeName: name, NodeType: p.Type().String(),
++		HeadAttempts: 6, ExpectedBytes: chunk * int64(o.streams)}
++	latencies := testHeads(p, target, o.latency)
++	res.HeadSuccesses = len(latencies)
++	if len(latencies) > 0 {
++		var sum float64
++		for _, d := range latencies {
++			sum += float64(d) / float64(time.Millisecond)
++		}
++		res.LatencyMS = sum / float64(len(latencies))
++		var variance float64
++		for _, d := range latencies {
++			diff := float64(d)/float64(time.Millisecond) - res.LatencyMS
++			variance += diff * diff
++		}
++		res.JitterMS = math.Sqrt(variance / float64(len(latencies)))
++	}
++	results := make(chan transfer, o.streams)
++	var wg sync.WaitGroup
++	started := time.Now()
++	for i := 0; i < o.streams; i++ {
++		wg.Add(1)
++		go func() {
++			v := transfer{}
++			defer func() {
++				if recover() != nil {
++					v.ok = false
++				}
++				results <- v
++				wg.Done()
++			}()
++			v = download(p, target, chunk, o.timeout)
++		}()
++	}
++	wg.Wait()
++	elapsed := time.Since(started).Seconds()
++	close(results)
++	res.DownloadComplete = true
++	for v := range results {
++		res.ReceivedBytes += v.bytes
++		if !v.ok {
++			res.DownloadComplete = false
++		}
++	}
++	if res.DownloadComplete && elapsed > 0 {
++		res.DownloadBytesPerSecond = float64(res.ReceivedBytes) / elapsed
++	} else {
++		res.DownloadComplete = false
++		res.DownloadBytesPerSecond = 0
++	}
++	if json.NewEncoder(out).Encode(res) != nil {
++		return 1
++	}
++	return 0
++}
++
++// constructValidated is the single gate to active adapter construction.
++// Keeping the constructor injectable allows tests to assert it was not called.
++func constructValidated(node map[string]any, construct func(map[string]any) (constant.Proxy, error)) (constant.Proxy, error) {
++	if !validEndpoints(node) {
++		return nil, io.ErrUnexpectedEOF
++	}
++	return construct(node)
++}
++
++// Mihomo weakly decodes ports and can cast Hysteria2 values to
++// uint16. Validate all supported endpoint forms before adapter construction.
++// Case folding and underscore replacement match mihomo's structure decoder.
++func endpointKey(key, name string) bool {
++	return strings.EqualFold(strings.ReplaceAll(key, "_", "-"), name)
++}
++
++func field(m map[string]any, name string) (any, bool, bool) {
++	var value any
++	found := false
++	for key, v := range m {
++		if endpointKey(key, name) {
++			if found {
++				return nil, false, false
++			}
++			value, found = v, true
++		}
++	}
++	return value, found, true
++}
++
++func endpointLike(key string) bool {
++	for _, name := range []string{"port", "ports", "port-range", "peers", "endpoint", "endpoints", "server-port", "server-ports"} {
++		if endpointKey(key, name) {
++			return true
++		}
++	}
++	return false
++}
++
++func stringMap(value any) (map[string]any, bool) {
++	switch m := value.(type) {
++	case map[string]any:
++		return m, true
++	case map[any]any:
++		result := make(map[string]any, len(m))
++		for key, v := range m {
++			k, ok := key.(string)
++			if !ok {
++				return nil, false
++			}
++			result[k] = v
++		}
++		return result, true
++	default:
++		return nil, false
++	}
++}
++
++// No other nested endpoint forms are accepted, including maps inside arrays.
++func noNestedEndpoints(value any) bool {
++	switch v := value.(type) {
++	case []any:
++		for _, child := range v {
++			if !noNestedEndpoints(child) {
++				return false
++			}
++		}
++	case map[string]any, map[any]any:
++		m, ok := stringMap(v)
++		if !ok {
++			return false
++		}
++		for key, child := range m {
++			if endpointLike(key) || !noNestedEndpoints(child) {
++				return false
++			}
++		}
++	}
++	return true
++}
++
++func validPort(value any) bool {
++	switch v := value.(type) {
++	case int:
++		return v > 0 && v <= 65535
++	case int64:
++		return v > 0 && v <= 65535
++	case uint64:
++		return v > 0 && v <= 65535
++	default:
++		return false
++	}
++}
++
++func decimalPort(text string) (uint64, bool) {
++	if text == "" {
++		return 0, false
++	}
++	for _, c := range text {
++		if c < '0' || c > '9' {
++			return 0, false
++		}
++	}
++	n, err := strconv.ParseUint(text, 10, 16)
++	return n, err == nil && n > 0
++}
++
++func rangeSegment(segment string, requireRange bool) bool {
++	parts := strings.Split(segment, "-")
++	if len(parts) > 2 || (requireRange && len(parts) != 2) {
++		return false
++	}
++	start, ok := decimalPort(parts[0])
++	if !ok {
++		return false
++	}
++	if len(parts) == 2 {
++		end, ok := decimalPort(parts[1])
++		return ok && start <= end
++	}
++	return true
++}
++
++// Hysteria's ports field is text syntax, never a coercible numeric scalar.
++// Hysteria2 additionally understands / separators; cap both at 28 segments.
++func validPortList(value any, hy2 bool) bool {
++	text, ok := value.(string)
++	if !ok || !strings.ContainsAny(text, ",/-") || (!hy2 && strings.Contains(text, "/")) {
++		return false
++	}
++	segments := strings.Split(strings.ReplaceAll(text, "/", ","), ",")
++	if len(segments) > 28 {
++		return false
++	}
++	for _, segment := range segments {
++		if !rangeSegment(segment, false) {
++			return false
++		}
++	}
++	return true
++}
++
++func validEndpoints(node map[string]any) bool {
++	typ, ok := node["type"].(string)
++	if !ok {
++		return false
++	}
++	switch typ {
++	case "ss", "ssr", "snell", "socks5", "http", "vmess", "vless", "trojan", "hysteria", "hysteria2", "tuic", "mieru", "anytls", "sudoku":
++	default:
++		return false
++	}
++	server, hasServer, serverUnique := field(node, "server")
++	port, hasPort, portUnique := field(node, "port")
++	ports, hasPorts, portsUnique := field(node, "ports")
++	portRange, hasRange, rangeUnique := field(node, "port-range")
++	_, hasPeers, peersUnique := field(node, "peers")
++	if !serverUnique || !portUnique || !portsUnique || !rangeUnique || !peersUnique {
++		return false
++	}
++	if hasServer {
++		host, ok := server.(string)
++		if !ok || host == "" {
++			return false
++		}
++	}
++	if hasPort && !validPort(port) {
++		return false
++	}
++	if hasPorts && ((typ != "hysteria" && typ != "hysteria2") || !validPortList(ports, typ == "hysteria2")) {
++		return false
++	}
++	if hasRange {
++		text, ok := portRange.(string)
++		if typ != "mieru" || !ok || !rangeSegment(text, true) {
++			return false
++		}
++	}
++	if hasPeers {
++		return false
++	}
++	for key, child := range node {
++		// Mihomo concatenates HTTP CONNECT custom headers without validating
++		// framing. Reject the field entirely, including all decoder aliases,
++		// regardless of its value or whether it is empty.
++		if typ == "http" && endpointKey(key, "headers") {
++			return false
++		}
++		if endpointLike(key) && !endpointKey(key, "port") && !endpointKey(key, "ports") && !endpointKey(key, "port-range") {
++			return false
++		}
++		if !noNestedEndpoints(child) {
++			return false
++		}
++	}
++	if !hasServer {
++		return false
++	}
++	switch typ {
++	case "hysteria", "hysteria2":
++		return hasPort || hasPorts
++	case "mieru":
++		return hasPort != hasRange
++	default:
++		return hasPort
++	}
++}
++
++// Same dial model as upstream's speedtester.createClient; never consult the
++// environment's HTTP proxy, never follow redirects, and never decompress.
++func clientFor(p constant.Proxy, timeout time.Duration) *http.Client {
++	tr := &http.Transport{
++		DisableCompression: true,
++		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
++			host, port, err := net.SplitHostPort(addr)
++			if err != nil {
++				return nil, err
++			}
++			n, err := strconv.ParseUint(port, 10, 16)
++			if err != nil || n == 0 {
++				return nil, io.ErrUnexpectedEOF
++			}
++			return p.DialContext(ctx, &constant.Metadata{Host: host, DstPort: uint16(n)})
++		},
++	}
++	return &http.Client{Timeout: timeout, Transport: tr,
++		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
++}
++
++func testHeads(p constant.Proxy, target string, timeout time.Duration) []time.Duration {
++	c := clientFor(p, timeout)
++	defer c.CloseIdleConnections()
++	latencies := make([]time.Duration, 0, 6)
++	for i := 0; i < 6; i++ {
++		req, err := http.NewRequest(http.MethodHead, target, nil)
++		if err != nil {
++			continue
++		}
++		start := time.Now()
++		resp, err := c.Do(req)
++		if err != nil {
++			continue
++		}
++		resp.Body.Close()
++		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
++			latencies = append(latencies, time.Since(start))
++		}
++	}
++	return latencies
++}
++
++type transfer struct {
++	bytes int64
++	ok    bool
++}
++
++var contentRange = regexp.MustCompile(`(?i)^bytes ([0-9]+)-([0-9]+)/([0-9]+|\*)$`)
++
++func validRange(header http.Header, size int64) bool {
++	values := header.Values("Content-Range")
++	if len(values) != 1 {
++		return false
++	}
++	fields := contentRange.FindStringSubmatch(values[0])
++	if fields == nil {
++		return false
++	}
++	first, e1 := strconv.ParseInt(fields[1], 10, 64)
++	last, e2 := strconv.ParseInt(fields[2], 10, 64)
++	if e1 != nil || e2 != nil || first != 0 || last != size-1 {
++		return false
++	}
++	if fields[3] == "*" {
++		return true
++	}
++	total, err := strconv.ParseInt(fields[3], 10, 64)
++	return err == nil && total > last
++}
++
++func download(p constant.Proxy, target string, size int64, timeout time.Duration) transfer {
++	c := clientFor(p, timeout)
++	defer c.CloseIdleConnections()
++	req, err := http.NewRequest(http.MethodGet, target, nil)
++	if err != nil {
++		return transfer{}
++	}
++	req.Header.Set("Range", "bytes=0-"+strconv.FormatInt(size-1, 10))
++	req.Header.Set("Accept-Encoding", "identity")
++	resp, err := c.Do(req)
++	if err != nil {
++		return transfer{}
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode < 200 || resp.StatusCode >= 300 ||
++		(resp.StatusCode == http.StatusPartialContent && !validRange(resp.Header, size)) {
++		return transfer{}
++	}
++	// size+1 distinguishes a genuine EOF at exactly size from excess data.
++	r := &io.LimitedReader{R: resp.Body, N: size + 1}
++	n, readErr := io.Copy(io.Discard, r)
++	return transfer{bytes: n, ok: readErr == nil && n == size && r.N > 0}
++}
+--- /dev/null
++++ b/cmd/verified-worker/safeinit/safeinit.go
+@@ -0,0 +1,15 @@
++// Package safeinit runs before the mihomo packages in Go's package-init order.
++// A non-directory home prevents mihomo's path initializer from even stat'ing
++// an existing user's ~/.config/mihomo. No user settings are changed on disk.
++package safeinit
++
++import "os"
++
++func init() {
++	for _, key := range []string{"HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME"} {
++		_ = os.Setenv(key, os.DevNull)
++	}
++	for _, key := range []string{"SAFE_PATHS", "SKIP_SAFE_PATH_CHECK", "SSL_CERT_FILE", "SSL_CERT_DIR"} {
++		_ = os.Unsetenv(key)
++	}
++}
+--- /dev/null
++++ b/cmd/verified-worker/endpoint_test.go
+@@ -0,0 +1,164 @@
++package main
++
++import (
++	"errors"
++	"net"
++	"strings"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/metacubex/mihomo/constant"
++)
++
++func testPeer(port any) map[string]any   { return map[string]any{"server": "localhost", "port": port} }
++func testWG(peers ...any) map[string]any { return map[string]any{"type": "wireguard", "peers": peers} }
++func testHy(kind string, ports any) map[string]any {
++	return map[string]any{"type": kind, "server": "localhost", "ports": ports}
++}
++func testMieru(r any) map[string]any {
++	return map[string]any{"type": "mieru", "server": "localhost", "port-range": r}
++}
++
++// Run this test binary only under a deny-network sandbox. Verify policy by
++// observing permission failures, not ordinary connection-refused errors.
++func TestEndpointNetworkDenied(t *testing.T) {
++	forbidden := func(err error) bool { return errors.Is(err, syscall.EACCES) || errors.Is(err, syscall.EPERM) }
++	c, err := net.DialTimeout("tcp", "127.0.0.1:1", time.Second)
++	if c != nil {
++		c.Close()
++	}
++	if !forbidden(err) {
++		t.Fatal("TCP deny canary did not return a permission error")
++	}
++	u, err := net.DialTimeout("udp", "127.0.0.1:1", time.Second)
++	if err == nil {
++		_, err = u.Write([]byte{0})
++		u.Close()
++	}
++	if !forbidden(err) {
++		t.Fatal("UDP deny canary did not return a permission error")
++	}
++}
++
++func TestEndpointPorts(t *testing.T) {
++	valid := []struct {
++		name string
++		node map[string]any
++	}{
++		{"h1-low", testHy("hysteria", "1-1")},
++		{"h1-high", testHy("hysteria", "65535-65535")},
++		{"h1-list", testHy("hysteria", "1,65535")},
++		{"h2-low", testHy("hysteria2", "1-1")},
++		{"h2-high", testHy("hysteria2", "65535-65535")},
++		{"h2-slash", testHy("hysteria2", "1/65535")},
++		{"h2-28", testHy("hysteria2", strings.TrimSuffix(strings.Repeat("1,", 28), ","))},
++		{"mieru-low", testMieru("1-1")},
++		{"mieru-high", testMieru("65535-65535")},
++		{"vless-low", map[string]any{"type": "vless", "server": "localhost", "port": 1}},
++		{"ss-high", map[string]any{"type": "ss", "server": "localhost", "port": 65535}},
++		{"folded-h2", map[string]any{"type": "hysteria2", "server": "localhost", "portſ": "1-2"}},
++	}
++	for _, tc := range valid {
++		t.Run(tc.name, func(t *testing.T) {
++			if !validEndpoints(tc.node) {
++				t.Fatal("valid endpoint rejected")
++			}
++		})
++	}
++	invalid := []struct {
++		name string
++		node map[string]any
++	}{
++		{"wg-peer-low-disabled", testWG(testPeer(1))},
++		{"wg-peer-high-disabled", testWG(testPeer(65535))},
++		{"wg-multiple-disabled", testWG(testPeer(1), testPeer(65535))},
++		{"wg-root-disabled", map[string]any{"type": "wireguard", "server": "localhost", "port": 1}},
++		{"wg-both-disabled", map[string]any{"type": "wireguard", "server": "localhost", "port": 1, "peers": []any{testPeer(65535)}}},
++		{"wg-negative", testWG(testPeer(-1))},
++		{"wg-zero", testWG(testPeer(0))},
++		{"wg-overflow", testWG(testPeer(65536))},
++		{"wg-wrap", testWG(testPeer(65537))},
++		{"wg-max-uint", testWG(testPeer(^uint64(0)))},
++		{"wg-string", testWG(testPeer("1"))},
++		{"wg-float", testWG(testPeer(1.0))},
++		{"wg-bool", testWG(testPeer(true))},
++		{"wg-null", testWG(testPeer(nil))},
++		{"wg-second", testWG(testPeer(1), testPeer(65537))},
++		{"wg-first", testWG(testPeer(-1), testPeer(1))},
++		{"wg-empty", testWG()},
++		{"wg-nested", testWG([]any{testPeer(1)})},
++		{"wg-peer-missing", testWG(map[string]any{"server": "localhost"})},
++		{"wg-peer-alias", testWG(map[string]any{"server": "localhost", "port": 1, "PORT": 65537})},
++		{"wg-peer-extra", testWG(map[string]any{"server": "localhost", "port": 1, "opts": []any{map[string]any{"port": -1}}})},
++		{"wg-peer-unicode-alias", map[string]any{"type": "wireguard", "peers": []any{testPeer(1)}, "peerſ": []any{testPeer(65537)}}},
++		{"wg-root-with-peer", map[string]any{"type": "wireguard", "server": "localhost", "port": 65537, "peers": []any{testPeer(1)}}},
++		{"wg-dns", map[string]any{"type": "wireguard", "dns": []any{"localhost"}, "peers": []any{testPeer(1)}}},
++		{"h1-zero", testHy("hysteria", "0-1")},
++		{"h1-reversed", testHy("hysteria", "2-1")},
++		{"h1-slash", testHy("hysteria", "1/2")},
++		{"h1-overflow", testHy("hysteria", "1-65536")},
++		{"h2-wrap", testHy("hysteria2", "1-65537")},
++		{"h2-wrapped-list", testHy("hysteria2", "1,65537")},
++		{"h2-slash-wrap", testHy("hysteria2", "1/65537")},
++		{"h2-29", testHy("hysteria2", strings.TrimSuffix(strings.Repeat("1,", 29), ","))},
++		{"h2-bare-number", testHy("hysteria2", "1")},
++		{"h2-quoted-suffix", testHy("hysteria2", "1-2junk")},
++		{"h2-unicode-wrap", map[string]any{"type": "hysteria2", "server": "localhost", "portſ": "1,65537"}},
++		{"h2-unicode-duplicate", map[string]any{"type": "hysteria2", "server": "localhost", "ports": "1-2", "portſ": "1-2"}},
++		{"mieru-zero", testMieru("0-1")},
++		{"mieru-overflow", testMieru("1-65536")},
++		{"mieru-wrap", testMieru("1-65537")},
++		{"mieru-suffix", testMieru("1-2x")},
++		{"nested-array", map[string]any{"type": "vless", "server": "localhost", "port": 1, "extra": []any{[]any{map[string]any{"port": 65537}}}}},
++	}
++	for _, tc := range invalid {
++		t.Run(tc.name, func(t *testing.T) {
++			if validEndpoints(tc.node) {
++				t.Fatal("invalid endpoint accepted")
++			}
++		})
++	}
++}
++
++// Assert the real entry-point gate prevents construction, not merely that a
++// no-gVisor build or a denied network connection eventually fails.
++func TestAdapterConstructionPreflight(t *testing.T) {
++	cases := []struct {
++		name string
++		node map[string]any
++		allow bool
++	}{
++		{"ssh-password", map[string]any{"type": "ssh", "server": "localhost", "port": 22, "password": "fixture"}, false},
++		{"ssh-inline-key", map[string]any{"type": "ssh", "server": "localhost", "port": 22, "private-key": "PRIVATE KEY"}, false},
++		{"wg-peer", testWG(testPeer(1)), false},
++		{"wg-workers", map[string]any{"type": "wireguard", "server": "localhost", "port": 1, "workers": 1000000000}, false},
++		{"http-injected-name", map[string]any{"type": "http", "server": "localhost", "port": 1, "headers": map[string]any{"X\r\nBad": "x"}}, false},
++		{"http-injected-value", map[string]any{"type": "http", "server": "localhost", "port": 1, "HEADERS": map[string]any{"X": "x\r\nBad: y"}}, false},
++		{"http-unicode-alias", map[string]any{"type": "http", "server": "localhost", "port": 1, "headerſ": map[string]any{"X": "x"}}, false},
++		{"http-empty", map[string]any{"type": "http", "server": "localhost", "port": 1, "headers": map[string]any{}}, false},
++		{"http-null", map[string]any{"type": "http", "server": "localhost", "port": 1, "headers": nil}, false},
++		{"http-weak-value", map[string]any{"type": "http", "server": "localhost", "port": 1, "headers": map[string]any{"X": 1}}, false},
++		{"http-safe-no-headers", map[string]any{"type": "http", "server": "localhost", "port": 1}, true},
++		{"vless", map[string]any{"type": "vless", "server": "localhost", "port": 1}, true},
++		{"ss", map[string]any{"type": "ss", "server": "localhost", "port": 1}, true},
++		{"hysteria2", testHy("hysteria2", "1-2"), true},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			calls := 0
++			marker := errors.New("constructor was called")
++			_, err := constructValidated(tc.node, func(map[string]any) (constant.Proxy, error) {
++				calls++
++				return nil, marker
++			})
++			if tc.allow {
++				if calls != 1 || !errors.Is(err, marker) {
++					t.Fatal("valid node did not reach constructor exactly once")
++				}
++			} else if calls != 0 || err == nil {
++				t.Fatal("unsafe node reached adapter construction")
++			}
++		})
++	}
++}
