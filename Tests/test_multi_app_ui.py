@@ -132,6 +132,53 @@ private func fixtureRows(_ rows: [MultiRow]) -> [[String: Any]] {
             } else {
                 out = ["ok": false]
             }
+        case "filterSortFunnel":
+            let batch = fixtureBatch()
+            var rows = multiPreviewRows(batch)
+            // Populate measurements with varying speeds/latencies/states
+            for i in rows.indices {
+                if i % 3 == 0 {
+                    let speed = Double(max(1, 10 - i)) * 1_048_576
+                    let latency = Double(30 + i * 10)
+                    let m = VerifiedMeasurement(
+                        nodeName: rows[i].nodeName,
+                        nodeType: "fixture",
+                        headAttempts: 6,
+                        headSuccesses: 6,
+                        latencyMilliseconds: latency,
+                        jitterMilliseconds: 2.0,
+                        expectedBytes: 262_144,
+                        receivedBytes: 262_144,
+                        downloadComplete: true,
+                        downloadBytesPerSecond: speed
+                    )
+                    rows[i].measurement = m
+                    rows[i].state = "有效"
+                } else if i % 3 == 1 {
+                    rows[i].state = "等待"
+                } else {
+                    rows[i].state = "无效"
+                }
+            }
+            let activeSet: Set<MultiIdentity> = Set(rows.enumerated().compactMap { $0.offset % 3 == 1 ? $0.element.identity : nil })
+            let validIndices = multiVisibleRows(rows, query: "", statusFilter: .validOnly, activeIdentities: activeSet).map { rows[$0].index }
+            let testingIndices = multiVisibleRows(rows, query: "", statusFilter: .testingOnly, activeIdentities: activeSet).map { rows[$0].index }
+            let failedIndices = multiVisibleRows(rows, query: "", statusFilter: .failedOnly, activeIdentities: activeSet).map { rows[$0].index }
+            let sortedLatencyAsc = multiVisibleRows(rows, query: "", statusFilter: .validOnly, activeIdentities: activeSet,
+                                                    sortColumn: "latency", sortAscending: true).map { rows[$0].index }
+            let sortedLatencyDesc = multiVisibleRows(rows, query: "", statusFilter: .validOnly, activeIdentities: activeSet,
+                                                     sortColumn: "latency", sortAscending: false).map { rows[$0].index }
+            let ranked = multiRank(rows)
+            let promoted = multiFunnelPromotedIdentities(rows: ranked, runIdentities: Set(rows.map(\.identity)), topCount: 2)
+            let promotedIndices = ranked.filter { promoted.contains($0.identity) }.map(\.index)
+            out = [
+                "valid": validIndices,
+                "testing": testingIndices,
+                "failed": failedIndices,
+                "latencyAsc": sortedLatencyAsc,
+                "latencyDesc": sortedLatencyDesc,
+                "promoted": promotedIndices
+            ]
         case "inspect":
             let data = (input["yaml"] as! String).data(using: .utf8)!
             if let names = try? multiInspectNodes(data) { out = ["ok": true, "names": names] }
@@ -803,6 +850,15 @@ class MultiAppHeadlessTests(unittest.TestCase):
             self.assertFalse(self.run_driver({"action": "topN", "order": order, "count": invalid})["ok"])
         self.assertFalse(self.run_driver({"action": "topN", "order": order, "query": "no-such-node", "count": 3})["ok"])
         self.assertFalse(self.run_driver({"action": "topN", "order": order, "visible": [0, 99], "count": 2})["ok"])
+
+    def test_status_filter_column_sorting_and_funnel_promotion(self):
+        out = self.run_driver({"action": "filterSortFunnel"})
+        self.assertEqual(out["valid"], [0, 3, 6])
+        self.assertEqual(out["testing"], [1, 4, 7])
+        self.assertEqual(out["failed"], [2, 5])
+        self.assertEqual(out["latencyAsc"], [0, 3, 6])
+        self.assertEqual(out["latencyDesc"], [6, 3, 0])
+        self.assertEqual(out["promoted"], [0, 3])
 
 
 if __name__ == "__main__":

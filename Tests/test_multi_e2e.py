@@ -212,6 +212,8 @@ private extension MultiAppDelegate {
               modePopup.indexOfSelectedItem == 0, sizeValues[sizePopup.indexOfSelectedItem] == 3 * 1_048_576,
               chosenOptions().map({ $0.0.streams == 2 && $0.1 == 10 }) == true, autoSwitch.state == .off,
               startButton.action == #selector(startManual(_:)), loadTestButton.action == #selector(startLoadTest(_:)),
+              funnelButton.action == #selector(startFunnelTest(_:)), undoSwitchButton.action == #selector(undoLastSwitch(_:)),
+              champQuickSwitchButton.action == #selector(switchChampionRoute(_:)), champRetestButton.action == #selector(retestChampionRoute(_:)),
               switchResultButton.action == #selector(switchSelectedResult(_:)), scheduleButton.action == #selector(toggleSchedule(_:)),
               refreshGroupsButton.action == #selector(refreshGroups(_:)), groupPopup.action == #selector(groupChanged(_:))
         else { return fail("startup-controls") }
@@ -254,7 +256,11 @@ private extension MultiAppDelegate {
             guard click(selectTopNButton, #selector(selectTopNNodes(_:))),
                   nodeSelection?.count == 3,
                   visibleRows.count >= 3,
-                  nodeSelection == Set(visibleRows.prefix(3).map { rows[$0].identity })
+                  nodeSelection == Set(visibleRows.prefix(3).map { rows[$0].identity }),
+                  click(filterValidButton, #selector(statusFilterChanged(_:))),
+                  visibleRows.isEmpty,
+                  click(filterAllButton, #selector(statusFilterChanged(_:))),
+                  visibleRows.count == rows.count
             else { return fail("select-top-n") }
             return finish()
         }
