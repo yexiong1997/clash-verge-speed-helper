@@ -2,8 +2,9 @@ import AppKit
 import Foundation
 import Darwin
 
-// This executable is separate from main.swift. It never changes profiles or
-// writes config files; controller selection is strictly opt-in and guarded.
+// This executable is separate from main.swift. It never writes profile files;
+// an explicitly requested cross-profile change goes through the runtime
+// injector, while controller selection remains opt-in and guarded.
 
 enum MultiUIError: Error {
     case invalidProfile, staleProfile, budget, unavailable
@@ -601,6 +602,75 @@ func multiUniqueController(paths: [String]) -> MultiControllerIdentity? {
     return candidates.count == 1 ? candidates[0] : nil
 }
 
+// A socket file can outlive the core that created it. Probe the local
+// controller itself before selecting an identity so a stale generated config
+// socket cannot make the live Verge service socket look ambiguous. This is a
+// bounded, read-only request and stops after the HTTP headers are complete.
+private func multiControllerResponds(path: String) -> Bool {
+    let bytes = Array(path.utf8)
+    var address = sockaddr_un()
+    let pathCapacity = MemoryLayout.size(ofValue: address.sun_path)
+    guard !bytes.isEmpty, bytes.count + 1 < pathCapacity else { return false }
+    address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+    address.sun_family = sa_family_t(AF_UNIX)
+    withUnsafeMutableBytes(of: &address.sun_path) { raw in
+        raw.initializeMemory(as: UInt8.self, repeating: 0)
+        raw.copyBytes(from: bytes)
+    }
+
+    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    guard fd >= 0 else { return false }
+    defer { close(fd) }
+    var timeout = timeval(tv_sec: 1, tv_usec: 0)
+    guard setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout,
+                     socklen_t(MemoryLayout<timeval>.size)) == 0,
+          setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                     socklen_t(MemoryLayout<timeval>.size)) == 0 else { return false }
+    var noSignal: Int32 = 1
+    _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSignal,
+                   socklen_t(MemoryLayout<Int32>.size))
+    let connected = withUnsafePointer(to: &address) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+        }
+    }
+    guard connected == 0 else { return false }
+
+    let request = Array("GET /proxies HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".utf8)
+    var sent = 0
+    while sent < request.count {
+        let count = request.withUnsafeBytes { raw -> Int in
+            guard let base = raw.baseAddress else { return -1 }
+            return Darwin.send(fd, base.advanced(by: sent), request.count - sent, 0)
+        }
+        if count > 0 { sent += count; continue }
+        if count < 0 && errno == EINTR { continue }
+        return false
+    }
+
+    var response = Data()
+    var buffer = [UInt8](repeating: 0, count: 16 * 1024)
+    let separator = Data([13, 10, 13, 10])
+    while response.count <= 256 * 1024 {
+        let count = buffer.withUnsafeMutableBytes {
+            Darwin.recv(fd, $0.baseAddress, $0.count, 0)
+        }
+        if count > 0 {
+            response.append(contentsOf: buffer[0..<count])
+            guard let end = response.range(of: separator) else { continue }
+            let header = response[..<end.lowerBound]
+            guard let text = String(data: header, encoding: .utf8),
+                  let first = text.split(separator: "\r\n", omittingEmptySubsequences: false).first
+            else { return false }
+            let fields = first.split(separator: " ", omittingEmptySubsequences: true)
+            return fields.count >= 2 && fields[1] == "200"
+        }
+        if count < 0 && errno == EINTR { continue }
+        return false
+    }
+    return false
+}
+
 // Return the generated Unix socket only. The config is opened no-follow and
 // bounded; Ruby sees the bytes on stdin, emits no other config, and has a
 // watchdog. An unreadable/ambiguous config fails closed, rather than hiding a
@@ -649,7 +719,7 @@ begin
     end
     nodes.concat(n.children) if n.respond_to?(:children) && n.children
   end
-  value = YAML.safe_load(stream.to_yaml, [], [], false)
+  value = YAML.safe_load(stream.to_yaml, [Symbol], [], false)
   raise unless value.is_a?(Hash)
   socket = value['external-controller-unix']
   raise unless socket.nil? || socket.is_a?(String)
@@ -687,8 +757,34 @@ func multiLocalController(root: URL) -> MultiControllerIdentity? {
     do {
         var paths = ["/var/run/clash-verge-service/users/\(geteuid())/verge-mihomo.sock"]
         if let configured = try multiConfiguredSocket(root: root) { paths.append(configured) }
-        return multiUniqueController(paths: paths)
+        // The service path is deliberately first. A stale config socket may
+        // still pass lstat(), so only a live read-only controller response can
+        // make a path eligible; if both respond, keep the service identity.
+        for path in paths {
+            guard let identity = multiUniqueController(paths: [path]),
+                  multiControllerResponds(path: identity.path) else { continue }
+            return identity
+        }
+        return nil
     } catch { return nil }
+}
+
+// Clash Verge may create its service socket shortly after the window appears.
+// A single discovery attempt turns that normal startup race into a persistent
+// error in the footer. Keep the bounded retry off the main thread and return
+// the first live, same-user controller identity; callers still fail closed
+// when the controller never becomes available.
+func multiWaitForLocalController(root: URL, attempts: Int = 12,
+                                 delay: TimeInterval = 0.25) -> MultiControllerIdentity? {
+    let boundedAttempts = max(1, min(attempts, 40))
+    let boundedDelay = max(0, min(delay, 2))
+    for index in 0..<boundedAttempts {
+        if let identity = multiLocalController(root: root) { return identity }
+        if index + 1 < boundedAttempts, boundedDelay > 0 {
+            Thread.sleep(forTimeInterval: boundedDelay)
+        }
+    }
+    return nil
 }
 
 // These helpers are pure so canonical-equivalent but byte-distinct names and
@@ -945,6 +1041,10 @@ private func multiHexColor(_ hex: UInt32, alpha: CGFloat = 1.0) -> NSColor {
     return NSColor(srgbRed: r, green: g, blue: b, alpha: alpha)
 }
 
+private func multiIsDarkAppearance(_ appearance: NSAppearance) -> Bool {
+    appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+}
+
 enum MultiClearGlassStyle {
     case clearPrimary
     case clearSecondary
@@ -960,7 +1060,12 @@ final class MultiClearAmbientCanvas: NSView {
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         let b = bounds
-        let baseGrad = NSGradient(colors: [
+        let dark = multiIsDarkAppearance(effectiveAppearance)
+        let baseGrad = NSGradient(colors: dark ? [
+            multiHexColor(0x111722),
+            multiHexColor(0x172131),
+            multiHexColor(0x202C3D)
+        ] : [
             multiHexColor(0xF5F7FB),
             multiHexColor(0xEEF2F9),
             multiHexColor(0xE6ECF7)
@@ -1007,6 +1112,7 @@ final class MultiClearFrostedSurface: NSView {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
         let b = bounds
         guard b.width > 2, b.height > 2 else { return }
+        let dark = multiIsDarkAppearance(effectiveAppearance)
         let r = isCapsule ? (b.height / 2.0) : cornerRadius
 
         ctx.saveGState()
@@ -1104,6 +1210,12 @@ final class MultiClearFrostedSurface: NSView {
                 multiHexColor(0x059669, alpha: 0.12)
             ])
             frostGrad?.draw(in: mainRect, angle: 90)
+        }
+        if dark {
+            // The content layer must stay dark in Dark Mode; otherwise the
+            // semantic light labels used by NSTableView become unreadable.
+            multiHexColor(0x111827, alpha: 0.68).setFill()
+            mainPath.fill()
         }
         ctx.restoreGState()
 
@@ -1252,7 +1364,10 @@ final class MultiClearGlassButton: NSButton {
         }
 
         let r = b.height / 2.0
-        let alphaFactor: CGFloat = isEnabled ? 1.0 : 0.46
+        let dark = multiIsDarkAppearance(effectiveAppearance)
+        // Disabled controls should recede, but remain readable against the
+        // pale glass surface. 0.46 made labels effectively disappear.
+        let alphaFactor: CGFloat = isEnabled ? 1.0 : 0.72
         let hoverBoost: CGFloat = (isHovered && isEnabled) ? 0.14 : 0.0
 
         let mainRect = b.insetBy(dx: 1.0, dy: 1.0)
@@ -1292,6 +1407,10 @@ final class MultiClearGlassButton: NSButton {
                 multiHexColor(0xFFFFFF, alpha: 0.14 * alphaFactor)
             ])
             frostGrad?.draw(in: mainRect, angle: 90)
+        }
+        if dark {
+            multiHexColor(0x111827, alpha: 0.72).setFill()
+            mainPath.fill()
         }
 
         if progressFraction > 0.005 {
@@ -1344,15 +1463,15 @@ final class MultiClearGlassButton: NSButton {
         let fgColor: NSColor
         switch glassStyle {
         case .clearPrimary:
-            fgColor = multiHexColor(0x2532B8, alpha: alphaFactor)
+            fgColor = multiHexColor(dark ? 0xD7DEFF : 0x2532B8, alpha: alphaFactor)
         case .clearDanger:
-            fgColor = multiHexColor(0xDC2626, alpha: alphaFactor)
+            fgColor = multiHexColor(dark ? 0xFFB4AB : 0xDC2626, alpha: alphaFactor)
         case .darkEmeraldPill:
             fgColor = multiHexColor(0x34D399, alpha: alphaFactor)
         case .clearSubtle:
-            fgColor = multiHexColor(0x687082, alpha: alphaFactor)
+            fgColor = multiHexColor(dark ? 0xCBD5E1 : 0x687082, alpha: alphaFactor)
         default:
-            fgColor = multiHexColor(0x1E222D, alpha: alphaFactor)
+            fgColor = multiHexColor(dark ? 0xE5E7EB : 0x1E222D, alpha: alphaFactor)
         }
 
         let attr: [NSAttributedString.Key: Any] = [
@@ -1610,6 +1729,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private let selectShownButton = MultiClearGlassButton(title: "全选当前", style: .clearSecondary, height: 28, hPadding: 11, fontSize: 11.5)
     private let clearShownButton = MultiClearGlassButton(title: "清空勾选", style: .clearSubtle, height: 28, hPadding: 11, fontSize: 11.5)
     private let nodeCount = NSTextField(labelWithString: "已勾选 0 / 0")
+    private let emptyStateLabel = NSTextField(labelWithString: "请先勾选订阅源")
     private let trafficEstimate = NSTextField(labelWithString: "预计最大下载：—（不含 HEAD 请求）")
     private let groupPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let refreshGroupsButton = MultiClearGlassButton(title: "刷新", symbol: "arrow.clockwise", style: .clearSecondary, height: 28, hPadding: 10, fontSize: 11.5)
@@ -1622,7 +1742,6 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private let stopButton = MultiClearGlassButton(title: "停止", symbol: "stop.fill", style: .clearDanger, height: 32, hPadding: 12, fontSize: 12)
     private let copyButton = MultiClearGlassButton(title: "导出 TSV", symbol: "square.and.arrow.up", style: .clearSecondary, height: 32, hPadding: 13, fontSize: 12)
     private let autoSwitch = NSButton(checkboxWithTitle: "测速后自动切换最高分（当前订阅）", target: nil, action: nil)
-    private let resumeButton = MultiClearGlassButton(title: "已切换订阅，应用最高分", symbol: "checkmark.circle", style: .clearPrimary, height: 34, hPadding: 14, fontSize: 12)
     private let status = NSTextField(wrappingLabelWithString: "请选择订阅。启动应用不会自动测速。")
     private let scheduleStatus = NSTextField(labelWithString: "定时未启用（仅窗口打开时运行）")
     private let subPillsStack = NSStackView()
@@ -1634,6 +1753,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private let champSpeedLabel = NSTextField(labelWithString: "—")
     private let champMetaLabel = NSTextField(labelWithString: "延迟 —  ·  抖动 —  ·  丢包 —")
     private let champReadyLabel = NSTextField(labelWithString: "● 待命就绪")
+    private let flowIndicator = FlowIndicatorView()
     private let champSparkline = MultiSparklineView()
     private var uiMotionTimer: Timer?
     private var statusFilter: MultiRowStatusFilter = .all
@@ -1687,15 +1807,34 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private var pendingManual: MultiPickerChoice?
     private var switchCoordinator: AssistedSwitchCoordinator?
     private var switchAuthorization: MultiSwitchAuthorization?
+#if !MULTI_UI_TEST
+    private let runtimeInjector = ClashRuntimeInjector.shared
+#endif
     private let sizeValues = [256 * 1024, 512 * 1024, 1 * 1_048_576, 2 * 1_048_576,
                               3 * 1_048_576, 5 * 1_048_576, 20 * 1_048_576, 50 * 1_048_576]
     private let sizeLabels = ["256 KiB", "512 KiB", "1 MiB", "2 MiB", "3 MiB", "5 MiB", "20 MiB", "50 MiB"]
     private let intervals: [TimeInterval] = [900, 1800, 3600, 7200, 21600, 43200, 86400]
+    private let minimumWindowContentSize = NSSize(width: 1080, height: 700)
+    private let preferredWindowContentSize = NSSize(width: 1240, height: 800)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildWindow()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+#if !MULTI_UI_TEST
+        runtimeInjector.start { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self, !self.closed else { return }
+                switch result {
+                case .success:
+                    self.runtimeBridgeDidAttach()
+                case .failure(let error):
+                    self.status.stringValue = "Clash Verge 运行时补丁未连接：\(error.localizedDescription)"
+                }
+                self.updateControls()
+            }
+        }
+#endif
         refresh(nil)
         timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in self?.pollSchedule() }
         uiMotionTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in self?.tickUIMotion() }
@@ -1718,13 +1857,38 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         status.stringValue = !busy ? "本次操作已停止；可再次关闭窗口。" : applying ? "正在撤销切换授权；已通过最终检查的请求仍可能发送或已发出，请等待结果后关闭。" : "正在停止操作；请等待结束后关闭窗口。"
     }
     func windowWillClose(_ notification: Notification) { closeApp() }
+    func windowDidResize(_ notification: Notification) {
+        guard let window else { return }
+        let minimumFrame = window.frameRect(forContentRect: NSRect(origin: .zero, size: minimumWindowContentSize)).size
+        guard window.frame.width < minimumFrame.width || window.frame.height < minimumFrame.height else { return }
+        window.setContentSize(minimumWindowContentSize)
+    }
     func applicationWillTerminate(_ notification: Notification) { closeApp() }
     private func closeApp() {
         guard !closed else { return }
         closed = true; timer?.invalidate(); timer = nil; uiMotionTimer?.invalidate(); uiMotionTimer = nil
+#if !MULTI_UI_TEST
+        runtimeInjector.stop()
+#endif
         schedule.disarm(); armedBatch = nil; switchAuthorization?.revoke()
         cancelLaunchChecks(); runner?.cancel()
     }
+#if !MULTI_UI_TEST
+    private func runtimeBridgeDidAttach() {
+        guard !closed else { return }
+        // Do not overwrite an active measurement or switch status. Once the
+        // catalogue is loaded, however, a bridge attach is also the signal to
+        // recover a controller refresh that may have raced Clash startup.
+        guard !busy else { return }
+        guard selectionPreview != nil else {
+            status.stringValue = "Clash Verge 运行时补丁已连接；请选择订阅。"
+            return
+        }
+        guard !groupRefreshInFlight, groupContext == nil else { return }
+        status.stringValue = "Clash Verge 运行时补丁已连接；正在恢复策略组连接…"
+        refreshGroups(nil)
+    }
+#endif
     private func label(_ text: String, size: CGFloat = 13, weight: NSFont.Weight = .regular,
                        color: NSColor = .labelColor, monospacedDigits: Bool = false) -> NSTextField {
         let v = NSTextField(labelWithString: text)
@@ -1837,8 +2001,12 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         window.titlebarAppearsTransparent = true
         window.isMovableByWindowBackground = true
         window.backgroundColor = multiHexColor(0xF3F5FA)
-        window.minSize = NSSize(width: 1080, height: 700)
+        window.minSize = minimumWindowContentSize
+        window.contentMinSize = minimumWindowContentSize
         window.center(); window.delegate = self
+        // A persisted frame can be narrower than this fixed desktop layout.
+        window.setContentSize(preferredWindowContentSize)
+        window.center()
 
         let rootCanvas = MultiClearAmbientCanvas(frame: NSRect(x: 0, y: 0, width: 1240, height: 800))
         window.contentView = rootCanvas
@@ -1865,7 +2033,6 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         clearShownButton.target = self; clearShownButton.action = #selector(clearShownNodes(_:))
         refreshGroupsButton.target = self; refreshGroupsButton.action = #selector(refreshGroups(_:))
         scheduleButton.target = self; scheduleButton.action = #selector(toggleSchedule(_:))
-        resumeButton.target = self; resumeButton.action = #selector(resumeWinner(_:))
 
         // =========================================================================
         // 1. TOP COMMAND BAR (Height: 54 pt)
@@ -1885,7 +2052,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             brandIcon.centerYAnchor.constraint(equalTo: brandOrb.centerYAnchor)
         ])
 
-        let appTitle = label("Clash 测速工作台", size: 15, weight: .bold, color: multiHexColor(0x11131A))
+        let appTitle = label("Clash 测速工作台", size: 15, weight: .bold, color: .labelColor)
         let verPillSurface = MultiClearFrostedSurface(style: .clearSubtle, cornerRadius: 10, isCapsule: true)
         let verLabel = label("Mihomo · Clear Prism Glass", size: 10.5, weight: .medium, color: multiHexColor(0x687082), monospacedDigits: true)
         verLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -1989,11 +2156,11 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         matrixCard.translatesAutoresizingMaskIntoConstraints = false
 
         trafficEstimate.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
-        trafficEstimate.textColor = multiHexColor(0x687082)
+        trafficEstimate.textColor = .secondaryLabelColor
         trafficEstimate.lineBreakMode = .byTruncatingTail
 
         let matrixHeaderRow = row([
-            label("订阅源矩阵", size: 12.5, weight: .bold, color: multiHexColor(0x11131A)),
+            label("订阅源矩阵", size: 12.5, weight: .bold, color: .labelColor),
             trafficEstimate,
             spacer(),
             selectAllProfilesButton,
@@ -2016,12 +2183,44 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         profileTable.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
         addColumn(profileTable, "select", "勾选", 24, minWidth: 22, maxWidth: 28, align: .center)
         addColumn(profileTable, "profile", "订阅名称", 160, minWidth: 100)
-        let profilesScroll = scroller(profileTable, height: 34, drawsBackground: false)
+        let profilesScroll = scroller(profileTable, height: 28, drawsBackground: false)
         profilesScroll.isHidden = true
         profilesScroll.widthAnchor.constraint(equalToConstant: 1).isActive = true
-        profilesScroll.heightAnchor.constraint(equalToConstant: 34).isActive = true
+        profilesScroll.heightAnchor.constraint(equalToConstant: 28).isActive = true
 
         let subMidRow = row([subPillsStack, spacer(), profilesScroll], spacing: 8)
+
+        groupPopup.addItem(withTitle: "请选择当前订阅策略组")
+        groupPopup.controlSize = .small; groupPopup.font = .systemFont(ofSize: 11.5, weight: .semibold)
+        groupPopup.target = self; groupPopup.action = #selector(groupChanged(_:))
+        groupPopup.widthAnchor.constraint(equalToConstant: 210).isActive = true
+
+        let groupSelectorPill = MultiClearFrostedSurface(style: .clearSecondary, cornerRadius: 15, isCapsule: true)
+        groupSelectorPill.translatesAutoresizingMaskIntoConstraints = false
+        groupSelectorPill.heightAnchor.constraint(equalToConstant: 30).isActive = true
+        let groupSelectorRow = row([
+            symbolIcon("arrow.triangle.branch", color: multiHexColor(0x2532B8), size: 11.5),
+            label("策略组", size: 11, weight: .medium, color: .secondaryLabelColor),
+            groupPopup
+        ], spacing: 5)
+        groupSelectorRow.translatesAutoresizingMaskIntoConstraints = false
+        groupSelectorPill.addSubview(groupSelectorRow)
+        NSLayoutConstraint.activate([
+            groupSelectorRow.leadingAnchor.constraint(equalTo: groupSelectorPill.leadingAnchor, constant: 11),
+            groupSelectorRow.trailingAnchor.constraint(equalTo: groupSelectorPill.trailingAnchor, constant: -8),
+            groupSelectorRow.centerYAnchor.constraint(equalTo: groupSelectorPill.centerYAnchor)
+        ])
+
+        autoSwitch.state = .on; autoSwitch.controlSize = .small
+        autoSwitch.target = self; autoSwitch.action = #selector(configurationChanged(_:))
+        autoSwitch.font = .systemFont(ofSize: 11.5, weight: .medium)
+
+        let strategyRouteRow = row([
+            groupSelectorPill,
+            refreshGroupsButton,
+            autoSwitch,
+            spacer()
+        ], spacing: 8)
 
         let matrixDiv = divider()
 
@@ -2047,7 +2246,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         intervalPopup.widthAnchor.constraint(equalToConstant: 82).isActive = true
 
         scheduleStatus.font = .systemFont(ofSize: 10.5, weight: .medium)
-        scheduleStatus.textColor = multiHexColor(0x687082)
+        scheduleStatus.textColor = .secondaryLabelColor
         scheduleStatus.lineBreakMode = .byTruncatingTail
 
         func wrapParamPill(_ titleText: String, control: NSView, trailing: NSView? = nil) -> NSView {
@@ -2055,7 +2254,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             pill.translatesAutoresizingMaskIntoConstraints = false
             pill.heightAnchor.constraint(equalToConstant: 32).isActive = true
             var items: [NSView] = [
-                label(titleText, size: 11, weight: .semibold, color: multiHexColor(0x687082)),
+                label(titleText, size: 11, weight: .semibold, color: .secondaryLabelColor),
                 control
             ]
             if let trailing = trailing { items.append(trailing) }
@@ -2077,19 +2276,20 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
         let paramStripRow = row([pPill1, pPill2, pPill3, pPill4, spacer(), scheduleStatus], spacing: 8)
 
-        let matrixStack = NSStackView(views: [matrixHeaderRow, subMidRow, matrixDiv, paramStripRow])
-        matrixStack.orientation = .vertical; matrixStack.alignment = .leading; matrixStack.spacing = 10
+        let matrixStack = NSStackView(views: [matrixHeaderRow, subMidRow, strategyRouteRow, matrixDiv, paramStripRow])
+        matrixStack.orientation = .vertical; matrixStack.alignment = .leading; matrixStack.spacing = 8
         matrixStack.translatesAutoresizingMaskIntoConstraints = false
         matrixCard.addSubview(matrixStack)
         NSLayoutConstraint.activate([
             matrixHeaderRow.widthAnchor.constraint(equalTo: matrixStack.widthAnchor),
             subMidRow.widthAnchor.constraint(equalTo: matrixStack.widthAnchor),
+            strategyRouteRow.widthAnchor.constraint(equalTo: matrixStack.widthAnchor),
             matrixDiv.widthAnchor.constraint(equalTo: matrixStack.widthAnchor),
             paramStripRow.widthAnchor.constraint(equalTo: matrixStack.widthAnchor),
             matrixStack.leadingAnchor.constraint(equalTo: matrixCard.leadingAnchor, constant: 16),
             matrixStack.trailingAnchor.constraint(equalTo: matrixCard.trailingAnchor, constant: -16),
-            matrixStack.topAnchor.constraint(equalTo: matrixCard.topAnchor, constant: 12),
-            matrixStack.bottomAnchor.constraint(equalTo: matrixCard.bottomAnchor, constant: -12)
+            matrixStack.topAnchor.constraint(equalTo: matrixCard.topAnchor, constant: 11),
+            matrixStack.bottomAnchor.constraint(equalTo: matrixCard.bottomAnchor, constant: -11)
         ])
 
         topDeck.addSubview(champCard)
@@ -2104,7 +2304,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             matrixCard.trailingAnchor.constraint(equalTo: topDeck.trailingAnchor),
             matrixCard.topAnchor.constraint(equalTo: topDeck.topAnchor),
             matrixCard.bottomAnchor.constraint(equalTo: topDeck.bottomAnchor),
-            topDeck.heightAnchor.constraint(equalToConstant: 158)
+            topDeck.heightAnchor.constraint(equalToConstant: 184)
         ])
 
         // =========================================================================
@@ -2114,7 +2314,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         tableCard.translatesAutoresizingMaskIntoConstraints = false
 
         nodeCount.font = .monospacedDigitSystemFont(ofSize: 11, weight: .bold)
-        nodeCount.textColor = multiHexColor(0x2532B8)
+        nodeCount.textColor = .controlAccentColor
         let countPill = MultiClearFrostedSurface(style: .clearPrimary, cornerRadius: 11, isCapsule: true)
         nodeCount.translatesAutoresizingMaskIntoConstraints = false
         countPill.addSubview(nodeCount)
@@ -2143,9 +2343,9 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         topNPill.translatesAutoresizingMaskIntoConstraints = false
         topNPill.heightAnchor.constraint(equalToConstant: 28).isActive = true
         let topNPillRow = row([
-            label("前", size: 11, weight: .semibold, color: multiHexColor(0x687082)),
+            label("前", size: 11, weight: .semibold, color: .secondaryLabelColor),
             topNBox,
-            label("项", size: 11, weight: .semibold, color: multiHexColor(0x687082))
+            label("项", size: 11, weight: .semibold, color: .secondaryLabelColor)
         ], spacing: 4)
         topNPillRow.translatesAutoresizingMaskIntoConstraints = false
         topNPill.addSubview(topNPillRow)
@@ -2156,7 +2356,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         ])
 
         let tableToolbar = row([
-            label("节点实时遥测队列", size: 13.5, weight: .bold, color: multiHexColor(0x11131A)),
+            label("节点实时遥测队列", size: 13.5, weight: .bold, color: .labelColor),
             countPill,
             filterAllButton,
             filterValidButton,
@@ -2205,9 +2405,17 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         let resultsScroll = scroller(resultTable, height: 320, drawsBackground: false)
         resultsScroll.translatesAutoresizingMaskIntoConstraints = false
 
+        emptyStateLabel.font = .systemFont(ofSize: 14, weight: .semibold)
+        emptyStateLabel.textColor = .labelColor
+        emptyStateLabel.alignment = .center
+        emptyStateLabel.maximumNumberOfLines = 2
+        emptyStateLabel.lineBreakMode = .byWordWrapping
+        emptyStateLabel.translatesAutoresizingMaskIntoConstraints = false
+
         tableCard.addSubview(tableToolbar)
         tableCard.addSubview(tableHairline)
         tableCard.addSubview(resultsScroll)
+        tableCard.addSubview(emptyStateLabel)
         NSLayoutConstraint.activate([
             tableToolbar.leadingAnchor.constraint(equalTo: tableCard.leadingAnchor, constant: 16),
             tableToolbar.trailingAnchor.constraint(equalTo: tableCard.trailingAnchor, constant: -16),
@@ -2221,7 +2429,11 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             resultsScroll.leadingAnchor.constraint(equalTo: tableCard.leadingAnchor, constant: 6),
             resultsScroll.trailingAnchor.constraint(equalTo: tableCard.trailingAnchor, constant: -6),
             resultsScroll.topAnchor.constraint(equalTo: tableHairline.bottomAnchor, constant: 2),
-            resultsScroll.bottomAnchor.constraint(equalTo: tableCard.bottomAnchor, constant: -6)
+            resultsScroll.bottomAnchor.constraint(equalTo: tableCard.bottomAnchor, constant: -6),
+            emptyStateLabel.centerXAnchor.constraint(equalTo: resultsScroll.centerXAnchor),
+            emptyStateLabel.centerYAnchor.constraint(equalTo: resultsScroll.centerYAnchor),
+            emptyStateLabel.leadingAnchor.constraint(greaterThanOrEqualTo: resultsScroll.leadingAnchor, constant: 24),
+            emptyStateLabel.trailingAnchor.constraint(lessThanOrEqualTo: resultsScroll.trailingAnchor, constant: -24)
         ])
 
         // =========================================================================
@@ -2230,50 +2442,17 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         let bottomDock = bottomDockSurface
         bottomDock.translatesAutoresizingMaskIntoConstraints = false
 
-        groupPopup.addItem(withTitle: "请选择当前订阅策略组")
-        groupPopup.controlSize = .small; groupPopup.font = .systemFont(ofSize: 11.5, weight: .semibold)
-        groupPopup.target = self; groupPopup.action = #selector(groupChanged(_:))
-        groupPopup.widthAnchor.constraint(equalToConstant: 210).isActive = true
-
-        let groupSelectorPill = MultiClearFrostedSurface(style: .clearSecondary, cornerRadius: 15, isCapsule: true)
-        groupSelectorPill.translatesAutoresizingMaskIntoConstraints = false
-        groupSelectorPill.heightAnchor.constraint(equalToConstant: 30).isActive = true
-        let groupSelectorRow = row([
-            symbolIcon("arrow.triangle.branch", color: multiHexColor(0x2532B8), size: 11.5),
-            label("策略组", size: 11, weight: .medium, color: multiHexColor(0x687082)),
-            groupPopup
-        ], spacing: 5)
-        groupSelectorRow.translatesAutoresizingMaskIntoConstraints = false
-        groupSelectorPill.addSubview(groupSelectorRow)
-        NSLayoutConstraint.activate([
-            groupSelectorRow.leadingAnchor.constraint(equalTo: groupSelectorPill.leadingAnchor, constant: 11),
-            groupSelectorRow.trailingAnchor.constraint(equalTo: groupSelectorPill.trailingAnchor, constant: -8),
-            groupSelectorRow.centerYAnchor.constraint(equalTo: groupSelectorPill.centerYAnchor)
-        ])
-
-        autoSwitch.state = .off; autoSwitch.controlSize = .small
-        autoSwitch.target = self; autoSwitch.action = #selector(configurationChanged(_:))
-        autoSwitch.font = .systemFont(ofSize: 11.5, weight: .medium)
-
         status.font = .systemFont(ofSize: 11.5, weight: .medium)
-        status.textColor = multiHexColor(0x1E222D)
+        status.textColor = .labelColor
         status.maximumNumberOfLines = 1
         status.lineBreakMode = .byTruncatingTail
-        status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-
-        let dockSep = divider(vertical: true)
-        dockSep.heightAnchor.constraint(equalToConstant: 20).isActive = true
+        status.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
 
         let bottomDockRow = row([
-            groupSelectorPill,
-            refreshGroupsButton,
-            autoSwitch,
-            dockSep,
             symbolIcon("shield.lefthalf.filled", color: multiHexColor(0x059669), size: 12),
             status,
             spacer(),
             undoSwitchButton,
-            resumeButton,
             switchResultButton
         ], spacing: 8)
         bottomDockRow.translatesAutoresizingMaskIntoConstraints = false
@@ -2331,9 +2510,13 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
     func controlTextDidChange(_ obj: Notification) { configurationChanged(nil) }
     func comboBoxSelectionDidChange(_ notification: Notification) { configurationChanged(nil) }
-    @objc private func refresh(_ sender: Any?) {
+    @objc private func refresh(_ sender: Any?) { refresh(preservingPending: false) }
+    private func refresh(preservingPending: Bool) {
         guard !busy, !closed else { return }
-        pendingWinner = nil; pendingManual = nil; manualSwitchDisarmedSchedule = false; nodeSelection = nil; selectionPreview = nil
+        if !preservingPending {
+            pendingWinner = nil; pendingManual = nil; manualSwitchDisarmedSchedule = false
+        }
+        nodeSelection = nil; selectionPreview = nil
         rows = []; visibleRows = []; resultTable.deselectAll(nil); resultTable.reloadData(); invalidateGroups()
         disarm("订阅已刷新，定时已停止。")
         busy = true; updateControls(); status.stringValue = "正在读取订阅列表…"
@@ -2565,9 +2748,6 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                     crossProfileReadyDetected = nowReady
                     bottomDockSurface.dockVisualState = .crossProfilePending(ready: nowReady)
                     champCardView.isCrossProfileReady = nowReady
-                    if nowReady {
-                        resumeButton.glassStyle = .clearPrimary
-                    }
                 }
             }
         } else if crossProfileReadyDetected {
@@ -2581,12 +2761,16 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private func updateControls() {
         let count = nodeSelection?.count ?? 0
         let hasNodes = selectionPreview != nil && count > 0
+        emptyStateLabel.stringValue = busy ? "正在读取订阅和节点…" :
+            (selectionPreview == nil ? "请先勾选订阅源" : "当前筛选没有节点")
+        emptyStateLabel.isHidden = !rows.isEmpty
         let readyForAction = !busy && !groupRefreshInFlight
         selectAllProfilesButton.isEnabled = !busy && selected.count < registry.count
         clearProfilesButton.isEnabled = !busy && !selected.isEmpty
         refreshButton.isEnabled = !busy
         funnelButton.isEnabled = readyForAction && hasNodes
         loadTestButton.isEnabled = readyForAction && hasNodes
+        flowIndicator.isHidden = true
         switchResultButton.isEnabled = readyForAction && !switchOutcomeUnknown && selectionPreview != nil && visibleRows.indices.contains(resultTable.selectedRow)
         topNBox.isEnabled = !busy && !visibleRows.isEmpty
         selectTopNButton.isEnabled = !busy && !visibleRows.isEmpty
@@ -2607,10 +2791,8 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         scheduleButton.isEnabled = schedule.isArmed || (readyForAction && hasNodes)
         startButton.isEnabled = readyForAction && hasNodes; stopButton.isEnabled = busy && !cancelled
         autoSwitch.isEnabled = !busy && !switchOutcomeUnknown
-        resumeButton.isEnabled = readyForAction && (pendingWinner != nil || pendingManual != nil) && !switchOutcomeUnknown
-        resumeButton.title = pendingManual == nil ? "已切换订阅，应用最高分" : "已切换订阅，继续切换所选节点"
         copyButton.isEnabled = !rows.isEmpty
-        scheduleStatus.textColor = schedule.isArmed ? multiHexColor(0x2532B8) : multiHexColor(0x687082)
+        scheduleStatus.textColor = schedule.isArmed ? .controlAccentColor : .secondaryLabelColor
         updateDockAndProgressState()
         rebuildSubscriptionPills()
         updateChampionCard()
@@ -2766,6 +2948,9 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             status.stringValue = "策略组：\(capture.groupName)；当前：\(capture.now)。点击切换即执行。"
         }
         updateControls()
+#if !MULTI_UI_TEST
+        continuePendingSwitchIfNeeded()
+#endif
     }
     private func selectedGroupCapture() -> MultiSwitchCapture? {
         guard let context = groupContext, groupPopup.indexOfSelectedItem > 0 else { return nil }
@@ -2775,9 +2960,10 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         return MultiSwitchCapture(controller: context.controller, profile: context.profile, groupName: group.name, now: group.now)
     }
     @objc private func refreshGroups(_ sender: Any?) {
-        guard !busy, !groupRefreshInFlight, !closed, let preview = selectionPreview else { return }
+        guard !busy, !closed, let preview = selectionPreview else { return }
         // Only a post-switch refresh may retain an existing recurring grant.
         let postSwitch = (sender as? Bool) == true
+        if groupRefreshInFlight { return }
         let previous = selectedGroupCapture()
         let previousStatus = postSwitch ? status.stringValue : nil
         if schedule.isArmed && !postSwitch { disarm("策略组已刷新，定时已停止。") }
@@ -2794,6 +2980,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         // leave a recurring authorization active with an unknown displayed group.
         func fail(_ message: String) {
             guard !self.closed, self.groupRefreshInFlight, self.groupGeneration == generation else { return }
+            self.groupRefreshInFlight = false
             self.invalidateGroups()
             if postSwitch && self.schedule.isArmed {
                 self.disarm()
@@ -2813,11 +3000,30 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             let profile = active.flatMap { current in
                 preview.profiles.first { $0.option.id == current.id && multiBytesEqual($0.option.path, current.path) }
             }
-            let identity = profile.flatMap { multiProfileSnapshotMatches(root: root, profile: $0) ? multiLocalController(root: root) : nil }
+            let snapshotMatches = profile.map { multiProfileSnapshotMatches(root: root, profile: $0) } ?? false
+            let identity = snapshotMatches ? multiWaitForLocalController(root: root) : nil
             DispatchQueue.main.async {
                 guard !self.closed, !self.busy, self.groupRefreshInFlight, self.groupGeneration == generation else { return }
-                guard let profile = profile, let identity = identity else {
-                    fail("当前订阅不在列表或控制器不可用；请在 Verge 检查订阅。")
+                guard active != nil else {
+                    fail("无法读取 Clash Verge 当前订阅；请刷新配置。")
+                    return
+                }
+                guard let profile = profile else {
+                    self.groupRefreshInFlight = false
+                    self.invalidateGroups()
+                    self.status.stringValue = "当前订阅未勾选；跨订阅切换时会自动激活目标订阅。"
+                    self.updateControls()
+                    return
+                }
+                guard snapshotMatches else {
+                    self.groupRefreshInFlight = false
+                    self.invalidateGroups()
+                    self.status.stringValue = "当前订阅内容已更新，正在重新读取节点…"
+                    self.loadNodePreview()
+                    return
+                }
+                guard let identity = identity else {
+                    fail("无法连接 Mihomo 控制器；请确认 Clash Verge 正在运行。")
                     return
                 }
                 let controller = ClashController(settings: ControllerSettings(socket: identity.path, secret: ""))
@@ -2846,6 +3052,9 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                             report(candidates.isEmpty ? "当前订阅没有可用的直接成员 Selector。" :
                                 "策略组已刷新，对应当前订阅 ‘\(profile.option.name)’；多组时请先选择。")
                             self.updateControls()
+#if !MULTI_UI_TEST
+                            self.continuePendingSwitchIfNeeded()
+#endif
                         }
                     }
                 }
@@ -2977,7 +3186,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         status.stringValue = "正在确认当前订阅和本地 Selector…"
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let valid = (try? multiRevalidate(root: root, batch: batch)) != nil
-            let identity = valid ? multiLocalController(root: root) : nil
+            let identity = valid ? multiWaitForLocalController(root: root) : nil
             DispatchQueue.main.async { [weak self] in
                 guard let self = self, self.allowed(token, scheduled: scheduled), let identity = identity else { completion(nil); return }
                 guard identity == prior.controller, profile.option.id == prior.profile.option.id,
@@ -3284,7 +3493,10 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                         self.abort(token, "最高分属于其他订阅，但此前 PUT 结果未知；本次应用中已禁用切换，请直接在 Verge 核对。")
                     } else {
                         self.pendingWinner = pending
-                        self.abort(token, "最高分属于 ‘\(profile.option.name)’（UID：\(profile.option.uid)）；请先在 Verge 切换该订阅，刷新并选择策略组，再点击继续。不会改选次优。")
+                        self.abort(token, "最高分属于 ‘\(profile.option.name)’（UID：\(profile.option.uid)）；正在自动热切换订阅并继续应用，不改选次优。")
+#if !MULTI_UI_TEST
+                        self.continuePendingSwitchIfNeeded()
+#endif
                     }
                 } else if let capture = self.runCapture {
                     self.applyCurrentWinner(pending, batch: batch, capture: capture, token: token)
@@ -3360,10 +3572,21 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     @objc private func resumeWinner(_ sender: Any?) {
         if let choice = pendingManual { beginManualSwitch(choice); return }
         guard !busy, !groupRefreshInFlight, !closed, !switchOutcomeUnknown, let winner = pendingWinner else { return }
-        guard let capture = selectedGroupCapture(), capture.profile.option.id == winner.profile.option.id,
+#if !MULTI_UI_TEST
+        if registry.first(where: { $0.isCurrent })?.id != winner.profile.option.id {
+            runtimeSwitchProfile(winner.profile.option)
+            return
+        }
+#endif
+        guard let capture = selectedGroupCapture() else {
+            status.stringValue = "请先在主界面选择当前订阅的策略组；尚未应用最高分。"
+            updateControls()
+            return
+        }
+        guard capture.profile.option.id == winner.profile.option.id,
               capture.profile.version == winner.profile.version, capture.profile.data == winner.profile.data,
               multiBytesEqual(capture.profile.option.path, winner.profile.option.path) else {
-            status.stringValue = "请先在 Verge 切换到 ‘\(winner.profile.option.name)’，刷新并选择策略组，再点继续。"
+            status.stringValue = "目标订阅已变化；请刷新订阅和策略组后重试，尚未应用最高分。"
             return
         }
         guard let token = schedule.beginManualRun() else { return }
@@ -3374,7 +3597,8 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         // Do not call multiRevalidate here: the user was explicitly instructed
         // to change `isCurrent` in Verge since the measurement was taken.
         DispatchQueue.global(qos: .userInitiated).async {
-            let identity = multiProfileSnapshotMatches(root: root, profile: winner.profile) ? multiLocalController(root: root) : nil
+            let identity = multiProfileSnapshotMatches(root: root, profile: winner.profile) ?
+                multiWaitForLocalController(root: root) : nil
             DispatchQueue.main.async {
                 guard self.activeToken == token else { return }
                 guard self.allowed(token, scheduled: false), let identity = identity else {
@@ -3388,8 +3612,8 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                     guard case .ready(let catalogue) = preparation else {
                         let message: String
                         if case .manualProfileRequired = preparation {
-                            self.pendingWinner = winner
-                            message = "目标订阅尚未在 Verge 设为当前；请手动切换后再点继续。"
+                            self.pendingWinner = nil
+                            message = "目标订阅未保持为当前订阅；未发起切换，请刷新后重试。"
                         } else { message = "目标 UID、路径、快照或控制器无法验证；未发起切换。" }
                         self.abort(token, message); return
                     }
@@ -3429,12 +3653,20 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     // never invents a VerifiedMeasurement or weakens automatic winner checks.
     private func beginManualSwitch(_ choice: MultiPickerChoice) {
         guard !busy, !groupRefreshInFlight, !closed, !switchOutcomeUnknown else { return }
+#if !MULTI_UI_TEST
+        if registry.first(where: { $0.isCurrent })?.id != choice.profile.option.id {
+            manualSwitchDisarmedSchedule = manualSwitchDisarmedSchedule || schedule.isArmed
+            disarm(); pendingWinner = nil; pendingManual = choice
+            runtimeSwitchProfile(choice.profile.option)
+            return
+        }
+#endif
         guard let capture = selectedGroupCapture(), capture.profile.option.id == choice.profile.option.id,
               capture.profile.version == choice.profile.version, capture.profile.data == choice.profile.data,
               multiBytesEqual(capture.profile.option.path, choice.profile.option.path) else {
             manualSwitchDisarmedSchedule = manualSwitchDisarmedSchedule || schedule.isArmed
             disarm(); pendingWinner = nil; pendingManual = choice
-            status.stringValue = "请先在 Verge 切换到 ‘\(choice.profile.option.name)’，刷新并选择策略组，再点继续。" + (manualSwitchDisarmedSchedule ? " 原定时已停止。" : "")
+            status.stringValue = "请先在主界面选择当前订阅的策略组；未发起节点切换。" + (manualSwitchDisarmedSchedule ? " 原定时已停止。" : "")
             updateControls(); return
         }
         guard let token = schedule.beginManualRun() else { return }
@@ -3444,7 +3676,8 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         status.stringValue = "正在确认手动选择的订阅、节点和唯一控制器…"
         let root = self.root
         DispatchQueue.global(qos: .userInitiated).async {
-            let identity = multiProfileSnapshotMatches(root: root, profile: choice.profile) ? multiLocalController(root: root) : nil
+            let identity = multiProfileSnapshotMatches(root: root, profile: choice.profile) ?
+                multiWaitForLocalController(root: root) : nil
             DispatchQueue.main.async {
                 guard self.activeToken == token else { return }
                 guard self.allowed(token, scheduled: false), let identity = identity else {
@@ -3460,10 +3693,8 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                     guard self.allowed(token, scheduled: false) else { self.abort(token, "已停止；未发起切换。"); return }
                     guard case .ready(let catalogue) = preparation else {
                         if case .manualProfileRequired = preparation {
-                            // A continuation exists only after explicitly asking the user
-                            // to activate this profile. Cancel/stop never retain it.
-                            self.pendingManual = choice
-                            self.abort(token, "请先在 Verge 切换到 ‘\(choice.profile.option.name)’，刷新并选择策略组，再点继续。")
+                            self.pendingManual = nil
+                            self.abort(token, "目标订阅未保持为当前订阅；未发起节点切换，请刷新后重试。")
                         } else {
                             self.pendingManual = nil
                             self.abort(token, "目标订阅、节点快照或控制器无法验证；未发起切换。请重新选择节点。")
@@ -3501,6 +3732,43 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             }
         }
     }
+
+#if !MULTI_UI_TEST
+    private func continuePendingSwitchIfNeeded() {
+        guard !busy, !groupRefreshInFlight, !closed, !switchOutcomeUnknown,
+              pendingWinner != nil || pendingManual != nil else { return }
+        // The current-profile and selected-group checks remain inside
+        // resumeWinner. This helper only replaces the removed continuation
+        // button with an automatic guarded continuation.
+        resumeWinner(nil)
+    }
+
+    private func runtimeSwitchProfile(_ option: ProfileOption) {
+        busy = true; updateControls()
+        status.stringValue = "正在通过 Clash Verge 运行时补丁切换 ‘\(option.name)’…"
+        runtimeInjector.switchProfile(uid: option.uid) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self, !self.closed else { return }
+                self.busy = false
+                switch result {
+                case .success(let switched):
+                    guard switched.current.utf8.elementsEqual(option.uid.utf8) else {
+                        self.status.stringValue = "Clash Verge 未确认目标订阅；请手动核对。"
+                        self.updateControls()
+                        return
+                    }
+                    self.status.stringValue = "已热切换到 ‘\(switched.name)’；正在刷新助手界面…"
+                    self.refresh(preservingPending: true)
+                case .failure:
+                    self.pendingWinner = nil
+                    self.pendingManual = nil
+                    self.status.stringValue = "运行时切换失败；未应用 ‘\(option.name)’，请检查 Clash Verge 运行时桥接。"
+                    self.updateControls()
+                }
+            }
+        }
+    }
+#endif
 
     private func finishSwitch(_ outcome: AssistedSwitchResult, token: TestSchedule.RunToken) {
         guard activeToken == token else { return }
@@ -3733,6 +4001,37 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             field.textColor = text == "—" ? .tertiaryLabelColor : .secondaryLabelColor
         }
         return centeredCell(field, align: align)
+    }
+}
+
+private final class FlowIndicatorView: NSView {
+    private let shapeLayer = CAShapeLayer()
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        shapeLayer.strokeColor = NSColor.systemOrange.cgColor
+        shapeLayer.fillColor = nil
+        shapeLayer.lineWidth = 2
+        shapeLayer.lineDashPattern = [4, 4]
+        layer?.addSublayer(shapeLayer)
+        wantsLayer = true
+        startAnimating()
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func layout() {
+        super.layout()
+        let path = CGMutablePath()
+        path.move(to: CGPoint(x: 0, y: bounds.midY))
+        path.addLine(to: CGPoint(x: bounds.maxX, y: bounds.midY))
+        shapeLayer.path = path
+        shapeLayer.frame = bounds
+    }
+    func startAnimating() {
+        let anim = CABasicAnimation(keyPath: "lineDashPhase")
+        anim.fromValue = 8
+        anim.toValue = 0
+        anim.duration = 0.5
+        anim.repeatCount = .infinity
+        shapeLayer.add(anim, forKey: "flow")
     }
 }
 

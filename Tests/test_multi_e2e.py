@@ -40,7 +40,7 @@ SCENARIOS = ('startup', 'same', 'other', 'stop', 'scheduled-stale', 'during-stal
              'scheduled-other-no-auto', 'only-other', *SELECTION_CASES, 'zero-selection',
              'load-run', 'manual-same', 'manual-unchecked', 'manual-other', 'manual-revoked',
              'manual-unknown', 'manual-group-stale', 'manual-now-stale',
-             'result-ranked', 'multiple-groups', 'mixed-groups', 'global-only', 'old-scores',
+             'result-ranked', 'no-group-start', 'multiple-groups', 'mixed-groups', 'global-only', 'old-scores',
              'quick-stop-valid', 'quick-stop-stale', 'quick-load-stop', 'scheduled-decision-disarm',
              'scheduled-quick-stop', 'scheduled-quick-close')
 
@@ -154,6 +154,10 @@ private extension MultiAppDelegate {
             guard button.target as AnyObject? === self, button.action == action, button.isEnabled else { return false }
             button.performClick(nil); return true
         }
+        func continuePending() -> Bool {
+            resumeWinner(nil)
+            return true
+        }
         func finish() -> Int32 {
             let expectedWarnings = ["uncertain", "manual-unknown"].contains(scenario) ? 1 : 0
             guard Fixture.warnings == expectedWarnings else { return fail("unexpected-warning") }
@@ -210,7 +214,7 @@ private extension MultiAppDelegate {
         guard wait(25, { !self.busy }), registry.count == 2 else { return fail("startup-registry") }
         guard !schedule.isArmed, runner == nil, rows.isEmpty, parallelBox.stringValue == "10",
               modePopup.indexOfSelectedItem == 0, sizeValues[sizePopup.indexOfSelectedItem] == 3 * 1_048_576,
-              chosenOptions().map({ $0.0.streams == 2 && $0.1 == 10 }) == true, autoSwitch.state == .off,
+              chosenOptions().map({ $0.0.streams == 2 && $0.1 == 10 }) == true, autoSwitch.state == .on,
               startButton.action == #selector(startManual(_:)), loadTestButton.action == #selector(startLoadTest(_:)),
               funnelButton.action == #selector(startFunnelTest(_:)), undoSwitchButton.action == #selector(undoLastSwitch(_:)),
               champQuickSwitchButton.action == #selector(switchChampionRoute(_:)), champRetestButton.action == #selector(retestChampionRoute(_:)),
@@ -245,7 +249,7 @@ private extension MultiAppDelegate {
         guard wait(30, { !self.groupRefreshInFlight }) else { return fail("group-refresh-timeout") }
         if scenario != "only-other" {
             guard wait(30, { self.groupContext?.profile.option.id == uidA }) else { return fail("group-preview") }
-            if !["multiple-groups", "mixed-groups", "global-only"].contains(scenario) {
+            if !["no-group-start", "multiple-groups", "mixed-groups", "global-only"].contains(scenario) {
                 guard selectedGroupCapture()?.profile.option.id == uidA,
                       selectedGroupCapture().map({ multiBytesEqual($0.groupName, "SyntheticSelect") && multiBytesEqual($0.now, "A02") }) == true
                 else { return fail("group-default") }
@@ -316,6 +320,14 @@ private extension MultiAppDelegate {
             guard wait(30, { idle() }), !started(), noPut(), settleDisarmed() else { return fail("zero-launched") }
             return finish()
         }
+        if scenario == "no-group-start" {
+            guard groupPopup.indexOfSelectedItem == 0, selectedGroupCapture() == nil else { return fail("no-group-start-precondition") }
+            autoSwitch.state = .on; startManual(nil)
+            guard wait(30, { idle() }), !started(), noPut(),
+                  status.stringValue.contains("请先在主界面选择当前订阅的策略组"),
+                  status.stringValue.contains("未开始测速") else { return fail("no-group-start-prompt") }
+            return finish()
+        }
         if scenario == "manual-group-stale" || scenario == "manual-now-stale" {
             let changed = scenario == "manual-group-stale" ? "group-stale" : "now-stale"
             guard mark(changed), highlight(MultiIdentity(profile: uidA, node: "A03")),
@@ -330,9 +342,9 @@ private extension MultiAppDelegate {
             if scenario == "manual-revoked" { Fixture.stopBeforeApply = true }
             guard click(switchResultButton, #selector(switchSelectedResult(_:))), wait(30, { idle() }), !started() else { return fail("manual-initial") }
             if scenario == "manual-other" {
-                guard pendingManual != nil, noPut(), click(resumeButton, #selector(resumeWinner(_:))), wait(10, { idle() }), noPut(),
-                      registryToB(), click(resumeButton, #selector(resumeWinner(_:))), wait(10, { idle() }), noPut(),
-                      refreshed(uidB), pendingManual != nil, click(resumeButton, #selector(resumeWinner(_:))), wait(30, { idle() }),
+                guard pendingManual != nil, noPut(), continuePending(), wait(10, { idle() }), noPut(),
+                      registryToB(), continuePending(), wait(10, { idle() }), noPut(),
+                      refreshed(uidB), pendingManual != nil, continuePending(), wait(30, { idle() }),
                       pendingManual == nil, !noPut(), status.stringValue.contains("已切换") else { return fail("manual-other-continuation") }
             } else if scenario == "manual-revoked" {
                 guard Fixture.stopCount == 1, noPut(), settleDisarmed() else { return fail("manual-revocation") }
@@ -447,9 +459,9 @@ private extension MultiAppDelegate {
         case "scheduled-other-no-auto": guard rows.count == 14, rows.first?.nodeName == "B01", pendingWinner == nil, noPut(), schedule.isArmed else { return fail("scheduled-other-no-auto-policy") }
         case "other", "only-other":
             guard rows.first?.nodeName == "B01", pendingWinner != nil, noPut(), !schedule.isArmed,
-                  click(resumeButton, #selector(resumeWinner(_:))), wait(10, { idle() }), noPut(), registryToB(),
-                  click(resumeButton, #selector(resumeWinner(_:))), wait(10, { idle() }), noPut(),
-                  refreshed(uidB), pendingWinner != nil, click(resumeButton, #selector(resumeWinner(_:))), wait(30, { idle() }),
+                  continuePending(), wait(10, { idle() }), noPut(), registryToB(),
+                  continuePending(), wait(10, { idle() }), noPut(),
+                  refreshed(uidB), pendingWinner != nil, continuePending(), wait(30, { idle() }),
                   pendingWinner == nil, !noPut(), status.stringValue.contains("已切换") else { return fail("other-continuation") }
         case "during-stale", "preput-stale": guard noPut(), settleDisarmed() else { return fail("stale-not-rejected") }
         case "allfailed": guard rows.count == 14, rows.allSatisfy({ $0.eligibleScore == nil }), noPut(), settleDisarmed() else { return fail("allfailed-not-disarmed") }
@@ -522,7 +534,6 @@ def instrument(source, fixture_root, event_file, put_marker, socket_path):
         'groupPopup.action = #selector(groupChanged(_:))',
         'action: #selector(toggleProfile(_:))', 'action: #selector(toggleNode(_:))',
         'clearShownButton.action = #selector(clearShownNodes(_:))',
-        'resumeButton.action = #selector(resumeWinner(_:))',
         'let runner = MultiBatchRunner(executable: executable, jobs: jobs, parallel: batch.parallel,',
     ):
         require(source.count(anchor) == 1, 'UI action anchor changed: ' + anchor)
@@ -695,7 +706,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
         if self.path == '/proxies':
             groups = ({'GLOBAL': global_group} if case.name == 'global-only' else
                       {'GLOBAL': global_group, GROUP: group} if case.name == 'mixed-groups' else
-                      {GROUP: group, OTHER_GROUP: other} if case.name == 'multiple-groups' else {GROUP: group})
+                      {GROUP: group, OTHER_GROUP: other} if case.name in ('multiple-groups', 'no-group-start') else {GROUP: group})
             self.reply(200, {'proxies': groups})
         elif self.path == '/proxies/' + GROUP:
             self.reply(200, group)
@@ -861,7 +872,7 @@ def check_events(case, worker_events, scenario):
         require(sorted(jobs) == sorted(wanted_jobs), 'byte-exact selected job identities differ')
     require(peak <= (2 if scenario == 'load-run' else 10), 'worker concurrency exceeded limit')
     require(not active, 'synthetic worker did not exit in ' + scenario)
-    no_workers = ('startup', 'scheduled-stale', 'group-stale', 'now-stale', 'select-preview',
+    no_workers = ('startup', 'no-group-start', 'scheduled-stale', 'group-stale', 'now-stale', 'select-preview',
                   'select-stale', 'select-invalid', 'zero-selection', 'manual-same', 'manual-unchecked',
                   'manual-other', 'manual-revoked', 'manual-unknown', 'manual-group-stale', 'manual-now-stale',
                   'multiple-groups', 'mixed-groups', 'global-only', 'manual-unicode', *NO_WORKER_REGRESSIONS)

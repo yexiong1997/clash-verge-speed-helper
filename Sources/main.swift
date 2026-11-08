@@ -284,7 +284,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
     private var quickMode: Bool { modePopup.indexOfSelectedItem == 0 }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        buildWindow(); useCurrentProfile(nil); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
+        buildWindow()
+        ClashRuntimeInjector.shared.start { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if case .failure(let error) = result {
+                    self.statusLabel.stringValue = "Clash Verge 运行时补丁未连接：\(error.localizedDescription)"
+                }
+            }
+        }
+        useCurrentProfile(nil); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -298,7 +307,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
         }
         return true
     }
-    func applicationWillTerminate(_ notification: Notification) { runner?.cancel() }
+    func applicationWillTerminate(_ notification: Notification) {
+        runner?.cancel()
+        ClashRuntimeInjector.shared.stop()
+    }
     private func label(_ text: String, size: CGFloat, weight: NSFont.Weight = .regular) -> NSTextField {
         let field = NSTextField(labelWithString: text); field.font = .systemFont(ofSize: size, weight: weight); return field
     }

@@ -1,8 +1,8 @@
 # Clash 节点测速助手
 
-一个面向 macOS 的本地桌面助手：读取 Clash Verge Rev 当前配置或用户选定的 YAML，用 [faceair/clash-speedtest](https://github.com/faceair/clash-speedtest) 逐节点进行**真实下载测速**，展示并复制结果；也可在用户确认后，将指定 Clash 策略组切到测速最快的合格直接成员。
+一个面向 macOS 的本地桌面助手：读取 Clash Verge Rev 当前配置或用户选定的 YAML，用 [faceair/clash-speedtest](https://github.com/faceair/clash-speedtest) 逐节点进行**真实下载测速**，展示并复制结果；也可在用户确认后，将指定 Clash 策略组切到测速最快的合格直接成员。启动时会尝试向已安装的官方 Clash Verge Rev 注入运行时桥接，不修改 `.app`、不重新签名、不重装。
 
-> 本页主要描述原来的单订阅版本。独立的多订阅版本（V4 Clear Prism Glass 透明底毛玻璃胶囊界面 + 全量交互动效）支持跨订阅直接勾选节点、一键选择当前列表前 N 项节点、智能两段式漏斗优选（快速初筛自动晋级前 N 名进行 20 MiB 加压复测）、实时动态榜单重排、内联吞吐能量条与延迟分级胶囊、表头点击排序与状态筛选、最优路由卡片一键直切/单节点复测、双击行/右键菜单操作、跨订阅切换就绪自动感知、一键安全切回原节点及应用内定时实时倒计时；其开关默认值、测速组件和切换流程不同。切换其他订阅仍须用户先在 Verge 手动激活。请阅读[多订阅版本使用指南](docs/MULTI_SUBSCRIPTION.md)，并以该版本的构建与验证状态为准。
+> 本页主要描述原来的单订阅版本。独立的多订阅版本（V4 Clear Prism Glass 透明底毛玻璃胶囊界面 + 全量交互动效）支持跨订阅直接勾选节点、一键选择当前列表前 N 项节点、智能两段式漏斗优选（快速初筛自动晋级前 N 名进行 20 MiB 加压复测）、实时动态榜单重排、内联吞吐能量条与延迟分级胶囊、表头点击排序与状态筛选、最优路由卡片一键直切/单节点复测、双击行/右键菜单操作、跨订阅切换就绪自动感知、一键安全切回原节点及应用内定时实时倒计时；其开关默认值、测速组件和切换流程不同。多订阅版本启动时会尝试自动注入官方 Clash Verge 的运行时补丁，具体状态以窗口底部提示为准。请阅读[多订阅版本使用指南](docs/MULTI_SUBSCRIPTION.md)，并以该版本的构建与验证状态为准。
 
 > **开始前请注意（以下为原单订阅版本）**
 >
@@ -14,6 +14,14 @@
 ## 环境与构建
 
 当前构建设计面向 **macOS Apple Silicon（arm64）**。需要 Xcode Command Line Tools（包括 `swiftc`）、系统 AppKit、`/usr/bin/ruby`（带 YAML/JSON 支持）、`/usr/bin/curl`；运行本地测试另需 Python 3，端到端测试还需要 `/usr/bin/sandbox-exec`。自动切换需要正在运行、配置和本机 Unix 控制接口可被当前用户访问的 Clash Verge Rev / 兼容内核；仅测速不要求它正在运行。
+
+### 官方 Clash Verge 运行时桥接
+
+助手启动时会校验 `/Applications/Clash Verge.app` 的 Bundle ID、Developer ID Team ID 和代码签名，然后按需启动官方 App，显示主窗口并打开官方 Web Inspector。它通过辅助功能权限向 Console 输入一次短加载器；加载器在官方 `tauri://localhost` 页面内调用原版 `patch_profiles_config`，再由助手本地回环桥接发送已验证的命令。
+
+该流程只修改运行时内存，不写入 Clash Verge `.app`，不重新签名，也不安装登录项。首次运行需要在“系统设置 → 隐私与安全性 → 辅助功能”授予本助手权限；缺少权限、找不到官方包或签名不匹配时，窗口会明确显示失败原因，测速仍可继续使用。退出助手会关闭桥接，不退出 Clash Verge。刷新或重建 WebView 后，下一次启动助手会重新注入。
+
+多订阅版本的构建与安装使用 [`Scripts/install-multi.sh`](Scripts/install-multi.sh)。它先构建并核验新包，再清理 `~/Applications` 中本助手的旧副本、运行时副本和备份，最后安装唯一的 `Clash 多订阅测速助手.app`；不会清理官方 Clash Verge 或其他应用。
 
 在项目根目录执行：
 

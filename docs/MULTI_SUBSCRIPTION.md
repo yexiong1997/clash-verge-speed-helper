@@ -8,7 +8,7 @@
 
 这是一个独立的多订阅测速应用，不是对已有 Clash Verge 应用的升级。它读取本机 Clash Verge 已登记的订阅列表，允许直接在测速列表中勾选不同订阅的节点，测速后按综合分排序。**点击“开始测速”、加压测试或启用定时即表示同意相应操作，不再出现二次确认。** 测速会连接真实节点和外部服务并消耗流量；启动应用、刷新或勾选列表本身不会开始测速。
 
-自动应用最高分是**默认关闭、可选的功能**。即使启用，助手也不会替您切换 Verge 当前订阅。最高分来自其他订阅时，是否在 Verge 手动切换、是否继续应用最高分，都由您明确决定；不会自动用当前订阅的第二名替代。
+自动应用最高分是**默认关闭、可选的功能**。最高分来自其他订阅时，助手会通过已连接的官方运行时补丁调用 Verge 自己的 `patch_profiles_config`，切换成功后自动重新读取订阅列表、策略组和界面状态并继续应用；注入不可用或结果无法确认时会停止并明确提示，不会用当前订阅的第二名替代。界面不再提供“先手动切换订阅再应用”的继续按钮。
 
 ## 构建、签名与安装
 
@@ -32,7 +32,7 @@
 
   for file in MultiMain.swift ProfileRegistry.swift MultiBatchRunner.swift \
               VerifiedMeasurement.swift CompositeScore.swift TestSchedule.swift \
-              SwitchController.swift AssistedSwitch.swift; do
+              SwitchController.swift AssistedSwitch.swift ClashRuntimeInjector.swift; do
     /bin/cp -X "$PROJECT/Sources/$file" "$WORK/src/Sources/$file"
   done
   for file in verified-worker.patch UPSTREAM-GPL-3.0.txt NOTICE.md CONTRACT.md; do
@@ -62,16 +62,21 @@ env VERIFIED_WORKER_OFFLINE_CACHE="/绝对路径/可信缓存" \
 
 `VERIFIED_WORKER_OFFLINE_CACHE` 一旦设置即启用离线模式，空值也不会回退到联网构建。离线构建只针对构建过程；它不限制您之后确认测速时的联网行为。
 
-### 单独安装，不覆盖已有应用
+### 安装并清理旧版本
 
-成功构建并核验后，您可以继续使用临时目录中的应用；如果要保留副本，请在 Finder 中将它**复制到一个全新、空的专用目录**，不要替换任何现有 App。下面可为当前用户创建一个随机的空安装目录，终端会输出实际路径：
+如果要使用当前用户的标准安装位置，直接运行项目提供的安装脚本：
 
 ```bash
-/bin/mkdir -p "$HOME/Applications" &&
-  /usr/bin/mktemp -d "$HOME/Applications/ClashMultiSpeedHelper.XXXXXXXX"
+/bin/bash Scripts/install-multi.sh
 ```
 
-在 Finder 中分别前往构建命令输出的路径及新目录，把新应用复制到后者。如果 Finder 提示覆盖或合并，**取消**并重新确认路径。复制完成后，可在终端运行 `codesign --verify --deep --strict`，再输入一个空格并将复制后的 `.app` 拖入终端以填入路径，然后回车；核验失败不要运行。此核验只检查签名完整性，不证明来源可信或应用安全。
+脚本先在 `/private/tmp` 构建并核验新包，再只清理当前用户 `~/Applications` 下名称属于本助手的旧包、运行时副本和 dated backup，最后安装到 `~/Applications/Clash 多订阅测速助手.app` 并再次核验。它不会删除官方 `Clash Verge.app` 或其他应用。以后更新也使用这个脚本；若助手正在运行，脚本会先请求它退出，无法退出就保留旧安装并失败。
+
+如需在隔离目录中验证清理逻辑，可设置一个由当前用户拥有的临时目录：
+
+```bash
+CLASH_MULTI_INSTALL_ROOT="/private/tmp/my-clash-apps" /bin/bash Scripts/install-multi.sh
+```
 
 此构建使用本机 **ad-hoc 签名**，没有 Developer ID 签名，也没有 Apple 公证。macOS 可能阻止首次打开；只有在您确认来源可信并接受风险时，才使用系统提供的针对该应用的允许打开流程。不要全局关闭 Gatekeeper，也不要用管理员权限覆盖现有应用。
 
@@ -110,7 +115,7 @@ env VERIFIED_WORKER_OFFLINE_CACHE="/绝对路径/可信缓存" \
 
 无需先测速：先勾选目标订阅，在主窗口的测速列表中**点选目标节点行**，在底部悬浮控制岛选择当前订阅的 `Selector` 策略组，核对界面显示的组和当前选择，然后点击右下角底栏的 **“⚡ 切换至选中节点”**。点击即申请切换，**不再二次确认**。复选框决定待测节点，行高亮决定手动切换目标，两者用途不同；未勾选、未测速或测速失败的节点也可主动选择，请自行确认其可用性。
 
-如目标属于其他订阅，按提示先在 Clash Verge 手动切换到目标订阅，回到助手并刷新、选择直接包含该节点的策略组，再点击 **“已切换订阅，继续切换所选节点”**；继续按钮本身即申请切换，不再弹确认框。快照变化、无法验证或目标不是该组直接成员时不会发起切换；结果未知时不要盲目重试。发起手动切换会停止已启用的定时任务。所有检查与写入仍非原子操作，切换后应在 Verge 核实。
+如目标属于其他订阅，点击 **“切换至选中节点”** 时，助手会先尝试通过运行时补丁切换订阅并刷新界面，然后自动继续申请策略组切换。若桥接不可用，操作会停止并明确提示，不再显示“手动切换后继续”的按钮。快照变化、无法验证或目标不是该组直接成员时不会发起切换；结果未知时不要盲目重试。发起切换会停止已启用的定时任务。所有检查与写入仍非原子操作，切换后应在 Verge 核实。
 
 ## 理解综合分
 
@@ -131,7 +136,7 @@ env VERIFIED_WORKER_OFFLINE_CACHE="/绝对路径/可信缓存" \
 
 当前实现使用可唯一确定的、属于当前用户的本机 Unix 控制器，查询并切换当前内核中的 `Selector`；不需要为了本助手另外启用 TCP 外部控制器，也不在助手中输入 TCP API 密钥。请不要为了此功能将控制器开放到公网或降低认证保护。
 
-就已查阅的官方源码而言，Mihomo 的配置接口用于重载或替换**内核配置**，而 Verge 的订阅激活由应用内部的配置流程管理，二者不能安全地直接等同。为避免内核与 Verge 的当前订阅状态不一致，本助手不会用内核配置覆盖模拟订阅切换；遇到其他订阅时仍须用户先在 Verge 手动激活。不同版本的接口可能变化，不能据此断言所有第三方工具或未来版本都没有其他方式。参考 [Mihomo 配置路由](https://github.com/MetaCubeX/mihomo/blob/Meta/hub/route/configs.go) 和 [Verge 订阅配置命令](https://github.com/clash-verge-rev/clash-verge-rev/blob/dev/src-tauri/src/cmd/profile.rs)。
+就已查阅的官方源码而言，Mihomo 的配置接口用于重载或替换**内核配置**，而 Verge 的订阅激活由应用内部的配置流程管理，二者不能安全地直接等同。本助手通过官方页面内的运行时补丁调用 Verge 自己的订阅事务，不直接改内核配置；补丁不可用时会停止，不模拟订阅切换。不同版本的接口可能变化，不能据此断言所有第三方工具或未来版本都没有其他方式。参考 [Mihomo 配置路由](https://github.com/MetaCubeX/mihomo/blob/Meta/hub/route/configs.go) 和 [Verge 订阅配置命令](https://github.com/clash-verge-rev/clash-verge-rev/blob/dev/src-tauri/src/cmd/profile.rs)。
 
 ## 可选的应用最高分与撤销
 
@@ -143,11 +148,7 @@ env VERIFIED_WORKER_OFFLINE_CACHE="/绝对路径/可信缓存" \
 
 ### 最高分属于其他订阅
 
-只有启用自动应用时，最高分属于其他订阅才会提示后续流程，并停止定时等待您的决定；助手不会自动切换订阅。自动应用关闭时仅显示结果，不提示跨订阅应用，也不会因此停止定时。若想继续应用其他订阅的最高分：
-
-1. 在 **Clash Verge** 中由您本人手动将当前订阅切到提示的目标，并按名称和 UID 核对。
-2. 回到助手，刷新策略组并在列表下方选中直接包含该节点的 `Selector`，核对所示组与当前选择。
-3. 点击 **“已切换订阅，应用最高分”** 即申请应用，不再弹确认框。助手会重新检查目标订阅、快照、控制器和策略组；若不匹配或校验失败不会继续，也不会改选第二名。修改选项、重新选择或刷新订阅可能清除待处理的最高分。
+只有启用自动应用时，最高分属于其他订阅才会进入后续流程，并停止定时等待当前流程完成；助手会先通过运行时补丁切到提示的目标，再刷新策略组和界面并自动继续应用。若注入不可用，操作会停止并提示检查桥接。助手会重新检查目标订阅、快照、控制器和策略组；若不匹配或校验失败不会继续，也不会改选第二名。存在多个策略组且没有选择时，会提示先在主界面选择当前订阅的策略组；选择后会继续自动应用。修改选项、重新选择或刷新订阅可能清除待处理的最高分。
 
 应用前后会检查订阅、控制器和策略组状态，但**检查与控制器 PUT 不是原子操作**，其他用户操作、配置更新或控制器客户端仍可能同时改变状态；同名节点也不证明运行端点身份。固定到具体节点可能取代原本的自动选择策略，已有连接可能继续使用旧选择，Verge 异步恢复订阅或策略时也可能在复核成功后再次覆盖选择。请回到 Verge 检查实际结果，必要时在 Verge 手动恢复原策略、原节点或原订阅；助手不会替您自动撤销。
 
@@ -174,4 +175,4 @@ env VERIFIED_WORKER_OFFLINE_CACHE="/绝对路径/可信缓存" \
 - **“复制结果”** 会把订阅名称、UID、节点名称及测量结果放到系统剪贴板。为降低粘贴到表格时的公式注入风险，潜在公式前缀会转义，表格分隔符会替换，因此复制内容可能与原始名称不完全一致；这不是对所有表格软件行为的保证。发送截图、日志或粘贴内容前先检查并脱敏；剪贴板同步或其他有权限的软件也可能接触这些内容。不要公开凭据、订阅地址或真实节点信息。
 - 结果反映当前订阅快照、网络环境及当时的测速目标，不代表随后订阅更新后的节点状态。需要切换时，请重新核对 Verge 中的实际配置和策略。
 
-相关实现参考：[多订阅界面](../Sources/MultiMain.swift)、[综合分](../Sources/CompositeScore.swift)、[测量校验](../Sources/VerifiedMeasurement.swift)、[定时器](../Sources/TestSchedule.swift) 和 [构建脚本](../Scripts/build-multi.sh)。不同版本的行为可能不同，请以所使用版本的源码及契约为准。
+相关实现参考：[多订阅界面](../Sources/MultiMain.swift)、[运行时注入](../Sources/ClashRuntimeInjector.swift)、[综合分](../Sources/CompositeScore.swift)、[测量校验](../Sources/VerifiedMeasurement.swift)、[定时器](../Sources/TestSchedule.swift)、[构建脚本](../Scripts/build-multi.sh) 和 [安装清理脚本](../Scripts/install-multi.sh)。不同版本的行为可能不同，请以所使用版本的源码及契约为准。

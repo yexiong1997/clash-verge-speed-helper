@@ -40,7 +40,7 @@ if [[ $# -gt 0 ]]; then
     allow_unverified=1
 fi
 [[ "$(uname -s)" == 'Darwin' && "$(uname -m)" == 'arm64' ]] || die 'Apple Silicon macOS (Darwin arm64) is required'
-[[ -f "$SOURCES_DIR/main.swift" && -f "$SOURCES_DIR/SwitchController.swift" ]] || die 'required Swift sources are missing'
+[[ -f "$SOURCES_DIR/main.swift" && -f "$SOURCES_DIR/SwitchController.swift" && -f "$SOURCES_DIR/ClashRuntimeInjector.swift" ]] || die 'required Swift sources are missing'
 
 ensure_dir() {
     local dir="$1"
@@ -162,7 +162,7 @@ fi
 
 swiftc -swift-version 5 -O -target arm64-apple-macos12.0 \
     -module-cache-path "$module_cache" \
-    "$SOURCES_DIR/main.swift" "$SOURCES_DIR/SwitchController.swift" \
+    "$SOURCES_DIR/main.swift" "$SOURCES_DIR/SwitchController.swift" "$SOURCES_DIR/ClashRuntimeInjector.swift" \
     -o "$app_path/Contents/MacOS/ClashSpeedHelper"
 # App files need normal distribution permissions even though build/ is private.
 chmod 755 "$app_path" "$app_path/Contents" "$app_path/Contents/MacOS" \

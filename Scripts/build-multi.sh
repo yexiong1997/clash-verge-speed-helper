@@ -130,7 +130,7 @@ readonly SOURCES_DIR="$PROJECT_DIR/Sources"
 readonly WORKER_DIR="$PROJECT_DIR/Worker"
 readonly WORKER_BUILDER="$PROJECT_DIR/Scripts/build-verified-worker.sh"
 [[ -d "$SOURCES_DIR" && ! -L "$SOURCES_DIR" && -d "$WORKER_DIR" && ! -L "$WORKER_DIR" ]] || die 'source or worker directory is missing or a symlink'
-swift_sources=(MultiMain.swift ProfileRegistry.swift MultiBatchRunner.swift VerifiedMeasurement.swift CompositeScore.swift TestSchedule.swift SwitchController.swift AssistedSwitch.swift)
+swift_sources=(MultiMain.swift ProfileRegistry.swift MultiBatchRunner.swift VerifiedMeasurement.swift CompositeScore.swift TestSchedule.swift SwitchController.swift AssistedSwitch.swift ClashRuntimeInjector.swift)
 for name in "${swift_sources[@]}"; do
     [[ -f "$SOURCES_DIR/$name" && ! -L "$SOURCES_DIR/$name" && -r "$SOURCES_DIR/$name" ]] || die "required Swift source missing or unsafe: $name"
 done
