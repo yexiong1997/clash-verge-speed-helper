@@ -983,47 +983,77 @@ private struct MultiGroupContext {
     let groups: [ProxyGroup]
 }
 
+private func multiHexColor(_ hex: UInt32, alpha: CGFloat = 1.0) -> NSColor {
+    NSColor(srgbRed: CGFloat((hex >> 16) & 0xFF) / 255,
+            green: CGFloat((hex >> 8) & 0xFF) / 255,
+            blue: CGFloat(hex & 0xFF) / 255, alpha: alpha)
+}
+
+private func multiIsDarkAppearance(_ appearance: NSAppearance) -> Bool {
+    appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+}
+
+// Scheme A uses opaque surfaces. Dynamic tokens keep labels and custom
+// drawing in sync when the system appearance changes.
+enum MultiPalette {
+    private static func color(_ name: String, dark: UInt32, light: UInt32) -> NSColor {
+        NSColor(name: NSColor.Name("ClashGraphite.\(name)")) { appearance in
+            multiHexColor(multiIsDarkAppearance(appearance) ? dark : light)
+        }
+    }
+    static let background = color("background", dark: 0x14171B, light: 0xF3F5F8)
+    static let bar = color("bar", dark: 0x1A1E23, light: 0xF9FAFC)
+    static let panel = color("panel", dark: 0x1C2026, light: 0xFFFFFF)
+    static let elevated = color("elevated", dark: 0x232932, light: 0xEDF1F6)
+    static let border = color("border", dark: 0x39414C, light: 0xC8D0DA)
+    static let divider = color("divider", dark: 0x2C333D, light: 0xDFE4EB)
+    static let text = color("text", dark: 0xEDF1F5, light: 0x202936)
+    static let muted = color("muted", dark: 0xA8B2C0, light: 0x505E70)
+    static let faint = color("faint", dark: 0x9DA9B9, light: 0x5E6B7C)
+    static let accent = color("accent", dark: 0xA9C7FF, light: 0x284F98)
+    static let accentInk = color("accentInk", dark: 0x182538, light: 0xFFFFFF)
+    static let selection = color("selection", dark: 0x28364B, light: 0xE2EBFA)
+    static let success = color("success", dark: 0x84D2B1, light: 0x246A4D)
+    static let successSurface = color("successSurface", dark: 0x20332C, light: 0xE6F1EB)
+    static let warning = color("warning", dark: 0xEDBF80, light: 0x815414)
+    static let danger = color("danger", dark: 0xF2A19C, light: 0xA83732)
+
+    static var outline: NSColor {
+        NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast ? muted : border
+    }
+    static var reducesMotion: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
+}
+
 final class MultiResultRowView: NSTableRowView {
-    var isCascadeHighlighted: Bool = false { didSet { needsDisplay = true } }
-    var isRecentlyScored: Bool = false { didSet { needsDisplay = true } }
-    var isActiveTesting: Bool = false { didSet { needsDisplay = true } }
+    var isCascadeHighlighted = false { didSet { needsDisplay = true } }
+    var isRecentlyScored = false { didSet { needsDisplay = true } }
+    var isActiveTesting = false { didSet { needsDisplay = true } }
     override var isEmphasized: Bool { get { false } set {} }
 
     override func drawBackground(in dirtyRect: NSRect) {
         let b = bounds.insetBy(dx: 4, dy: 1)
         guard b.width > 4, b.height > 4 else { return }
-        let path = NSBezierPath(roundedRect: b, xRadius: 8, yRadius: 8)
+        let path = NSBezierPath(roundedRect: b, xRadius: 5, yRadius: 5)
         if isCascadeHighlighted {
-            multiHexColor(0x6374F2, alpha: 0.14).setFill()
-            path.fill()
-            multiHexColor(0x6374F2, alpha: 0.42).setStroke()
-            path.lineWidth = 1.0
-            path.stroke()
+            MultiPalette.selection.setFill(); path.fill()
         } else if isRecentlyScored {
-            multiHexColor(0x10B981, alpha: 0.13).setFill()
-            path.fill()
-            multiHexColor(0x10B981, alpha: 0.36).setStroke()
-            path.lineWidth = 1.0
-            path.stroke()
+            MultiPalette.successSurface.setFill(); path.fill()
         } else if isActiveTesting {
-            multiHexColor(0x38BDF8, alpha: 0.09).setFill()
-            path.fill()
+            MultiPalette.elevated.setFill(); path.fill()
         }
+        MultiPalette.divider.setFill()
+        NSRect(x: 6, y: bounds.maxY - 0.5, width: max(0, bounds.width - 12), height: 0.5).fill()
     }
 
     override func drawSelection(in dirtyRect: NSRect) {
         guard selectionHighlightStyle != .none else { return }
         let b = bounds.insetBy(dx: 4, dy: 1)
         guard b.width > 4, b.height > 4 else { return }
-        let path = NSBezierPath(roundedRect: b, xRadius: 8, yRadius: 8)
-        let grad = NSGradient(colors: [
-            multiHexColor(0x6374F2, alpha: 0.18),
-            multiHexColor(0x818CF8, alpha: 0.10)
-        ])
-        grad?.draw(in: path, angle: 0)
-        multiHexColor(0x6374F2, alpha: 0.55).setStroke()
-        path.lineWidth = 1.0
-        path.stroke()
+        let path = NSBezierPath(roundedRect: b, xRadius: 5, yRadius: 5)
+        MultiPalette.selection.setFill(); path.fill()
+        if NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast {
+            MultiPalette.accent.setStroke(); path.lineWidth = 1; path.stroke()
+        }
     }
 }
 
@@ -1034,56 +1064,31 @@ enum MultiDockVisualState: Equatable {
     case switchedConfirmed
 }
 
-private func multiHexColor(_ hex: UInt32, alpha: CGFloat = 1.0) -> NSColor {
-    let r = CGFloat((hex >> 16) & 0xFF) / 255.0
-    let g = CGFloat((hex >> 8) & 0xFF) / 255.0
-    let b = CGFloat(hex & 0xFF) / 255.0
-    return NSColor(srgbRed: r, green: g, blue: b, alpha: alpha)
-}
-
-private func multiIsDarkAppearance(_ appearance: NSAppearance) -> Bool {
-    appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-}
-
+// Preserve the existing view API while replacing the old glass treatment.
 enum MultiClearGlassStyle {
-    case clearPrimary
-    case clearSecondary
-    case clearSubtle
-    case clearDanger
-    case frostedCard
-    case frostedDock
-    case darkEmeraldPill
+    case clearPrimary, clearSecondary, clearSubtle, clearDanger
+    case frostedCard, frostedDock, darkEmeraldPill
 }
 
 final class MultiClearAmbientCanvas: NSView {
     override var isFlipped: Bool { true }
     override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-        let b = bounds
-        let dark = multiIsDarkAppearance(effectiveAppearance)
-        let baseGrad = NSGradient(colors: dark ? [
-            multiHexColor(0x111722),
-            multiHexColor(0x172131),
-            multiHexColor(0x202C3D)
-        ] : [
-            multiHexColor(0xF5F7FB),
-            multiHexColor(0xEEF2F9),
-            multiHexColor(0xE6ECF7)
-        ])
-        baseGrad?.draw(in: b, angle: 115)
-
-        let blooms: [(NSPoint, CGFloat, NSColor)] = [
-            (NSPoint(x: b.width * 0.86, y: 54), 320, multiHexColor(0x8B9AF8, alpha: 0.20)),
-            (NSPoint(x: b.width * 0.62, y: 150), 280, multiHexColor(0x67E8F9, alpha: 0.16)),
-            (NSPoint(x: b.width * 0.18, y: b.height - 60), 340, multiHexColor(0xA5B4FC, alpha: 0.18)),
-            (NSPoint(x: b.width * 0.88, y: b.height - 46), 300, multiHexColor(0x818CF8, alpha: 0.22)),
-            (NSPoint(x: b.width * 0.46, y: 310), 260, multiHexColor(0x6EE7B7, alpha: 0.12))
-        ]
-        for (center, radius, color) in blooms {
-            if let grad = NSGradient(starting: color, ending: color.withAlphaComponent(0.0)) {
-                grad.draw(fromCenter: center, radius: 0, toCenter: center, radius: radius, options: [])
-            }
+        MultiPalette.background.setFill(); bounds.fill()
+        MultiPalette.bar.setFill()
+        NSRect(x: 0, y: 0, width: bounds.width, height: 54).fill()
+        MultiPalette.divider.setFill()
+        NSRect(x: 0, y: 53, width: bounds.width, height: 1).fill()
+    }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        invalidateAppearance()
+    }
+    func invalidateAppearance() {
+        func redraw(_ view: NSView) {
+            view.needsDisplay = true
+            for child in view.subviews { redraw(child) }
         }
+        redraw(self)
     }
 }
 
@@ -1098,197 +1103,39 @@ final class MultiClearFrostedSurface: NSView {
     }
 
     init(style: MultiClearGlassStyle, cornerRadius: CGFloat = 14, isCapsule: Bool = false) {
-        self.style = style
-        self.cornerRadius = cornerRadius
-        self.isCapsule = isCapsule
+        self.style = style; self.cornerRadius = cornerRadius; self.isCapsule = isCapsule
         super.init(frame: .zero)
-        self.wantsLayer = true
+        wantsLayer = true
     }
     required init?(coder: NSCoder) { nil }
     override var isFlipped: Bool { true }
 
     override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
-        let b = bounds
-        guard b.width > 2, b.height > 2 else { return }
-        let dark = multiIsDarkAppearance(effectiveAppearance)
-        let r = isCapsule ? (b.height / 2.0) : cornerRadius
-
-        ctx.saveGState()
-        let shadowRect = b.insetBy(dx: 1.0, dy: 1.2)
-        let shadowPath = NSBezierPath(roundedRect: shadowRect.offsetBy(dx: 0, dy: 1.4), xRadius: r, yRadius: r)
+        guard bounds.width > 2, bounds.height > 2 else { return }
+        let r = style == .frostedDock ? 12 : (isCapsule ? min(6, bounds.height / 2) : cornerRadius)
+        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: r, yRadius: r)
         switch style {
-        case .clearPrimary:
-            multiHexColor(0x3B49DF, alpha: 0.12).setFill()
-        case .frostedDock:
-            switch dockState {
-            case .racing:
-                multiHexColor(0x4F46E5, alpha: 0.14).setFill()
-            case .crossProfilePending(let ready):
-                (ready ? multiHexColor(0x10B981, alpha: 0.16) : multiHexColor(0xF59E0B, alpha: 0.15)).setFill()
-            case .switchedConfirmed:
-                multiHexColor(0x10B981, alpha: 0.16).setFill()
-            case .idle:
-                multiHexColor(0x0F172A, alpha: 0.08).setFill()
-            }
-        case .darkEmeraldPill:
-            NSColor.clear.setFill()
-        default:
-            multiHexColor(0x0F172A, alpha: 0.05).setFill()
+        case .darkEmeraldPill: MultiPalette.successSurface.setFill()
+        case .clearPrimary, .clearSecondary, .clearDanger: MultiPalette.elevated.setFill()
+        default: MultiPalette.panel.setFill()
         }
-        shadowPath.fill()
-        ctx.restoreGState()
-
-        let mainRect = b.insetBy(dx: 1.0, dy: 1.0)
-        let mainPath = NSBezierPath(roundedRect: mainRect, xRadius: r, yRadius: r)
-
-        ctx.saveGState()
-        mainPath.addClip()
-        switch style {
-        case .clearPrimary, .clearSecondary:
-            let frostGrad = NSGradient(colorsAndLocations:
-                (multiHexColor(0xFFFFFF, alpha: 0.62), 0.0),
-                (multiHexColor(0xFFFFFF, alpha: 0.28), 0.42),
-                (multiHexColor(0xFFFFFF, alpha: 0.18), 0.72),
-                (multiHexColor(0xF0F4FC, alpha: 0.34), 1.0)
-            )
-            frostGrad?.draw(in: mainRect, angle: 90)
-            let diagGrad = NSGradient(colors: [
-                multiHexColor(0xFFFFFF, alpha: 0.40),
-                multiHexColor(0xFFFFFF, alpha: 0.0)
-            ])
-            diagGrad?.draw(in: NSRect(x: mainRect.minX, y: mainRect.minY, width: mainRect.width * 0.7, height: mainRect.height * 0.68), angle: 35)
-        case .clearSubtle:
-            let frostGrad = NSGradient(colors: [
-                multiHexColor(0xFFFFFF, alpha: 0.36),
-                multiHexColor(0xFFFFFF, alpha: 0.12)
-            ])
-            frostGrad?.draw(in: mainRect, angle: 90)
-        case .clearDanger:
-            let frostGrad = NSGradient(colors: [
-                multiHexColor(0xFFF5F5, alpha: 0.56),
-                multiHexColor(0xFFFFFF, alpha: 0.20)
-            ])
-            frostGrad?.draw(in: mainRect, angle: 90)
-        case .frostedCard:
-            let frostGrad = NSGradient(colors: [
-                multiHexColor(0xFFFFFF, alpha: 0.68),
-                multiHexColor(0xFFFFFF, alpha: 0.46)
-            ])
-            frostGrad?.draw(in: mainRect, angle: 90)
-        case .frostedDock:
-            let frostGrad = NSGradient(colors: [
-                multiHexColor(0xFFFFFF, alpha: 0.70),
-                multiHexColor(0xF5F7FC, alpha: 0.48)
-            ])
-            frostGrad?.draw(in: mainRect, angle: 90)
-            switch dockState {
-            case .racing(let progress):
-                let clamped = max(0.02, min(1.0, progress))
-                let trackRect = NSRect(x: mainRect.minX + 18, y: mainRect.maxY - 3.5, width: (mainRect.width - 36) * clamped, height: 3.0)
-                let trackPath = NSBezierPath(roundedRect: trackRect, xRadius: 1.5, yRadius: 1.5)
-                let barGrad = NSGradient(colors: [
-                    multiHexColor(0x6374F2, alpha: 0.88),
-                    multiHexColor(0x38BDF8, alpha: 0.92),
-                    multiHexColor(0x10B981, alpha: 0.90)
-                ])
-                barGrad?.draw(in: trackPath, angle: 0)
-            case .crossProfilePending(let ready):
-                let tint = ready ? multiHexColor(0x10B981, alpha: 0.10) : multiHexColor(0xF59E0B, alpha: 0.10)
-                let wash = NSGradient(colors: [tint, NSColor.clear])
-                wash?.draw(in: mainRect, angle: 0)
-            case .switchedConfirmed:
-                let wash = NSGradient(colors: [multiHexColor(0x10B981, alpha: 0.10), NSColor.clear])
-                wash?.draw(in: mainRect, angle: 0)
-            case .idle:
-                break
-            }
-        case .darkEmeraldPill:
-            let frostGrad = NSGradient(colors: [
-                multiHexColor(0x10B981, alpha: 0.22),
-                multiHexColor(0x059669, alpha: 0.12)
-            ])
-            frostGrad?.draw(in: mainRect, angle: 90)
-        }
-        if dark {
-            // The content layer must stay dark in Dark Mode; otherwise the
-            // semantic light labels used by NSTableView become unreadable.
-            multiHexColor(0x111827, alpha: 0.68).setFill()
-            mainPath.fill()
-        }
-        ctx.restoreGState()
-
-        mainPath.lineWidth = 1.0
-        switch style {
-        case .clearPrimary:
-            multiHexColor(0x6374F2, alpha: 0.78).setStroke()
-        case .clearSecondary:
-            multiHexColor(0xC5CBD8, alpha: 0.85).setStroke()
-        case .clearSubtle:
-            multiHexColor(0xD8DCE6, alpha: 0.65).setStroke()
-        case .clearDanger:
-            multiHexColor(0xEF4444, alpha: 0.72).setStroke()
-        case .frostedCard:
-            multiHexColor(0xC8D0E0, alpha: 0.68).setStroke()
-        case .frostedDock:
-            switch dockState {
-            case .racing:
-                mainPath.lineWidth = 1.3
-                multiHexColor(0x6374F2, alpha: 0.82).setStroke()
-            case .crossProfilePending(let ready):
-                mainPath.lineWidth = 1.4
-                (ready ? multiHexColor(0x10B981, alpha: 0.85) : multiHexColor(0xF59E0B, alpha: 0.82)).setStroke()
-            case .switchedConfirmed:
-                mainPath.lineWidth = 1.3
-                multiHexColor(0x10B981, alpha: 0.82).setStroke()
-            case .idle:
-                multiHexColor(0xC8D0E0, alpha: 0.68).setStroke()
-            }
-        case .darkEmeraldPill:
-            multiHexColor(0x34D399, alpha: 0.46).setStroke()
-        }
-        mainPath.stroke()
-
-        let innerRect = mainRect.insetBy(dx: 1.0, dy: 1.0)
-        if innerRect.width > 2 && innerRect.height > 2 {
-            let innerR = max(1, r - 1.0)
-            let innerPath = NSBezierPath(roundedRect: innerRect, xRadius: innerR, yRadius: innerR)
-            innerPath.lineWidth = 1.0
-            switch style {
-            case .darkEmeraldPill:
-                multiHexColor(0xA7F3D0, alpha: 0.22).setStroke()
-            case .clearSubtle:
-                multiHexColor(0xFFFFFF, alpha: 0.65).setStroke()
-            default:
-                multiHexColor(0xFFFFFF, alpha: 0.88).setStroke()
-            }
-            innerPath.stroke()
-
-            if style != .darkEmeraldPill {
-                ctx.saveGState()
-                let topClip = NSRect(x: innerRect.minX, y: innerRect.minY, width: innerRect.width, height: min(5.0, innerRect.height * 0.35))
-                NSBezierPath(rect: topClip).addClip()
-                let topSpec = NSBezierPath(roundedRect: innerRect, xRadius: innerR, yRadius: innerR)
-                topSpec.lineWidth = 1.4
-                multiHexColor(0xFFFFFF, alpha: 0.95).setStroke()
-                topSpec.stroke()
-                ctx.restoreGState()
-            }
-        }
+        path.fill()
+        MultiPalette.outline.setStroke()
+        path.lineWidth = 1
+        path.stroke()
     }
 }
 
 final class MultiClearGlassButton: NSButton {
     var glassStyle: MultiClearGlassStyle = .clearSecondary { didSet { needsDisplay = true } }
+    var isProminent = false { didSet { needsDisplay = true } }
     var symbolName: String? { didSet { invalidateIntrinsicContentSize(); needsDisplay = true } }
     var pillHeight: CGFloat = 30 { didSet { invalidateIntrinsicContentSize(); needsDisplay = true } }
     var hPadding: CGFloat = 12 { didSet { invalidateIntrinsicContentSize(); needsDisplay = true } }
     var fontSize: CGFloat = 12 { didSet { invalidateIntrinsicContentSize(); needsDisplay = true } }
     var leadingDotColor: NSColor? { didSet { invalidateIntrinsicContentSize(); needsDisplay = true } }
-    var progressFraction: CGFloat = 0 { didSet { needsDisplay = true } }
-    private var isHovered: Bool = false { didSet { needsDisplay = true } }
-    private var isPressedVisual: Bool = false { didSet { needsDisplay = true } }
+    private var isHovered = false { didSet { needsDisplay = true } }
+    private var isPressedVisual = false { didSet { needsDisplay = true } }
     private var trackingAreaRef: NSTrackingArea?
     override var title: String { didSet { invalidateIntrinsicContentSize(); needsDisplay = true } }
     override var isEnabled: Bool { didSet { needsDisplay = true } }
@@ -1296,369 +1143,233 @@ final class MultiClearGlassButton: NSButton {
     convenience init(title: String, symbol: String? = nil, style: MultiClearGlassStyle = .clearSecondary,
                      height: CGFloat = 30, hPadding: CGFloat = 12, fontSize: CGFloat = 12) {
         self.init(frame: .zero)
-        self.title = title
-        self.symbolName = symbol
-        self.glassStyle = style
-        self.pillHeight = height
-        self.hPadding = hPadding
-        self.fontSize = fontSize
-        self.isBordered = false
-        self.bezelStyle = .regularSquare
-        self.setButtonType(.momentaryPushIn)
+        self.title = title; symbolName = symbol; glassStyle = style
+        pillHeight = height; self.hPadding = hPadding; self.fontSize = fontSize
+        isBordered = false; bezelStyle = .regularSquare
+        setButtonType(.momentaryPushIn)
     }
-
     override var isFlipped: Bool { true }
+    private var labelFont: NSFont { .systemFont(ofSize: fontSize, weight: .semibold) }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let existing = trackingAreaRef { removeTrackingArea(existing) }
-        let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self, userInfo: nil)
-        addTrackingArea(area)
-        trackingAreaRef = area
+        let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                  owner: self, userInfo: nil)
+        addTrackingArea(area); trackingAreaRef = area
     }
-
     override func mouseEntered(with event: NSEvent) {
         super.mouseEntered(with: event)
         if isEnabled { isHovered = true }
     }
-
     override func mouseExited(with event: NSEvent) {
         super.mouseExited(with: event)
-        isHovered = false
-        isPressedVisual = false
+        isHovered = false; isPressedVisual = false
     }
-
     override func mouseDown(with event: NSEvent) {
         guard isEnabled else { return }
         isPressedVisual = true
         super.mouseDown(with: event)
         isPressedVisual = false
     }
-
-    private var labelFont: NSFont {
-        let weight: NSFont.Weight = (glassStyle == .clearPrimary || glassStyle == .clearDanger || glassStyle == .darkEmeraldPill) ? .bold : .semibold
-        return .systemFont(ofSize: fontSize, weight: weight)
-    }
-
     override var intrinsicContentSize: NSSize {
-        let attr: [NSAttributedString.Key: Any] = [.font: labelFont]
-        let textW = ceil((title as NSString).size(withAttributes: attr).width)
-        let iconW: CGFloat = (symbolName != nil) ? (fontSize + 5.0) : 0
-        let dotW: CGFloat = (leadingDotColor != nil) ? 12.0 : 0
-        return NSSize(width: hPadding * 2.0 + dotW + iconW + textW + 2.0, height: pillHeight)
+        let textW = ceil((title as NSString).size(withAttributes: [.font: labelFont]).width)
+        let iconW: CGFloat = symbolName == nil ? 0 : fontSize + 5
+        return NSSize(width: hPadding * 2 + (leadingDotColor == nil ? 0 : 12) + iconW + textW + 2,
+                      height: pillHeight)
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        guard bounds.width > 2, bounds.height > 2 else { return }
         let b = bounds
-        guard b.width > 2, b.height > 2 else { return }
-
-        ctx.saveGState()
-        defer { ctx.restoreGState() }
-
+        let prominent = glassStyle == .clearPrimary && isProminent && isEnabled
+        let selected = glassStyle == .clearPrimary && isEnabled
+        var fill: NSColor = prominent ? MultiPalette.accent :
+            (selected ? MultiPalette.selection : MultiPalette.elevated)
+        var ink: NSColor = MultiPalette.text
+        if !isEnabled { ink = MultiPalette.faint }
+        else if prominent { ink = MultiPalette.accentInk }
+        else if selected { ink = MultiPalette.accent }
+        else if glassStyle == .clearDanger { ink = MultiPalette.danger }
+        else if glassStyle == .darkEmeraldPill { ink = MultiPalette.success; fill = MultiPalette.successSurface }
+        else if glassStyle == .clearSubtle { ink = MultiPalette.muted; fill = MultiPalette.panel }
         if isPressedVisual && isEnabled {
-            let cx = b.midX, cy = b.midY
-            ctx.translateBy(x: cx, y: cy)
-            ctx.scaleBy(x: 0.972, y: 0.972)
-            ctx.translateBy(x: -cx, y: -cy)
+            fill = fill.blended(withFraction: 0.10, of: ink) ?? fill
+        } else if isHovered && isEnabled && !prominent {
+            fill = selected ? MultiPalette.selection : MultiPalette.elevated
         }
+        let path = NSBezierPath(roundedRect: b.insetBy(dx: 1, dy: 1), xRadius: 6, yRadius: 6)
+        fill.setFill(); path.fill()
+        let focused = window?.firstResponder === self
+        (focused ? MultiPalette.accent : (isHovered && isEnabled ? MultiPalette.muted : MultiPalette.outline)).setStroke()
+        path.lineWidth = focused ? 2 : 1
+        path.stroke()
 
-        let r = b.height / 2.0
-        let dark = multiIsDarkAppearance(effectiveAppearance)
-        // Disabled controls should recede, but remain readable against the
-        // pale glass surface. 0.46 made labels effectively disappear.
-        let alphaFactor: CGFloat = isEnabled ? 1.0 : 0.72
-        let hoverBoost: CGFloat = (isHovered && isEnabled) ? 0.14 : 0.0
-
-        let mainRect = b.insetBy(dx: 1.0, dy: 1.0)
-        let mainPath = NSBezierPath(roundedRect: mainRect, xRadius: r, yRadius: r)
-
-        ctx.saveGState()
-        mainPath.addClip()
-        switch glassStyle {
-        case .clearPrimary, .clearSecondary:
-            let frostGrad = NSGradient(colorsAndLocations:
-                (multiHexColor(0xFFFFFF, alpha: min(0.88, (0.62 + hoverBoost) * alphaFactor)), 0.0),
-                (multiHexColor(0xFFFFFF, alpha: (0.28 + hoverBoost * 0.5) * alphaFactor), 0.42),
-                (multiHexColor(0xFFFFFF, alpha: (0.18 + hoverBoost * 0.4) * alphaFactor), 0.72),
-                (multiHexColor(0xF0F4FC, alpha: (0.34 + hoverBoost * 0.6) * alphaFactor), 1.0)
-            )
-            frostGrad?.draw(in: mainRect, angle: 90)
-            let diagGrad = NSGradient(colors: [
-                multiHexColor(0xFFFFFF, alpha: (0.42 + hoverBoost) * alphaFactor),
-                multiHexColor(0xFFFFFF, alpha: 0.0)
-            ])
-            diagGrad?.draw(in: NSRect(x: mainRect.minX, y: mainRect.minY, width: mainRect.width * 0.74, height: mainRect.height * 0.70), angle: 35)
-        case .clearDanger:
-            let frostGrad = NSGradient(colors: [
-                multiHexColor(0xFFF5F5, alpha: (0.58 + hoverBoost) * alphaFactor),
-                multiHexColor(0xFFFFFF, alpha: 0.22 * alphaFactor)
-            ])
-            frostGrad?.draw(in: mainRect, angle: 90)
-        case .darkEmeraldPill:
-            let frostGrad = NSGradient(colors: [
-                multiHexColor(0x10B981, alpha: (0.26 + hoverBoost) * alphaFactor),
-                multiHexColor(0x059669, alpha: 0.14 * alphaFactor)
-            ])
-            frostGrad?.draw(in: mainRect, angle: 90)
-        default:
-            let frostGrad = NSGradient(colors: [
-                multiHexColor(0xFFFFFF, alpha: (0.38 + hoverBoost) * alphaFactor),
-                multiHexColor(0xFFFFFF, alpha: 0.14 * alphaFactor)
-            ])
-            frostGrad?.draw(in: mainRect, angle: 90)
-        }
-        if dark {
-            multiHexColor(0x111827, alpha: 0.72).setFill()
-            mainPath.fill()
-        }
-
-        if progressFraction > 0.005 {
-            let clamped = max(0.02, min(1.0, progressFraction))
-            let progRect = NSRect(x: mainRect.minX, y: mainRect.minY, width: mainRect.width * clamped, height: mainRect.height)
-            let progGrad = NSGradient(colors: [
-                multiHexColor(0x6374F2, alpha: 0.26 * alphaFactor),
-                multiHexColor(0x38BDF8, alpha: 0.24 * alphaFactor)
-            ])
-            progGrad?.draw(in: progRect, angle: 0)
-            let edgeRect = NSRect(x: progRect.maxX - 1.5, y: mainRect.minY + 2, width: 1.5, height: mainRect.height - 4)
-            multiHexColor(0x6374F2, alpha: 0.65 * alphaFactor).setFill()
-            NSBezierPath(rect: edgeRect).fill()
-        }
-        ctx.restoreGState()
-
-        mainPath.lineWidth = (isHovered && isEnabled) ? 1.25 : 1.0
-        switch glassStyle {
-        case .clearPrimary:
-            multiHexColor(0x6374F2, alpha: min(1.0, (0.78 + hoverBoost) * alphaFactor)).setStroke()
-        case .clearDanger:
-            multiHexColor(0xEF4444, alpha: min(1.0, (0.72 + hoverBoost) * alphaFactor)).setStroke()
-        case .darkEmeraldPill:
-            multiHexColor(0x34D399, alpha: min(1.0, (0.55 + hoverBoost) * alphaFactor)).setStroke()
-        case .clearSubtle:
-            multiHexColor(0xD8DCE6, alpha: (0.65 + hoverBoost) * alphaFactor).setStroke()
-        default:
-            multiHexColor(0xC5CBD8, alpha: (0.85 + hoverBoost) * alphaFactor).setStroke()
-        }
-        mainPath.stroke()
-
-        let innerRect = mainRect.insetBy(dx: 1.0, dy: 1.0)
-        if innerRect.width > 2 && innerRect.height > 2 && glassStyle != .darkEmeraldPill {
-            let innerR = max(1, r - 1.0)
-            let innerPath = NSBezierPath(roundedRect: innerRect, xRadius: innerR, yRadius: innerR)
-            innerPath.lineWidth = 1.0
-            multiHexColor(0xFFFFFF, alpha: 0.88 * alphaFactor).setStroke()
-            innerPath.stroke()
-
-            ctx.saveGState()
-            let topClip = NSRect(x: innerRect.minX, y: innerRect.minY, width: innerRect.width, height: min(5.0, innerRect.height * 0.35))
-            NSBezierPath(rect: topClip).addClip()
-            let topSpec = NSBezierPath(roundedRect: innerRect, xRadius: innerR, yRadius: innerR)
-            topSpec.lineWidth = 1.4
-            multiHexColor(0xFFFFFF, alpha: 0.96 * alphaFactor).setStroke()
-            topSpec.stroke()
-            ctx.restoreGState()
-        }
-
-        let fgColor: NSColor
-        switch glassStyle {
-        case .clearPrimary:
-            fgColor = multiHexColor(dark ? 0xD7DEFF : 0x2532B8, alpha: alphaFactor)
-        case .clearDanger:
-            fgColor = multiHexColor(dark ? 0xFFB4AB : 0xDC2626, alpha: alphaFactor)
-        case .darkEmeraldPill:
-            fgColor = multiHexColor(0x34D399, alpha: alphaFactor)
-        case .clearSubtle:
-            fgColor = multiHexColor(dark ? 0xCBD5E1 : 0x687082, alpha: alphaFactor)
-        default:
-            fgColor = multiHexColor(dark ? 0xE5E7EB : 0x1E222D, alpha: alphaFactor)
-        }
-
-        let attr: [NSAttributedString.Key: Any] = [
-            .font: labelFont,
-            .foregroundColor: fgColor
-        ]
+        let attr: [NSAttributedString.Key: Any] = [.font: labelFont, .foregroundColor: ink]
         let textSize = (title as NSString).size(withAttributes: attr)
-        let iconW: CGFloat = (symbolName != nil) ? (fontSize + 4.0) : 0
-        let dotW: CGFloat = (leadingDotColor != nil) ? 11.0 : 0
-        let totalW = dotW + iconW + textSize.width
-        var cursorX = (b.width - totalW) / 2.0
-
+        let iconW: CGFloat = symbolName == nil ? 0 : fontSize + 4
+        let dotW: CGFloat = leadingDotColor == nil ? 0 : 11
+        let textW = min(textSize.width, max(0, b.width - hPadding * 2 - iconW - dotW))
+        var cursorX = max(hPadding, (b.width - dotW - iconW - textW) / 2)
         if let dot = leadingDotColor {
-            let dotRect = NSRect(x: cursorX, y: (b.height - 6.5) / 2.0, width: 6.5, height: 6.5)
-            let dotPath = NSBezierPath(ovalIn: dotRect)
-            dot.withAlphaComponent(alphaFactor).setFill()
-            dotPath.fill()
-            cursorX += 11.0
+            (isEnabled ? dot : MultiPalette.faint).setFill()
+            NSBezierPath(ovalIn: NSRect(x: cursorX, y: (b.height - 6) / 2, width: 6, height: 6)).fill()
+            cursorX += 11
         }
-
-        if let sym = symbolName, let img = NSImage(systemSymbolName: sym, accessibilityDescription: nil) {
-            let cfg = NSImage.SymbolConfiguration(pointSize: fontSize - 1.0, weight: .bold)
-            if let configured = img.withSymbolConfiguration(cfg),
-               let tinted = configured.copy() as? NSImage {
-                tinted.lockFocus()
-                fgColor.set()
-                NSRect(origin: .zero, size: tinted.size).fill(using: .sourceAtop)
-                tinted.unlockFocus()
-                let imgSize = tinted.size
-                let imgRect = NSRect(x: cursorX, y: (b.height - imgSize.height) / 2.0, width: imgSize.width, height: imgSize.height)
-                tinted.draw(in: imgRect)
-            }
+        if let symbol = symbolName, let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil),
+           let configured = image.withSymbolConfiguration(.init(pointSize: fontSize - 1, weight: .semibold)),
+           let tinted = configured.copy() as? NSImage {
+            tinted.lockFocus(); ink.set()
+            NSRect(origin: .zero, size: tinted.size).fill(using: .sourceAtop)
+            tinted.unlockFocus()
+            tinted.draw(in: NSRect(x: cursorX, y: (b.height - tinted.size.height) / 2,
+                                  width: tinted.size.width, height: tinted.size.height))
             cursorX += iconW
         }
-
-        let textRect = NSRect(x: cursorX, y: (b.height - textSize.height) / 2.0 - 0.5, width: textSize.width + 2.0, height: textSize.height)
-        (title as NSString).draw(in: textRect, withAttributes: attr)
+        let paragraph = NSMutableParagraphStyle(); paragraph.lineBreakMode = .byTruncatingTail
+        var textAttr = attr; textAttr[.paragraphStyle] = paragraph
+        (title as NSString).draw(in: NSRect(x: cursorX, y: (b.height - textSize.height) / 2 - 0.5,
+                                          width: textW + 2, height: textSize.height), withAttributes: textAttr)
     }
 }
 
 final class MultiChampionCardView: NSView {
-    var crownPulseIntensity: CGFloat = 0.0 { didSet { needsDisplay = true } }
-    var isCrossProfileReady: Bool = false { didSet { needsDisplay = true } }
+    var crownPulseIntensity: CGFloat = 0 { didSet { needsDisplay = true } }
+    var isCrossProfileReady = false { didSet { needsDisplay = true } }
     override var isFlipped: Bool { true }
     override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-        let b = bounds
-        let path = NSBezierPath(roundedRect: b, xRadius: 14, yRadius: 14)
-        let grad = NSGradient(colors: [multiHexColor(0x181A24), multiHexColor(0x12141C)])
-        grad?.draw(in: path, angle: 135)
-
-        NSGraphicsContext.current?.saveGraphicsState()
-        path.addClip()
-        let baseAlpha = 0.24 + min(0.32, crownPulseIntensity * 0.28)
-        let glowGrad = NSGradient(colors: [
-            multiHexColor(0x5263FF, alpha: baseAlpha),
-            multiHexColor(0x5263FF, alpha: 0.0)
-        ])
-        glowGrad?.draw(fromCenter: NSPoint(x: b.width - 54, y: 34), radius: 0,
-                       toCenter: NSPoint(x: b.width - 54, y: 34), radius: 175 + crownPulseIntensity * 25, options: [])
-        if crownPulseIntensity > 0.05 || isCrossProfileReady {
-            let emeraldAlpha = isCrossProfileReady ? 0.22 : (crownPulseIntensity * 0.24)
-            let emeraldGlow = NSGradient(colors: [
-                multiHexColor(0x10B981, alpha: emeraldAlpha),
-                multiHexColor(0x10B981, alpha: 0.0)
-            ])
-            emeraldGlow?.draw(fromCenter: NSPoint(x: 74, y: b.height - 26), radius: 0,
-                              toCenter: NSPoint(x: 74, y: b.height - 26), radius: 150, options: [])
-        }
-        NSGraphicsContext.current?.restoreGraphicsState()
-
-        let rim = NSBezierPath(roundedRect: b.insetBy(dx: 0.5, dy: 0.5), xRadius: 13.5, yRadius: 13.5)
-        rim.lineWidth = (crownPulseIntensity > 0.1 || isCrossProfileReady) ? 1.3 : 1.0
-        if isCrossProfileReady {
-            multiHexColor(0x34D399, alpha: 0.55).setStroke()
-        } else if crownPulseIntensity > 0.1 {
-            multiHexColor(0x818CF8, alpha: 0.45 + crownPulseIntensity * 0.35).setStroke()
-        } else {
-            multiHexColor(0xFFFFFF, alpha: 0.09).setStroke()
-        }
-        rim.stroke()
+        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 14, yRadius: 14)
+        let feedback = MultiPalette.reducesMotion ? 0 : min(1, max(0, crownPulseIntensity)) * 0.35
+        (MultiPalette.panel.blended(withFraction: feedback, of: MultiPalette.selection) ?? MultiPalette.panel).setFill()
+        path.fill()
+        MultiPalette.outline.setStroke(); path.lineWidth = 1; path.stroke()
     }
 }
 
 final class MultiSpeedBarCellView: NSTableCellView {
-    var speedText: String = "—" { didSet { needsDisplay = true } }
+    var speedText = "—" { didSet { needsDisplay = true; setAccessibilityValue(speedText) } }
     var fraction: CGFloat = 0 { didSet { needsDisplay = true } }
-    var isTesting: Bool = false { didSet { needsDisplay = true } }
-    var shimmerPhase: CGFloat = 0 { didSet { needsDisplay = true } }
+    var isTesting = false { didSet { needsDisplay = true } }
     override var isFlipped: Bool { true }
 
-    func configure(text: String, fraction: CGFloat, isTop: Bool, isTesting: Bool, shimmerPhase: CGFloat) {
-        self.speedText = text
-        self.fraction = max(0, min(1, fraction))
-        self.isTesting = isTesting
-        self.shimmerPhase = shimmerPhase
+    func configure(text: String, fraction: CGFloat, isTesting: Bool) {
+        speedText = text; self.fraction = max(0, min(1, fraction)); self.isTesting = isTesting
+        setAccessibilityElement(true); setAccessibilityRole(.staticText)
+        setAccessibilityLabel("验证吞吐")
+        setAccessibilityValue(isTesting ? "测速中" : text)
     }
-
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         let b = bounds
         guard b.width > 12, b.height > 10 else { return }
-
-        if isTesting {
-            let text = "⚡ 测速中…"
-            let attr: [NSAttributedString.Key: Any] = [
-                .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold),
-                .foregroundColor: multiHexColor(0x2532B8)
-            ]
-            let sz = (text as NSString).size(withAttributes: attr)
-            (text as NSString).draw(in: NSRect(x: max(4, b.width - sz.width - 8), y: 4, width: sz.width + 2, height: sz.height), withAttributes: attr)
-
-            let barBg = NSRect(x: 8, y: b.height - 7, width: b.width - 16, height: 3.5)
-            multiHexColor(0x6374F2, alpha: 0.14).setFill()
-            NSBezierPath(roundedRect: barBg, xRadius: 1.75, yRadius: 1.75).fill()
-
-            let segW = max(18, barBg.width * 0.42)
-            let travel = barBg.width - segW
-            let xPos = barBg.minX + travel * (0.5 + 0.5 * sin(shimmerPhase * .pi * 2.0))
-            let segRect = NSRect(x: xPos, y: barBg.minY, width: segW, height: barBg.height)
-            let segPath = NSBezierPath(roundedRect: segRect, xRadius: 1.75, yRadius: 1.75)
-            let grad = NSGradient(colors: [
-                multiHexColor(0x6374F2, alpha: 0.85),
-                multiHexColor(0x38BDF8, alpha: 0.92)
-            ])
-            grad?.draw(in: segPath, angle: 0)
-            return
-        }
-
-        let isMeasured = speedText != "—"
+        let measured = speedText != "—"
+        let text = isTesting ? "测速中…" : speedText
         let attr: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: isMeasured ? .semibold : .regular),
-            .foregroundColor: isMeasured ? NSColor.labelColor : NSColor.tertiaryLabelColor
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: measured ? .medium : .regular),
+            .foregroundColor: isTesting ? MultiPalette.accent : (measured ? MultiPalette.text : MultiPalette.faint)
         ]
-        let sz = (speedText as NSString).size(withAttributes: attr)
-        let textY: CGFloat = isMeasured ? 3.5 : ((b.height - sz.height) / 2.0)
-        (speedText as NSString).draw(in: NSRect(x: max(4, b.width - sz.width - 8), y: textY, width: sz.width + 2, height: sz.height), withAttributes: attr)
-
-        guard isMeasured, fraction > 0.005 else { return }
-        let barBg = NSRect(x: 8, y: b.height - 6.5, width: b.width - 16, height: 3.5)
-        multiHexColor(0xCBD5E1, alpha: 0.35).setFill()
-        NSBezierPath(roundedRect: barBg, xRadius: 1.75, yRadius: 1.75).fill()
-
-        let fillW = max(6, barBg.width * min(1.0, fraction))
-        let fillRect = NSRect(x: barBg.maxX - fillW, y: barBg.minY, width: fillW, height: barBg.height)
-        let fillPath = NSBezierPath(roundedRect: fillRect, xRadius: 1.75, yRadius: 1.75)
-        let barGrad = NSGradient(colors: [
-            multiHexColor(0x6374F2, alpha: 0.85),
-            multiHexColor(0x10B981, alpha: 0.90)
-        ])
-        barGrad?.draw(in: fillPath, angle: 0)
+        let size = (text as NSString).size(withAttributes: attr)
+        let y: CGFloat = measured || isTesting ? 3.5 : (b.height - size.height) / 2
+        (text as NSString).draw(in: NSRect(x: max(4, b.width - size.width - 8), y: y,
+                                         width: size.width + 2, height: size.height), withAttributes: attr)
+        guard isTesting || (measured && fraction > 0.005) else { return }
+        let track = NSRect(x: 8, y: b.height - 6, width: b.width - 16, height: 2)
+        MultiPalette.border.setFill()
+        NSBezierPath(roundedRect: track, xRadius: 1, yRadius: 1).fill()
+        let width = track.width * (isTesting ? 0.32 : fraction)
+        MultiPalette.accent.setFill()
+        NSBezierPath(roundedRect: NSRect(x: track.maxX - width, y: track.minY, width: width, height: 2),
+                     xRadius: 1, yRadius: 1).fill()
     }
 }
 
 final class MultiSparklineView: NSView {
-    var points: [CGFloat] = [0.64, 0.76, 0.72, 0.88, 0.94, 0.91] { didSet { needsDisplay = true } }
-    var strokeColor: NSColor = multiHexColor(0x34D399) { didSet { needsDisplay = true } }
+    var points: [CGFloat] = [] { didSet { needsDisplay = true } }
+    var strokeColor: NSColor = MultiPalette.accent { didSet { needsDisplay = true } }
     override var isFlipped: Bool { true }
-
     override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
         guard points.count > 1 else { return }
-        let w = bounds.width, h = bounds.height
-        let step = w / CGFloat(points.count - 1)
         let path = NSBezierPath()
-        let fillPath = NSBezierPath()
-        for (i, p) in points.enumerated() {
-            let x = CGFloat(i) * step
-            let y = h - (p * (h - 6)) - 3
-            if i == 0 {
-                path.move(to: NSPoint(x: x, y: y))
-                fillPath.move(to: NSPoint(x: x, y: h))
-                fillPath.line(to: NSPoint(x: x, y: y))
-            } else {
-                path.line(to: NSPoint(x: x, y: y))
-                fillPath.line(to: NSPoint(x: x, y: y))
-            }
+        for (i, point) in points.enumerated() {
+            let p = NSPoint(x: CGFloat(i) * bounds.width / CGFloat(points.count - 1),
+                            y: bounds.height - point * (bounds.height - 6) - 3)
+            if i == 0 { path.move(to: p) } else { path.line(to: p) }
         }
-        fillPath.line(to: NSPoint(x: w, y: h))
-        fillPath.close()
-        let grad = NSGradient(colors: [strokeColor.withAlphaComponent(0.24), strokeColor.withAlphaComponent(0.0)])
-        grad?.draw(in: fillPath, angle: 90)
-        path.lineWidth = 1.8
-        path.lineCapStyle = .round
-        path.lineJoinStyle = .round
         strokeColor.setStroke()
+        path.lineWidth = 1.4; path.lineCapStyle = .round; path.lineJoinStyle = .round
         path.stroke()
+    }
+}
+
+// A single finite transition carries progress; no shimmer or looping layer.
+final class MultiProgressView: NSView {
+    private let track = CALayer()
+    private let fill = CALayer()
+    private(set) var fraction: CGFloat = 0
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.addSublayer(track); track.addSublayer(fill)
+        track.cornerRadius = 1.5; fill.cornerRadius = 1.5
+        fill.anchorPoint = .zero
+        setAccessibilityElement(true); setAccessibilityRole(.progressIndicator)
+        setAccessibilityLabel("测速进度")
+    }
+    required init?(coder: NSCoder) { nil }
+    override func layout() {
+        super.layout()
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        track.frame = NSRect(x: 0, y: (bounds.height - 3) / 2, width: bounds.width, height: 3)
+        fill.bounds = NSRect(x: 0, y: 0, width: bounds.width, height: 3)
+        fill.position = .zero
+        updateColors()
+        CATransaction.commit()
+    }
+    private func updateColors() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            track.backgroundColor = MultiPalette.border.cgColor
+            fill.backgroundColor = MultiPalette.accent.cgColor
+        }
+    }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateColors()
+    }
+    func setFraction(_ value: CGFloat, animated: Bool = true) {
+        let value = max(0, min(1, value))
+        let previous = fill.presentation()?.transform.m11 ?? fill.transform.m11
+        let changed = abs(value - fraction) > 0.0001
+        fraction = value
+        setAccessibilityValue(NSNumber(value: Double(value) * 100))
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        fill.transform = CATransform3DMakeScale(value, 1, 1)
+        CATransaction.commit()
+        if changed && animated && !MultiPalette.reducesMotion && value > 0 {
+            let animation = CABasicAnimation(keyPath: "transform.scale.x")
+            animation.fromValue = previous; animation.toValue = value
+            animation.duration = 0.45; animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            fill.add(animation, forKey: "progress")
+        } else if MultiPalette.reducesMotion || !animated || value == 0 {
+            fill.removeAnimation(forKey: "progress")
+        }
+    }
+    func finishMotion() { fill.removeAllAnimations(); updateColors() }
+}
+
+final class MultiTableHeaderCell: NSTableHeaderCell {
+    override func draw(withFrame cellFrame: NSRect, in controlView: NSView) {
+        MultiPalette.panel.setFill(); cellFrame.fill()
+        MultiPalette.divider.setFill()
+        NSRect(x: cellFrame.minX, y: cellFrame.maxY - 1, width: cellFrame.width, height: 1).fill()
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = alignment; paragraph.lineBreakMode = .byTruncatingTail
+        let font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        let height = (stringValue as NSString).size(withAttributes: [.font: font]).height
+        (stringValue as NSString).draw(in: NSRect(x: cellFrame.minX + 6, y: cellFrame.midY - height / 2,
+                                                width: max(0, cellFrame.width - 12), height: height),
+                                      withAttributes: [.font: font, .foregroundColor: MultiPalette.muted,
+                                                       .paragraphStyle: paragraph])
     }
 }
 
@@ -1670,8 +1381,8 @@ final class MultiSurfaceView: NSView {
     private let radius: CGFloat
     private let lineWidth: CGFloat
 
-    init(fill: NSColor = .controlBackgroundColor, fillAlpha: CGFloat = 1.0,
-         border: NSColor? = .separatorColor, borderAlpha: CGFloat = 0.65,
+    init(fill: NSColor = MultiPalette.panel, fillAlpha: CGFloat = 1.0,
+         border: NSColor? = MultiPalette.divider, borderAlpha: CGFloat = 0.65,
          cornerRadius: CGFloat = 10, borderWidth: CGFloat = 1) {
         self.baseFill = fill
         self.fillAlpha = fillAlpha
@@ -1715,7 +1426,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private let refreshButton = MultiClearGlassButton(title: "刷新配置", symbol: "arrow.clockwise", style: .clearSecondary, height: 24, hPadding: 10, fontSize: 11)
     private let funnelButton = MultiClearGlassButton(title: "智能两段优选", symbol: "sparkles", style: .clearSecondary, height: 32, hPadding: 13, fontSize: 12)
     private let loadTestButton = MultiClearGlassButton(title: "加压验证 · 20M", symbol: "bolt.fill", style: .clearSecondary, height: 32, hPadding: 14, fontSize: 12)
-    private let switchResultButton = MultiClearGlassButton(title: "切换至选中节点", symbol: "bolt.fill", style: .clearPrimary, height: 34, hPadding: 16, fontSize: 12.5)
+    private let switchResultButton = MultiClearGlassButton(title: "切换至选中节点", symbol: "arrow.right", style: .clearSecondary, height: 34, hPadding: 16, fontSize: 12.5)
     private let undoSwitchButton = MultiClearGlassButton(title: "切回原节点", symbol: "arrow.uturn.backward", style: .clearSecondary, height: 34, hPadding: 12, fontSize: 11.5)
     private let champQuickSwitchButton = MultiClearGlassButton(title: "切换最优", symbol: "bolt.fill", style: .darkEmeraldPill, height: 22, hPadding: 8, fontSize: 10.5)
     private let champRetestButton = MultiClearGlassButton(title: "20M 复测", symbol: "arrow.clockwise", style: .darkEmeraldPill, height: 22, hPadding: 8, fontSize: 10.5)
@@ -1725,9 +1436,9 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private let filterFailedButton = MultiClearGlassButton(title: "失败", style: .clearSubtle, height: 24, hPadding: 9, fontSize: 11)
     private let nodeSearch = NSSearchField()
     private let topNBox = NSComboBox()
-    private let selectTopNButton = MultiClearGlassButton(title: "选择前 N 项", symbol: "list.number", style: .clearPrimary, height: 28, hPadding: 11, fontSize: 11.5)
-    private let selectShownButton = MultiClearGlassButton(title: "全选当前", style: .clearSecondary, height: 28, hPadding: 11, fontSize: 11.5)
-    private let clearShownButton = MultiClearGlassButton(title: "清空勾选", style: .clearSubtle, height: 28, hPadding: 11, fontSize: 11.5)
+    private let selectTopNButton = MultiClearGlassButton(title: "选择前 N 项", style: .clearSecondary, height: 28, hPadding: 8, fontSize: 11)
+    private let selectShownButton = MultiClearGlassButton(title: "全选当前", style: .clearSecondary, height: 28, hPadding: 8, fontSize: 11)
+    private let clearShownButton = MultiClearGlassButton(title: "清空勾选", style: .clearSubtle, height: 28, hPadding: 8, fontSize: 11)
     private let nodeCount = NSTextField(labelWithString: "已勾选 0 / 0")
     private let emptyStateLabel = NSTextField(labelWithString: "请先勾选订阅源")
     private let trafficEstimate = NSTextField(labelWithString: "预计最大下载：—（不含 HEAD 请求）")
@@ -1737,7 +1448,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private let sizePopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let modePopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let intervalPopup = NSPopUpButton(frame: .zero, pullsDown: false)
-    private let scheduleButton = MultiClearGlassButton(title: "启用定时", style: .clearPrimary, height: 24, hPadding: 10, fontSize: 11)
+    private let scheduleButton = MultiClearGlassButton(title: "启用定时", style: .clearSecondary, height: 24, hPadding: 10, fontSize: 11)
     private let startButton = MultiClearGlassButton(title: "开始测速", symbol: "play.fill", style: .clearPrimary, height: 32, hPadding: 16, fontSize: 12.5)
     private let stopButton = MultiClearGlassButton(title: "停止", symbol: "stop.fill", style: .clearDanger, height: 32, hPadding: 12, fontSize: 12)
     private let copyButton = MultiClearGlassButton(title: "导出 TSV", symbol: "square.and.arrow.up", style: .clearSecondary, height: 32, hPadding: 13, fontSize: 12)
@@ -1747,15 +1458,17 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private let subPillsStack = NSStackView()
     private let champCardView = MultiChampionCardView()
     private let bottomDockSurface = MultiClearFrostedSurface(style: .frostedDock, cornerRadius: 27, isCapsule: true)
+    private let progressView = MultiProgressView()
     private let champScoreLabel = NSTextField(labelWithString: "—")
     private let champNodeLabel = NSTextField(labelWithString: "等待测速或选择节点")
     private let champSubLabel = NSTextField(labelWithString: "请选择订阅并运行多订阅基准测速")
     private let champSpeedLabel = NSTextField(labelWithString: "—")
     private let champMetaLabel = NSTextField(labelWithString: "延迟 —  ·  抖动 —  ·  丢包 —")
     private let champReadyLabel = NSTextField(labelWithString: "● 待命就绪")
-    private let flowIndicator = FlowIndicatorView()
     private let champSparkline = MultiSparklineView()
     private var uiMotionTimer: Timer?
+    private var feedbackTimer: Timer?
+    private var displayOptionsObserver: NSObjectProtocol?
     private var statusFilter: MultiRowStatusFilter = .all
     private var sortColumnIdentifier: String?
     private var sortColumnAscending: Bool = false
@@ -1765,12 +1478,8 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private var lastUndoSwitchChoice: MultiPickerChoice?
     private var lastUndoTargetNodeName: String?
     private var crossProfileReadyDetected = false
-    private var displayedChampSpeed: Double = 0
     private var targetChampSpeed: Double = 0
-    private var displayedChampScore: Double = 0
     private var targetChampScore: Double = 0
-    private var champNumberAnimStep: Int = 0
-    private var shimmerPhase: CGFloat = -1.0
     private var dockConfirmedUntil: Date?
     private var registry: [ProfileOption] = []
     private var selected = Set<Data>()
@@ -1792,6 +1501,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private var launchCheckAuthorization: MultiSwitchAuthorization?
     private var launchCheckFailure: String?
     private var busy = false
+    private var displayedBusyState = false
     private var closed = false
     private var activeToken: TestSchedule.RunToken?
     private var armedSwitch: MultiSwitchCapture?
@@ -1837,7 +1547,20 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 #endif
         refresh(nil)
         timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in self?.pollSchedule() }
-        uiMotionTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in self?.tickUIMotion() }
+        // Countdown and bridge state need only a one-second cadence. Animation
+        // is finite and runs only while an actual value is changing.
+        uiMotionTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.tickUIMotion() }
+        displayOptionsObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            (self.window.contentView as? MultiClearAmbientCanvas)?.invalidateAppearance()
+            if MultiPalette.reducesMotion {
+                self.feedbackTimer?.invalidate(); self.feedbackTimer = nil
+                self.champCardView.crownPulseIntensity = 0
+                self.progressView.finishMotion()
+            }
+        }
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -1859,14 +1582,24 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     func windowWillClose(_ notification: Notification) { closeApp() }
     func windowDidResize(_ notification: Notification) {
         guard let window else { return }
+        defer { updateCompactLayout() }
         let minimumFrame = window.frameRect(forContentRect: NSRect(origin: .zero, size: minimumWindowContentSize)).size
         guard window.frame.width < minimumFrame.width || window.frame.height < minimumFrame.height else { return }
         window.setContentSize(minimumWindowContentSize)
+    }
+    private func updateCompactLayout() {
+        // The optional explanation moves to the timer button's help at narrow
+        // widths, rather than leaving a clipped character beside the controls.
+        scheduleStatus.isHidden = (window.contentView?.bounds.width ?? 1240) < 1180
+        scheduleButton.toolTip = scheduleStatus.stringValue
     }
     func applicationWillTerminate(_ notification: Notification) { closeApp() }
     private func closeApp() {
         guard !closed else { return }
         closed = true; timer?.invalidate(); timer = nil; uiMotionTimer?.invalidate(); uiMotionTimer = nil
+        feedbackTimer?.invalidate(); feedbackTimer = nil
+        if let observer = displayOptionsObserver { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
+        displayOptionsObserver = nil
 #if !MULTI_UI_TEST
         runtimeInjector.stop()
 #endif
@@ -1890,19 +1623,20 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 #endif
     private func label(_ text: String, size: CGFloat = 13, weight: NSFont.Weight = .regular,
-                       color: NSColor = .labelColor, monospacedDigits: Bool = false) -> NSTextField {
+                       color: NSColor = MultiPalette.text, monospacedDigits: Bool = false) -> NSTextField {
         let v = NSTextField(labelWithString: text)
         v.font = monospacedDigits ? .monospacedDigitSystemFont(ofSize: size, weight: weight) : .systemFont(ofSize: size, weight: weight)
         v.textColor = color
         return v
     }
-    private func symbolIcon(_ name: String, color: NSColor = .secondaryLabelColor, size: CGFloat = 13) -> NSImageView {
+    private func symbolIcon(_ name: String, color: NSColor = MultiPalette.muted, size: CGFloat = 13) -> NSImageView {
         let view = NSImageView()
         if let image = NSImage(systemSymbolName: name, accessibilityDescription: nil) {
             let config = NSImage.SymbolConfiguration(pointSize: size, weight: .semibold)
             view.image = image.withSymbolConfiguration(config)
         }
         view.contentTintColor = color
+        view.setAccessibilityElement(false)
         view.setContentHuggingPriority(.required, for: .horizontal)
         return view
     }
@@ -1922,10 +1656,10 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
     }
     private func cardBox(padding: NSEdgeInsets = NSEdgeInsets(top: 10, left: 12, bottom: 10, right: 12),
-                         fill: NSColor = .controlBackgroundColor,
+                         fill: NSColor = MultiPalette.panel,
                          fillAlpha: CGFloat = 0.78,
                          spacing: CGFloat = 8) -> (NSView, NSStackView) {
-        let box = MultiSurfaceView(fill: fill, fillAlpha: fillAlpha, border: .separatorColor,
+        let box = MultiSurfaceView(fill: fill, fillAlpha: fillAlpha, border: MultiPalette.divider,
                                    borderAlpha: 1.0, cornerRadius: 10, borderWidth: 1)
         let stack = NSStackView()
         stack.orientation = .vertical
@@ -1941,7 +1675,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         ])
         return (box, stack)
     }
-    private func pillBadge(_ view: NSView, fill: NSColor = .quaternaryLabelColor,
+    private func pillBadge(_ view: NSView, fill: NSColor = MultiPalette.elevated,
                            fillAlpha: CGFloat = 1.0,
                            cornerRadius: CGFloat = 8, hPad: CGFloat = 8, vPad: CGFloat = 3) -> NSView {
         let box = MultiSurfaceView(fill: fill, fillAlpha: fillAlpha, border: nil,
@@ -1957,7 +1691,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         return box
     }
     private func divider(vertical: Bool = false) -> NSView {
-        let line = MultiSurfaceView(fill: .separatorColor, fillAlpha: 1.0, border: nil,
+        let line = MultiSurfaceView(fill: MultiPalette.divider, fillAlpha: 1.0, border: nil,
                                     borderAlpha: 0, cornerRadius: 0, borderWidth: 0)
         if vertical {
             line.widthAnchor.constraint(equalToConstant: 1).isActive = true
@@ -1979,7 +1713,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         let scroll = NSScrollView(); scroll.borderType = .noBorder; scroll.hasVerticalScroller = true
         scroll.hasHorizontalScroller = false; scroll.autohidesScrollers = true
         scroll.drawsBackground = drawsBackground
-        if drawsBackground { scroll.backgroundColor = .controlBackgroundColor }
+        if drawsBackground { scroll.backgroundColor = MultiPalette.panel }
         scroll.documentView = table
         scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: height).isActive = true
         return scroll
@@ -1987,6 +1721,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private func addColumn(_ table: NSTableView, _ id: String, _ title: String, _ width: CGFloat,
                            minWidth: CGFloat = 44, maxWidth: CGFloat? = nil, align: NSTextAlignment = .left) {
         let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(id))
+        col.headerCell = MultiTableHeaderCell(textCell: title)
         col.title = title; col.width = width; col.minWidth = minWidth
         if let maxWidth = maxWidth { col.maxWidth = maxWidth }
         col.headerCell.alignment = align
@@ -2000,7 +1735,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.isMovableByWindowBackground = true
-        window.backgroundColor = multiHexColor(0xF3F5FA)
+        window.backgroundColor = MultiPalette.background
         window.minSize = minimumWindowContentSize
         window.contentMinSize = minimumWindowContentSize
         window.center(); window.delegate = self
@@ -2010,6 +1745,8 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
         let rootCanvas = MultiClearAmbientCanvas(frame: NSRect(x: 0, y: 0, width: 1240, height: 800))
         window.contentView = rootCanvas
+        startButton.isProminent = true
+        startButton.widthAnchor.constraint(equalToConstant: 112).isActive = true
 
         // Wire all actions (preserving exact single-occurrence E2E action anchors)
         selectAllProfilesButton.target = self; selectAllProfilesButton.action = #selector(selectAllProfiles(_:))
@@ -2044,7 +1781,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         brandOrb.translatesAutoresizingMaskIntoConstraints = false
         brandOrb.widthAnchor.constraint(equalToConstant: 26).isActive = true
         brandOrb.heightAnchor.constraint(equalToConstant: 26).isActive = true
-        let brandIcon = symbolIcon("bolt.horizontal.fill", color: multiHexColor(0x2532B8), size: 12.5)
+        let brandIcon = symbolIcon("waveform.path", color: MultiPalette.accent, size: 12.5)
         brandIcon.translatesAutoresizingMaskIntoConstraints = false
         brandOrb.addSubview(brandIcon)
         NSLayoutConstraint.activate([
@@ -2052,9 +1789,9 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             brandIcon.centerYAnchor.constraint(equalTo: brandOrb.centerYAnchor)
         ])
 
-        let appTitle = label("Clash 测速工作台", size: 15, weight: .bold, color: .labelColor)
+        let appTitle = label("Clash 测速工作台", size: 14, weight: .semibold)
         let verPillSurface = MultiClearFrostedSurface(style: .clearSubtle, cornerRadius: 10, isCapsule: true)
-        let verLabel = label("Mihomo · Clear Prism Glass", size: 10.5, weight: .medium, color: multiHexColor(0x687082), monospacedDigits: true)
+        let verLabel = label("Mihomo", size: 10.5, weight: .medium, color: MultiPalette.muted)
         verLabel.translatesAutoresizingMaskIntoConstraints = false
         verPillSurface.addSubview(verLabel)
         NSLayoutConstraint.activate([
@@ -2079,9 +1816,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         ])
 
         // =========================================================================
-        // 2. TOP SPLIT DECK (Height: 162 pt)
-        //    Left: Dark Ink-Violet OPTIMAL ROUTE Champion Card (390 pt)
-        //    Right: Frosted-Glass Subscription Matrix & Capsule Parameter Strip
+        // 2. ORIGINAL SPLIT DECK: champion and subscription matrix.
         // =========================================================================
         let topDeck = NSView()
         topDeck.translatesAutoresizingMaskIntoConstraints = false
@@ -2089,9 +1824,9 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         let champCard = champCardView
         champCard.translatesAutoresizingMaskIntoConstraints = false
 
-        let champTag = label("⚡ OPTIMAL ROUTE · 最优推荐路由", size: 10, weight: .bold, color: multiHexColor(0xA5B4FC), monospacedDigits: true)
+        let champTag = label("OPTIMAL ROUTE", size: 10, weight: .medium, color: MultiPalette.muted, monospacedDigits: true)
         champScoreLabel.font = .monospacedDigitSystemFont(ofSize: 12.5, weight: .bold)
-        champScoreLabel.textColor = multiHexColor(0x2532B8)
+        champScoreLabel.textColor = MultiPalette.accent
         let champScoreBadge = MultiClearFrostedSurface(style: .clearPrimary, cornerRadius: 12, isCapsule: true)
         champScoreLabel.translatesAutoresizingMaskIntoConstraints = false
         champScoreBadge.addSubview(champScoreLabel)
@@ -2104,26 +1839,28 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         let champTopRow = row([champTag, spacer(), champRetestButton, champQuickSwitchButton, champScoreBadge], spacing: 6)
 
         champNodeLabel.font = .systemFont(ofSize: 16.5, weight: .bold)
-        champNodeLabel.textColor = .white
+        champNodeLabel.textColor = MultiPalette.text
         champNodeLabel.lineBreakMode = .byTruncatingTail
 
         champSubLabel.font = .systemFont(ofSize: 11.5, weight: .medium)
-        champSubLabel.textColor = multiHexColor(0x9CA3AF)
+        champSubLabel.textColor = MultiPalette.muted
         champSubLabel.lineBreakMode = .byTruncatingTail
 
-        champSpeedLabel.font = .monospacedDigitSystemFont(ofSize: 22, weight: .bold)
-        champSpeedLabel.textColor = multiHexColor(0x34D399)
-        let champSpeedUnit = label("MiB/s", size: 11.5, weight: .semibold, color: multiHexColor(0x6EE7B7))
+        champSpeedLabel.font = .monospacedDigitSystemFont(ofSize: 24, weight: .medium)
+        champSpeedLabel.textColor = MultiPalette.accent
+        let champSpeedUnit = label("MiB/s", size: 11.5, weight: .medium, color: MultiPalette.muted)
         champMetaLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
-        champMetaLabel.textColor = multiHexColor(0xD1D5DB)
+        champMetaLabel.textColor = MultiPalette.muted
         champMetaLabel.lineBreakMode = .byTruncatingTail
 
         champSparkline.translatesAutoresizingMaskIntoConstraints = false
+        champSparkline.setAccessibilityElement(false)
+        champSparkline.toolTip = "当前吞吐量示意，不代表历史曲线"
         champSparkline.widthAnchor.constraint(equalToConstant: 82).isActive = true
         champSparkline.heightAnchor.constraint(equalToConstant: 24).isActive = true
 
         champReadyLabel.font = .systemFont(ofSize: 10.5, weight: .bold)
-        champReadyLabel.textColor = multiHexColor(0x34D399)
+        champReadyLabel.textColor = MultiPalette.success
         let champReadyPill = MultiClearFrostedSurface(style: .darkEmeraldPill, cornerRadius: 11, isCapsule: true)
         champReadyLabel.translatesAutoresizingMaskIntoConstraints = false
         champReadyPill.addSubview(champReadyLabel)
@@ -2156,11 +1893,11 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         matrixCard.translatesAutoresizingMaskIntoConstraints = false
 
         trafficEstimate.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
-        trafficEstimate.textColor = .secondaryLabelColor
+        trafficEstimate.textColor = MultiPalette.muted
         trafficEstimate.lineBreakMode = .byTruncatingTail
 
         let matrixHeaderRow = row([
-            label("订阅源矩阵", size: 12.5, weight: .bold, color: .labelColor),
+            label("订阅源矩阵", size: 12.5, weight: .semibold),
             trafficEstimate,
             spacer(),
             selectAllProfilesButton,
@@ -2199,8 +1936,8 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         groupSelectorPill.translatesAutoresizingMaskIntoConstraints = false
         groupSelectorPill.heightAnchor.constraint(equalToConstant: 30).isActive = true
         let groupSelectorRow = row([
-            symbolIcon("arrow.triangle.branch", color: multiHexColor(0x2532B8), size: 11.5),
-            label("策略组", size: 11, weight: .medium, color: .secondaryLabelColor),
+            symbolIcon("arrow.triangle.branch", color: MultiPalette.accent, size: 11.5),
+            label("策略组", size: 11, weight: .medium, color: MultiPalette.muted),
             groupPopup
         ], spacing: 5)
         groupSelectorRow.translatesAutoresizingMaskIntoConstraints = false
@@ -2229,32 +1966,33 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         parallelBox.controlSize = .small
         parallelBox.font = .monospacedDigitSystemFont(ofSize: 11.5, weight: .bold)
         parallelBox.numberOfVisibleItems = 10; parallelBox.delegate = self; parallelBox.target = self; parallelBox.action = #selector(configurationChanged(_:))
-        parallelBox.widthAnchor.constraint(equalToConstant: 54).isActive = true
+        parallelBox.widthAnchor.constraint(equalToConstant: 44).isActive = true
 
         sizePopup.addItems(withTitles: sizeLabels); sizePopup.selectItem(at: 4)
         sizePopup.controlSize = .small; sizePopup.font = .monospacedDigitSystemFont(ofSize: 11.5, weight: .semibold)
-        sizePopup.widthAnchor.constraint(equalToConstant: 86).isActive = true
+        sizePopup.widthAnchor.constraint(equalToConstant: 76).isActive = true
 
         modePopup.addItems(withTitles: ["快速 (2流)", "精确 (4流)"])
         modePopup.controlSize = .small; modePopup.font = .systemFont(ofSize: 11.5, weight: .semibold)
-        modePopup.widthAnchor.constraint(equalToConstant: 96).isActive = true
+        modePopup.widthAnchor.constraint(equalToConstant: 104).isActive = true
         for popup in [sizePopup, modePopup] { popup.target = self; popup.action = #selector(configurationChanged(_:)) }
 
         intervalPopup.addItems(withTitles: ["15 分钟", "30 分钟", "1 小时", "2 小时", "6 小时", "12 小时", "24 小时"])
         intervalPopup.controlSize = .small; intervalPopup.font = .systemFont(ofSize: 11.5, weight: .semibold)
         intervalPopup.target = self; intervalPopup.action = #selector(configurationChanged(_:))
-        intervalPopup.widthAnchor.constraint(equalToConstant: 82).isActive = true
+        intervalPopup.widthAnchor.constraint(equalToConstant: 70).isActive = true
 
         scheduleStatus.font = .systemFont(ofSize: 10.5, weight: .medium)
-        scheduleStatus.textColor = .secondaryLabelColor
+        scheduleStatus.textColor = MultiPalette.muted
         scheduleStatus.lineBreakMode = .byTruncatingTail
+        scheduleStatus.setContentCompressionResistancePriority(.init(1), for: .horizontal)
 
         func wrapParamPill(_ titleText: String, control: NSView, trailing: NSView? = nil) -> NSView {
             let pill = MultiClearFrostedSurface(style: .clearSecondary, cornerRadius: 16, isCapsule: true)
             pill.translatesAutoresizingMaskIntoConstraints = false
             pill.heightAnchor.constraint(equalToConstant: 32).isActive = true
             var items: [NSView] = [
-                label(titleText, size: 11, weight: .semibold, color: .secondaryLabelColor),
+                label(titleText, size: 11, weight: .medium, color: MultiPalette.muted),
                 control
             ]
             if let trailing = trailing { items.append(trailing) }
@@ -2262,8 +2000,8 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             r.translatesAutoresizingMaskIntoConstraints = false
             pill.addSubview(r)
             NSLayoutConstraint.activate([
-                r.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: 11),
-                r.trailingAnchor.constraint(equalTo: pill.trailingAnchor, constant: -8),
+                r.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: 9),
+                r.trailingAnchor.constraint(equalTo: pill.trailingAnchor, constant: -7),
                 r.centerYAnchor.constraint(equalTo: pill.centerYAnchor)
             ])
             return pill
@@ -2275,6 +2013,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         let pPill4 = wrapParamPill("定时", control: intervalPopup, trailing: scheduleButton)
 
         let paramStripRow = row([pPill1, pPill2, pPill3, pPill4, spacer(), scheduleStatus], spacing: 8)
+        paramStripRow.setClippingResistancePriority(.defaultLow, for: .horizontal)
 
         let matrixStack = NSStackView(views: [matrixHeaderRow, subMidRow, strategyRouteRow, matrixDiv, paramStripRow])
         matrixStack.orientation = .vertical; matrixStack.alignment = .leading; matrixStack.spacing = 8
@@ -2314,7 +2053,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         tableCard.translatesAutoresizingMaskIntoConstraints = false
 
         nodeCount.font = .monospacedDigitSystemFont(ofSize: 11, weight: .bold)
-        nodeCount.textColor = .controlAccentColor
+        nodeCount.textColor = MultiPalette.accent
         let countPill = MultiClearFrostedSurface(style: .clearPrimary, cornerRadius: 11, isCapsule: true)
         nodeCount.translatesAutoresizingMaskIntoConstraints = false
         countPill.addSubview(nodeCount)
@@ -2330,33 +2069,36 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         nodeSearch.sendsSearchStringImmediately = true
         nodeSearch.controlSize = .small
         nodeSearch.font = .systemFont(ofSize: 11.5)
-        nodeSearch.widthAnchor.constraint(equalToConstant: 196).isActive = true
+        nodeSearch.widthAnchor.constraint(lessThanOrEqualToConstant: 196).isActive = true
+        nodeSearch.widthAnchor.constraint(greaterThanOrEqualToConstant: 120).isActive = true
+        let preferredSearchWidth = nodeSearch.widthAnchor.constraint(equalToConstant: 196)
+        preferredSearchWidth.priority = .defaultLow; preferredSearchWidth.isActive = true
 
         topNBox.addItems(withObjectValues: ["3", "5", "10", "15", "20", "30", "50"])
         topNBox.stringValue = "10"
         topNBox.controlSize = .small
         topNBox.font = .monospacedDigitSystemFont(ofSize: 11.5, weight: .bold)
         topNBox.numberOfVisibleItems = 7
-        topNBox.widthAnchor.constraint(equalToConstant: 52).isActive = true
+        topNBox.widthAnchor.constraint(equalToConstant: 44).isActive = true
 
         let topNPill = MultiClearFrostedSurface(style: .clearSecondary, cornerRadius: 14, isCapsule: true)
         topNPill.translatesAutoresizingMaskIntoConstraints = false
         topNPill.heightAnchor.constraint(equalToConstant: 28).isActive = true
         let topNPillRow = row([
-            label("前", size: 11, weight: .semibold, color: .secondaryLabelColor),
+            label("前", size: 11, weight: .medium, color: MultiPalette.muted),
             topNBox,
-            label("项", size: 11, weight: .semibold, color: .secondaryLabelColor)
+            label("项", size: 11, weight: .medium, color: MultiPalette.muted)
         ], spacing: 4)
         topNPillRow.translatesAutoresizingMaskIntoConstraints = false
         topNPill.addSubview(topNPillRow)
         NSLayoutConstraint.activate([
-            topNPillRow.leadingAnchor.constraint(equalTo: topNPill.leadingAnchor, constant: 9),
-            topNPillRow.trailingAnchor.constraint(equalTo: topNPill.trailingAnchor, constant: -9),
+            topNPillRow.leadingAnchor.constraint(equalTo: topNPill.leadingAnchor, constant: 7),
+            topNPillRow.trailingAnchor.constraint(equalTo: topNPill.trailingAnchor, constant: -7),
             topNPillRow.centerYAnchor.constraint(equalTo: topNPill.centerYAnchor)
         ])
 
         let tableToolbar = row([
-            label("节点实时遥测队列", size: 13.5, weight: .bold, color: .labelColor),
+            label("节点实时遥测队列", size: 13, weight: .semibold),
             countPill,
             filterAllButton,
             filterValidButton,
@@ -2370,6 +2112,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             clearShownButton
         ], spacing: 6)
         tableToolbar.translatesAutoresizingMaskIntoConstraints = false
+        tableToolbar.setClippingResistancePriority(.defaultLow, for: .horizontal)
 
         let tableHairline = divider()
         tableHairline.translatesAutoresizingMaskIntoConstraints = false
@@ -2377,9 +2120,9 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         resultTable.delegate = self; resultTable.dataSource = self
         resultTable.target = self; resultTable.doubleAction = #selector(doubleClickResultRow(_:))
         let rowMenu = NSMenu(title: "节点操作")
-        let menuSwitch = NSMenuItem(title: "⚡ 立即切换至此节点", action: #selector(contextSwitchRow(_:)), keyEquivalent: "")
+        let menuSwitch = NSMenuItem(title: "立即切换至此节点", action: #selector(contextSwitchRow(_:)), keyEquivalent: "")
         menuSwitch.target = self; rowMenu.addItem(menuSwitch)
-        let menuRetest = NSMenuItem(title: "↻ 单独 20MiB 加压复测此节点", action: #selector(contextRetestRow(_:)), keyEquivalent: "")
+        let menuRetest = NSMenuItem(title: "单独 20MiB 加压复测此节点", action: #selector(contextRetestRow(_:)), keyEquivalent: "")
         menuRetest.target = self; rowMenu.addItem(menuRetest)
         rowMenu.addItem(NSMenuItem.separator())
         let menuCopyName = NSMenuItem(title: "复制节点名称", action: #selector(contextCopyNodeName(_:)), keyEquivalent: "")
@@ -2402,11 +2145,11 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         addColumn(resultTable, "failure", "丢包率", 58, minWidth: 48, align: .right)
         addColumn(resultTable, "jitter", "抖动", 64, minWidth: 54, align: .right)
         addColumn(resultTable, "score", "综合评分", 98, minWidth: 84, align: .right)
-        let resultsScroll = scroller(resultTable, height: 320, drawsBackground: false)
+        let resultsScroll = scroller(resultTable, height: 260, drawsBackground: false)
         resultsScroll.translatesAutoresizingMaskIntoConstraints = false
 
         emptyStateLabel.font = .systemFont(ofSize: 14, weight: .semibold)
-        emptyStateLabel.textColor = .labelColor
+        emptyStateLabel.textColor = MultiPalette.text
         emptyStateLabel.alignment = .center
         emptyStateLabel.maximumNumberOfLines = 2
         emptyStateLabel.lineBreakMode = .byWordWrapping
@@ -2437,21 +2180,24 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         ])
 
         // =========================================================================
-        // 4. BOTTOM FLOATING CLEAR FROSTED CAPSULE DOCK (Height: 54 pt)
+        // 4. ORIGINAL BOTTOM STATUS AND ACTION BAR (Height: 54 pt)
         // =========================================================================
         let bottomDock = bottomDockSurface
         bottomDock.translatesAutoresizingMaskIntoConstraints = false
 
         status.font = .systemFont(ofSize: 11.5, weight: .medium)
-        status.textColor = .labelColor
+        status.textColor = MultiPalette.text
         status.maximumNumberOfLines = 1
         status.lineBreakMode = .byTruncatingTail
         status.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
 
+        progressView.widthAnchor.constraint(equalToConstant: 150).isActive = true
+        progressView.heightAnchor.constraint(equalToConstant: 16).isActive = true
         let bottomDockRow = row([
-            symbolIcon("shield.lefthalf.filled", color: multiHexColor(0x059669), size: 12),
+            symbolIcon("shield.lefthalf.filled", color: MultiPalette.success, size: 12),
             status,
             spacer(),
+            progressView,
             undoSwitchButton,
             switchResultButton
         ], spacing: 8)
@@ -2486,6 +2232,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             bottomDock.bottomAnchor.constraint(equalTo: rootCanvas.bottomAnchor, constant: -14)
         ])
         updateControls()
+        updateCompactLayout()
     }
     private func cancelLaunchChecks() {
         launchCheckAuthorization?.revoke(); launchCheckAuthorization = nil
@@ -2580,7 +2327,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             view.removeFromSuperview()
         }
         if registry.isEmpty {
-            let emptyLbl = label("未检测到订阅源", size: 11.5, weight: .medium, color: multiHexColor(0x687082))
+            let emptyLbl = label("未检测到订阅源", size: 11.5, weight: .medium, color: MultiPalette.muted)
             subPillsStack.addArrangedSubview(emptyLbl)
             return
         }
@@ -2595,65 +2342,79 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                 hPadding: 12,
                 fontSize: 11.5
             )
-            pill.leadingDotColor = option.isCurrent ? multiHexColor(0x10B981) : (isChecked ? multiHexColor(0x6374F2) : multiHexColor(0x9CA3AF))
+            pill.leadingDotColor = option.isCurrent ? MultiPalette.success : (isChecked ? MultiPalette.accent : MultiPalette.faint)
             pill.tag = idx
+            pill.toolTip = option.name + suffix
+            pill.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            pill.widthAnchor.constraint(lessThanOrEqualToConstant: 180).isActive = true
+            pill.widthAnchor.constraint(greaterThanOrEqualToConstant: 70).isActive = true
             pill.target = self
             pill.action = #selector(toggleProfilePill(_:))
             pill.isEnabled = !busy
             subPillsStack.addArrangedSubview(pill)
         }
     }
+    private func pulseChampionFeedback() {
+        feedbackTimer?.invalidate(); feedbackTimer = nil
+        guard !MultiPalette.reducesMotion else { champCardView.crownPulseIntensity = 0; return }
+        champCardView.crownPulseIntensity = 1
+        let start = ProcessInfo.processInfo.systemUptime
+        feedbackTimer = Timer.scheduledTimer(withTimeInterval: 0.025, repeats: true) { [weak self] timer in
+            guard let self, !self.closed else { timer.invalidate(); return }
+            let elapsed = (ProcessInfo.processInfo.systemUptime - start) / 0.3
+            if MultiPalette.reducesMotion || elapsed >= 1 {
+                self.champCardView.crownPulseIntensity = 0
+                timer.invalidate(); self.feedbackTimer = nil
+            } else {
+                self.champCardView.crownPulseIntensity = CGFloat(1 - elapsed)
+            }
+        }
+    }
     private func updateChampionCard() {
-        let bestScored = rows.first { $0.eligibleScore != nil }
+        // The table stays still during a run, so find the best measured row
+        // independently of its current screen position.
+        let bestScored = multiRank(rows).first { $0.eligibleScore != nil }
         let highlighted: MultiRow? = visibleRows.indices.contains(resultTable.selectedRow) ? rows[visibleRows[resultTable.selectedRow]] : nil
         let hero = bestScored ?? highlighted ?? rows.first
         let hasPendingCrossProfile = (pendingWinner != nil || pendingManual != nil)
         champCardView.isCrossProfileReady = hasPendingCrossProfile && crossProfileReadyDetected
         guard let item = hero else {
-            targetChampScore = 0; displayedChampScore = 0
-            targetChampSpeed = 0; displayedChampSpeed = 0
+            targetChampScore = 0; targetChampSpeed = 0
             champScoreLabel.stringValue = "—"
             champNodeLabel.stringValue = selected.isEmpty ? "请先勾选订阅源" : "等待测速或选择节点"
             champSubLabel.stringValue = selected.isEmpty ? "支持多订阅并发基准测速与安全切换" : "已载入 \(rows.count) 个节点 · 点击右上角开始测速"
             champSpeedLabel.stringValue = "—"
             champMetaLabel.stringValue = "延迟 —  ·  抖动 —  ·  丢包 —"
             champReadyLabel.stringValue = busy ? "● 测速运行中" : "● 待命就绪"
-            champQuickSwitchButton.isHidden = true
-            champRetestButton.isHidden = true
+            champQuickSwitchButton.isHidden = true; champRetestButton.isHidden = true
+            champSparkline.isHidden = true
             return
         }
         let isCurrentProfile = registry.first(where: { $0.id == item.identity.profile })?.isCurrent ?? false
         champNodeLabel.stringValue = item.nodeName
-        champQuickSwitchButton.isHidden = false
-        champRetestButton.isHidden = false
+        champQuickSwitchButton.isHidden = false; champRetestButton.isHidden = false
         champQuickSwitchButton.isEnabled = !busy && !groupRefreshInFlight && !switchOutcomeUnknown && selectionPreview != nil
         champRetestButton.isEnabled = !busy && !groupRefreshInFlight && selectionPreview != nil
+        champSparkline.isHidden = item.measurement == nil
         if let m = item.measurement {
             let newScore = item.eligibleScore ?? m.score ?? 0
             let newSpeed = m.downloadBytesPerSecond / 1_048_576
             if abs(newSpeed - targetChampSpeed) > 0.005 || abs(newScore - targetChampScore) > 0.05 {
-                targetChampScore = newScore
-                targetChampSpeed = newSpeed
-                champNumberAnimStep = 10
-                champCardView.crownPulseIntensity = 1.0
+                targetChampScore = newScore; targetChampSpeed = newSpeed
+                pulseChampionFeedback()
             }
-            if champNumberAnimStep <= 0 {
-                displayedChampScore = targetChampScore
-                displayedChampSpeed = targetChampSpeed
-                let scoreText = item.eligibleScore.map { String(format: "%.1f", $0) } ?? (m.score.map { String(format: "%.1f", $0) } ?? "—")
-                champScoreLabel.stringValue = "★ \(scoreText)"
-                champSpeedLabel.stringValue = String(format: "%.2f", displayedChampSpeed)
-            }
+            let scoreText = item.eligibleScore.map { String(format: "%.1f", $0) } ?? (m.score.map { String(format: "%.1f", $0) } ?? "—")
+            champScoreLabel.stringValue = scoreText
+            champSpeedLabel.stringValue = String(format: "%.2f", newSpeed)
             champSubLabel.stringValue = "订阅源：\(item.profileName)  ·  \(m.nodeType.uppercased())"
             let failures = m.headAttempts > 0 ? 100.0 * Double(m.headAttempts - m.headSuccesses) / Double(m.headAttempts) : 100
             champMetaLabel.stringValue = String(format: "延迟 %.1f ms  ·  抖动 %.1f ms  ·  丢包 %.1f%%",
                                                 m.latencyMilliseconds, m.jitterMilliseconds, failures)
-            let norm = max(0.15, min(0.96, CGFloat((m.downloadBytesPerSecond / 1_048_576) / 25.0)))
+            let norm = max(0.15, min(0.96, CGFloat(newSpeed / 25)))
             champSparkline.points = [max(0.12, norm * 0.68), max(0.15, norm * 0.82), max(0.14, norm * 0.76),
                                      max(0.18, norm * 0.91), norm, max(0.16, norm * 0.95)]
         } else {
-            targetChampScore = 0; displayedChampScore = 0
-            targetChampSpeed = 0; displayedChampSpeed = 0
+            targetChampScore = 0; targetChampSpeed = 0
             champScoreLabel.stringValue = "待测"
             champSubLabel.stringValue = "订阅源：\(item.profileName)  ·  状态：\(item.state)"
             champSpeedLabel.stringValue = "—"
@@ -2669,17 +2430,22 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
     private func updateDockAndProgressState() {
         let totalJobs = max(1, runIdentities.count)
-        let doneJobs = rows.filter { runIdentities.contains($0.identity) && $0.state != "等待" }.count
-        let frac = busy && !runIdentities.isEmpty ? CGFloat(doneJobs) / CGFloat(totalJobs) : 0
-        startButton.progressFraction = frac
-        if busy && !runIdentities.isEmpty {
+        let doneJobs = rows.filter {
+            runIdentities.contains($0.identity) && !["等待", "待测速", "未勾选"].contains($0.state)
+        }.count
+        let measuring = busy && currentBatch != nil && !runIdentities.isEmpty
+        let hasProgress = measuring || doneJobs > 0
+        let frac = hasProgress ? CGFloat(doneJobs) / CGFloat(totalJobs) : 0
+        progressView.isHidden = !hasProgress
+        progressView.setFraction(frac)
+        progressView.toolTip = "已处理 \(doneJobs) / \(runIdentities.count) 个节点"
+        if measuring {
             let pct = Int(round(frac * 100))
             let stageTag = funnelStage == 1 ? "初筛" : (funnelStage == 2 ? "决选" : "测速")
-            startButton.title = "\(stageTag) \(doneJobs)/\(totalJobs) (\(pct)%)"
+            startButton.title = "\(stageTag) · \(pct)%"
             bottomDockSurface.dockVisualState = .racing(progress: frac)
         } else {
             startButton.title = "开始测速"
-            startButton.progressFraction = 0
             if pendingWinner != nil || pendingManual != nil {
                 bottomDockSurface.dockVisualState = .crossProfilePending(ready: crossProfileReadyDetected)
             } else if let until = dockConfirmedUntil, Date() < until {
@@ -2706,38 +2472,13 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
     private func tickUIMotion() {
         guard !closed else { return }
-        if champNumberAnimStep > 0 {
-            champNumberAnimStep -= 1
-            let t = 1.0 - Double(champNumberAnimStep) / 10.0
-            let ease = 1.0 - pow(1.0 - t, 3.0)
-            displayedChampSpeed += (targetChampSpeed - displayedChampSpeed) * ease
-            displayedChampScore += (targetChampScore - displayedChampScore) * ease
-            if targetChampScore > 0 {
-                champScoreLabel.stringValue = String(format: "★ %.1f", displayedChampScore)
-            }
-            if targetChampSpeed > 0 {
-                champSpeedLabel.stringValue = String(format: "%.2f", displayedChampSpeed)
-            }
-        }
-        if champCardView.crownPulseIntensity > 0.01 {
-            champCardView.crownPulseIntensity = max(0, champCardView.crownPulseIntensity - 0.06)
-        }
-        if busy && !runIdentities.isEmpty {
-            shimmerPhase += 0.075
-            if shimmerPhase > 1.35 { shimmerPhase = -0.35 }
-            for rowIdx in 0..<resultTable.numberOfRows {
-                if let cell = resultTable.view(atColumn: 5, row: rowIdx, makeIfNecessary: false) as? MultiSpeedBarCellView,
-                   cell.isTesting {
-                    cell.shimmerPhase = shimmerPhase
-                }
-            }
-        }
         if schedule.isArmed, let nextFire = schedule.nextFire {
             let remaining = max(0, Int(ceil(nextFire.timeIntervalSince(TestSchedule.monotonicNow()))))
             let mins = remaining / 60
             let secs = remaining % 60
             let title = intervalPopup.titleOfSelectedItem ?? ""
-            scheduleStatus.stringValue = String(format: "⏱ 下次 %02d:%02d（每 %@）", mins, secs, title)
+            scheduleStatus.stringValue = String(format: "下次 %02d:%02d（每 %@）", mins, secs, title)
+            scheduleButton.toolTip = scheduleStatus.stringValue
         }
         if !busy && !groupRefreshInFlight, (pendingWinner != nil || pendingManual != nil) {
             let targetUID = pendingWinner?.profile.option.id ?? pendingManual?.profile.option.id
@@ -2763,14 +2504,13 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         let hasNodes = selectionPreview != nil && count > 0
         emptyStateLabel.stringValue = busy ? "正在读取订阅和节点…" :
             (selectionPreview == nil ? "请先勾选订阅源" : "当前筛选没有节点")
-        emptyStateLabel.isHidden = !rows.isEmpty
+        emptyStateLabel.isHidden = !visibleRows.isEmpty
         let readyForAction = !busy && !groupRefreshInFlight
         selectAllProfilesButton.isEnabled = !busy && selected.count < registry.count
         clearProfilesButton.isEnabled = !busy && !selected.isEmpty
         refreshButton.isEnabled = !busy
         funnelButton.isEnabled = readyForAction && hasNodes
         loadTestButton.isEnabled = readyForAction && hasNodes
-        flowIndicator.isHidden = true
         switchResultButton.isEnabled = readyForAction && !switchOutcomeUnknown && selectionPreview != nil && visibleRows.indices.contains(resultTable.selectedRow)
         topNBox.isEnabled = !busy && !visibleRows.isEmpty
         selectTopNButton.isEnabled = !busy && !visibleRows.isEmpty
@@ -2786,13 +2526,17 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             trafficEstimate.stringValue = "预计最大下载：\(count) 节点 ≈ \(String(format: "%.2f", total)) MiB（不含 HEAD 请求）"
         }
         if busy { profileTable.deselectAll(nil) }
+        if busy != displayedBusyState {
+            displayedBusyState = busy
+            resultTable.reloadData()
+        }
         parallelBox.isEnabled = !busy; sizePopup.isEnabled = !busy; modePopup.isEnabled = !busy
         intervalPopup.isEnabled = !busy
         scheduleButton.isEnabled = schedule.isArmed || (readyForAction && hasNodes)
         startButton.isEnabled = readyForAction && hasNodes; stopButton.isEnabled = busy && !cancelled
         autoSwitch.isEnabled = !busy && !switchOutcomeUnknown
         copyButton.isEnabled = !rows.isEmpty
-        scheduleStatus.textColor = schedule.isArmed ? .controlAccentColor : .secondaryLabelColor
+        scheduleStatus.textColor = schedule.isArmed ? MultiPalette.accent : MultiPalette.muted
         updateDockAndProgressState()
         rebuildSubscriptionPills()
         updateChampionCard()
@@ -2867,7 +2611,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         let highlighted = desired ?? highlightedIdentity()
         let activeTesting: Set<MultiIdentity> = busy ? Set(rows.filter { runIdentities.contains($0.identity) && $0.state == "等待" }.map(\.identity)) : []
         visibleRows = multiVisibleRows(rows, query: nodeSearch.stringValue, statusFilter: statusFilter,
-                                       activeIdentities: activeTesting, sortColumn: sortColumnIdentifier,
+                                       activeIdentities: activeTesting, sortColumn: busy ? nil : sortColumnIdentifier,
                                        sortAscending: sortColumnAscending)
         resultTable.reloadData()
         if let highlighted = highlighted, let row = visibleRows.firstIndex(where: { rows[$0].identity == highlighted }) {
@@ -2883,7 +2627,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         updateControls()
     }
     func tableView(_ tableView: NSTableView, didClick tableColumn: NSTableColumn) {
-        guard tableView === resultTable else { return }
+        guard tableView === resultTable, !busy else { return }
         let id = tableColumn.identifier.rawValue
         guard ["rank", "profile", "node", "type", "speed", "latency", "failure", "jitter", "score"].contains(id) else { return }
         if sortColumnIdentifier == id {
@@ -3416,17 +3160,17 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         else { rows[index].state = "有效" }
         let highlighted = highlightedIdentity()
         recentlyScoredIdentities.insert(identity)
-        rows = multiRank(rows)
         reloadVisibleRows(preserving: highlighted)
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(550)) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(300)) { [weak self] in
             guard let self = self, !self.closed else { return }
             self.recentlyScoredIdentities.remove(identity)
             self.resultTable.reloadData()
         }
         copyButton.isEnabled = true
         let done = rows.filter { runIdentities.contains($0.identity) && $0.state != "等待" }.count
-        status.stringValue = "测速中：已处理 \(done) / \(runIdentities.count)；实时榜单已更新。"
+        status.stringValue = "测速中：已处理 \(done) / \(runIdentities.count)；完成后按综合评分排序。"
         updateDockAndProgressState()
+        updateChampionCard()
     }
     private func finished(_ summary: MultiBatchSummary, token: TestSchedule.RunToken) {
         guard !closed, activeToken == token else { return }
@@ -3910,18 +3654,18 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             let option = registry[row]
             let cell = NSTableCellView()
             let icon = symbolIcon(option.isCurrent ? "dot.radiowaves.left.and.right" : "tray.full",
-                                  color: option.isCurrent ? .controlAccentColor : .secondaryLabelColor, size: 11.5)
+                                  color: option.isCurrent ? MultiPalette.accent : MultiPalette.muted, size: 11.5)
             let nameField = NSTextField(labelWithString: option.name)
             nameField.font = .systemFont(ofSize: 12.5, weight: option.isCurrent ? .semibold : .medium)
-            nameField.textColor = .labelColor
+            nameField.textColor = MultiPalette.text
             nameField.lineBreakMode = .byTruncatingTail
             nameField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
             var items: [NSView] = [icon, nameField, spacer()]
             if option.isCurrent {
                 let activeLbl = NSTextField(labelWithString: "当前")
                 activeLbl.font = .systemFont(ofSize: 10, weight: .semibold)
-                activeLbl.textColor = .controlAccentColor
-                let activePill = pillBadge(activeLbl, fill: .controlAccentColor, fillAlpha: 0.15, cornerRadius: 5, hPad: 6, vPad: 1.5)
+                activeLbl.textColor = MultiPalette.accent
+                let activePill = pillBadge(activeLbl, fill: MultiPalette.accent, fillAlpha: 0.15, cornerRadius: 5, hPad: 6, vPad: 1.5)
                 items.append(activePill)
             }
             let r = self.row(items, spacing: 6)
@@ -3946,7 +3690,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         guard let index = ids.firstIndex(of: id) else { return nil }
         let text = cells(item)[index]
         if id == "type" && text != "—" {
-            return badgeCell(text.uppercased(), textColor: .secondaryLabelColor, fillColor: .quaternaryLabelColor,
+            return badgeCell(text.uppercased(), textColor: MultiPalette.muted, fillColor: MultiPalette.elevated,
                              font: .monospacedSystemFont(ofSize: 10.5, weight: .semibold), align: .center)
         }
         if id == "speed" {
@@ -3955,33 +3699,32 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                 let cell = MultiSpeedBarCellView()
                 let mib = m.downloadBytesPerSecond / 1_048_576
                 let maxSpeedMiB = max(20.0, (rows.compactMap { $0.measurement?.downloadBytesPerSecond }.max() ?? 20_971_520) / 1_048_576)
-                cell.configure(text: text, fraction: CGFloat(mib / maxSpeedMiB), isTop: row == 0, isTesting: false, shimmerPhase: 0)
+                cell.configure(text: text, fraction: CGFloat(mib / maxSpeedMiB), isTesting: false)
                 return cell
             } else if isRowTesting {
                 let cell = MultiSpeedBarCellView()
-                cell.configure(text: "测速中…", fraction: 0, isTop: false, isTesting: true, shimmerPhase: shimmerPhase)
+                cell.configure(text: "测速中…", fraction: 0, isTesting: true)
                 return cell
             }
         }
         if id == "latency", let m = item.measurement {
-            let ms = m.latencyMilliseconds
-            let tint: NSColor = ms < 80 ? multiHexColor(0x059669) : (ms <= 180 ? multiHexColor(0xD97706) : multiHexColor(0xDC2626))
-            return badgeCell(text, textColor: tint, fillColor: tint, fillAlpha: 0.12,
-                             font: .monospacedDigitSystemFont(ofSize: 11, weight: .semibold), align: .right)
+            let field = label(text, size: 11.5, color: MultiPalette.text, monospacedDigits: true)
+            field.toolTip = String(format: "HEAD 延迟 %.1f ms", m.latencyMilliseconds)
+            return centeredCell(field, align: .right)
         }
         if id == "score" {
             let hasScore = item.eligibleScore != nil
             if hasScore {
-                let isTop = row == 0
-                let tint: NSColor = isTop ? .controlAccentColor : .systemGreen
+                let isTop = item.eligibleScore == rows.compactMap(\.eligibleScore).max()
+                let tint: NSColor = isTop ? MultiPalette.accent : MultiPalette.text
                 let display = isTop ? "★ \(text)" : text
-                return badgeCell(display, textColor: tint, fillColor: tint, fillAlpha: 0.15,
+                return badgeCell(display, textColor: tint, fillColor: .clear,
                                  font: .monospacedDigitSystemFont(ofSize: 11.5, weight: .semibold), align: .right)
-            } else if text.contains("测速中") {
-                return badgeCell(text, textColor: .controlAccentColor, fillColor: .controlAccentColor, fillAlpha: 0.14,
+            } else if busy && runIdentities.contains(item.identity) && item.state == "等待" {
+                return badgeCell("测速中…", textColor: MultiPalette.accent, fillColor: .clear,
                                  font: .systemFont(ofSize: 11, weight: .semibold), align: .right)
             } else if text.contains("失败") || text.contains("未完成") || text.contains("无效") {
-                return badgeCell(text, textColor: .systemRed, fillColor: .systemRed, fillAlpha: 0.14,
+                return badgeCell(text, textColor: MultiPalette.danger, fillColor: .clear,
                                  font: .systemFont(ofSize: 11, weight: .semibold), align: .right)
             }
         }
@@ -3989,49 +3732,18 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         let align: NSTextAlignment = ["rank", "type"].contains(id) ? .center : ["speed", "latency", "failure", "jitter", "score"].contains(id) ? .right : .left
         if id == "node" {
             field.font = .systemFont(ofSize: 12.5, weight: .medium)
-            field.textColor = .labelColor
+            field.textColor = MultiPalette.text
         } else if id == "profile" {
             field.font = .systemFont(ofSize: 12, weight: .regular)
-            field.textColor = .secondaryLabelColor
+            field.textColor = MultiPalette.muted
         } else if id == "speed" {
             field.font = .monospacedDigitSystemFont(ofSize: 12, weight: text == "—" ? .regular : .semibold)
-            field.textColor = text == "—" ? .tertiaryLabelColor : .labelColor
+            field.textColor = text == "—" ? MultiPalette.faint : MultiPalette.text
         } else {
             field.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
-            field.textColor = text == "—" ? .tertiaryLabelColor : .secondaryLabelColor
+            field.textColor = text == "—" ? MultiPalette.faint : MultiPalette.muted
         }
         return centeredCell(field, align: align)
-    }
-}
-
-private final class FlowIndicatorView: NSView {
-    private let shapeLayer = CAShapeLayer()
-    override init(frame: NSRect) {
-        super.init(frame: frame)
-        shapeLayer.strokeColor = NSColor.systemOrange.cgColor
-        shapeLayer.fillColor = nil
-        shapeLayer.lineWidth = 2
-        shapeLayer.lineDashPattern = [4, 4]
-        layer?.addSublayer(shapeLayer)
-        wantsLayer = true
-        startAnimating()
-    }
-    required init?(coder: NSCoder) { fatalError() }
-    override func layout() {
-        super.layout()
-        let path = CGMutablePath()
-        path.move(to: CGPoint(x: 0, y: bounds.midY))
-        path.addLine(to: CGPoint(x: bounds.maxX, y: bounds.midY))
-        shapeLayer.path = path
-        shapeLayer.frame = bounds
-    }
-    func startAnimating() {
-        let anim = CABasicAnimation(keyPath: "lineDashPhase")
-        anim.fromValue = 8
-        anim.toValue = 0
-        anim.duration = 0.5
-        anim.repeatCount = .infinity
-        shapeLayer.add(anim, forKey: "flow")
     }
 }
 

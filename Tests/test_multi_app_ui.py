@@ -15,6 +15,7 @@ import unittest
 
 PROJECT = Path(__file__).resolve().parent.parent
 DRIVER = r'''
+import AppKit
 import Foundation
 import Darwin
 
@@ -23,6 +24,15 @@ private final class FixtureEvents: @unchecked Sendable {
     private var values: [String] = []
     func add(_ value: String) { lock.lock(); values.append(value); lock.unlock() }
     func snapshot() -> [String] { lock.lock(); defer { lock.unlock() }; return values }
+}
+
+private func fixtureLuminance(_ color: NSColor) -> Double {
+    let c = color.usingColorSpace(.sRGB)!
+    func linear(_ v: CGFloat) -> Double {
+        let v = Double(v)
+        return v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4)
+    }
+    return 0.2126 * linear(c.redComponent) + 0.7152 * linear(c.greenComponent) + 0.0722 * linear(c.blueComponent)
 }
 
 // In-memory catalogue only: no real profiles, controller, worker or network.
@@ -64,6 +74,31 @@ private func fixtureRows(_ rows: [MultiRow]) -> [[String: Any]] {
         let input = try JSONSerialization.jsonObject(with: FileHandle.standardInput.readDataToEndOfFile()) as! [String: Any]
         var out: [String: Any] = [:]
         switch input["action"] as! String {
+        case "palette":
+            let foregrounds: [(String, NSColor)] = [
+                ("text", MultiPalette.text), ("muted", MultiPalette.muted),
+                ("faint", MultiPalette.faint), ("accent", MultiPalette.accent),
+                ("success", MultiPalette.success), ("danger", MultiPalette.danger)
+            ]
+            let backgrounds: [(String, NSColor)] = [
+                ("background", MultiPalette.background), ("bar", MultiPalette.bar),
+                ("panel", MultiPalette.panel), ("elevated", MultiPalette.elevated),
+                ("selection", MultiPalette.selection), ("feedback", MultiPalette.successSurface)
+            ]
+            for (name, appearanceName) in [("dark", NSAppearance.Name.darkAqua), ("light", .aqua)] {
+                var checks: [[String: Any]] = []
+                NSAppearance(named: appearanceName)!.performAsCurrentDrawingAppearance {
+                    func check(_ label: String, _ foreground: NSColor, _ background: NSColor) {
+                        let a = fixtureLuminance(foreground), b = fixtureLuminance(background)
+                        checks.append(["pair": label, "ratio": (max(a, b) + 0.05) / (min(a, b) + 0.05)])
+                    }
+                    for (fgName, fg) in foregrounds {
+                        for (bgName, bg) in backgrounds { check("\(fgName)/\(bgName)", fg, bg) }
+                    }
+                    check("primary button", MultiPalette.accentInk, MultiPalette.accent)
+                }
+                out[name] = checks
+            }
         case "model":
             let batch = fixtureBatch()
             let preview = multiPreviewRows(batch)
@@ -474,6 +509,14 @@ class MultiAppHeadlessTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, "fixture driver failed")
         self.assertEqual(result.stderr, b"", "fixture driver leaked diagnostics")
         return json.loads(result.stdout)
+
+    def test_graphite_text_is_readable_in_both_appearances_and_row_states(self):
+        out = self.run_driver({"action": "palette"})
+        for appearance, checks in out.items():
+            self.assertEqual(len(checks), 37)
+            for check in checks:
+                with self.subTest(appearance=appearance, pair=check["pair"]):
+                    self.assertGreaterEqual(check["ratio"], 4.5)
 
     def test_preview_catalogue_preserves_byte_exact_profile_and_node_identities(self):
         out = self.run_driver({"action": "model"})
