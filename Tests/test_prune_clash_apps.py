@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Deletion and application-registration regression tests on disposable fixtures."""
 import importlib.util
+import json
 import os
 from pathlib import Path
 import plistlib
@@ -130,6 +131,45 @@ class PruneClashAppsTests(unittest.TestCase):
         self.assertTrue(first.exists())
         self.assertTrue(running.exists())
 
+    def incomplete_app(self):
+        temp = tempfile.TemporaryDirectory(prefix='clash-multi.', dir='/private/tmp')
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        app = root / pruner.APP_NAME
+        (app / 'Contents/MacOS').mkdir(parents=True)
+        work = app / '.build-multi-work'
+        (work / 'Sources').mkdir(parents=True)
+        (work / 'worker-project/Scripts').mkdir(parents=True)
+        (work / 'Sources/MultiMain.swift').write_text('// disposable build marker\n')
+        (work / 'worker-project/Scripts/build-verified-worker.sh').write_text('# disposable build marker\n')
+        return root, app
+
+    def test_dot_staging_prefix_and_incomplete_build_are_removed(self):
+        root, app = self.incomplete_app()
+        self.assertTrue(root.name.startswith(pruner.TMP_PREFIXES))
+        self.assertIsNone(pruner.bundle_id(app))
+        with mock.patch.object(pruner, 'refresh_registration'):
+            self.assertEqual(pruner.cleanup([root], set(), False, custom=True), 1)
+        self.assertFalse(app.exists())
+
+    def test_missing_plist_without_exact_owned_build_markers_is_preserved(self):
+        root, app = self.incomplete_app()
+        (app / '.build-multi-work/Sources/MultiMain.swift').unlink()
+        with mock.patch.object(pruner, 'refresh_registration'):
+            self.assertEqual(pruner.cleanup([root], set(), False, custom=True), 0)
+        self.assertTrue(app.exists())
+
+    def test_running_compiler_prevents_incomplete_build_removal(self):
+        root, app = self.incomplete_app()
+        command = '/compiler/swiftc ' + str(app / '.build-multi-work/Sources/MultiMain.swift') + '\n'
+        result = subprocess.CompletedProcess([], 0, stdout=command)
+        with mock.patch.object(pruner.subprocess, 'run', return_value=result), \
+             mock.patch.object(pruner, 'refresh_registration') as refresh:
+            with self.assertRaisesRegex(RuntimeError, 'running app or build'):
+                pruner.cleanup([root], set(), False, custom=True)
+            refresh.assert_not_called()
+        self.assertTrue(app.exists())
+
     def test_only_project_ghosts_are_unregistered_and_staged_app_is_not_registered(self):
         ghost = self.root / 'missing/Clash Multi.app'
         unrelated = self.root / 'missing/Unrelated.app'
@@ -160,7 +200,7 @@ class PruneClashAppsTests(unittest.TestCase):
             pruner.refresh_registration([self.root / 'gone.app'], [self.root], set(), False, True)
         self.assertTrue(all(call.args[0][1] == '-dump' for call in run.call_args_list))
 
-    def test_install_replaces_helper_prunes_duplicates_and_removes_staging(self):
+    def installer_fixture(self):
         scripts = self.root / 'project/Scripts'
         scripts.mkdir(parents=True)
         for name in ('install-multi.sh', 'prune-clash-apps.sh', 'prune-clash-apps.py'):
@@ -186,16 +226,62 @@ PY
 /usr/bin/codesign --force --sign - --timestamp=none "$app_path"
 ''', encoding='utf-8')
         builder.chmod(0o755)
-        current = self.app(pruner.APP_NAME, root=self.install)
-        backup = self.app(pruner.APP_NAME + '.backup-20261108', root=self.install)
-        direct = self.app('Clash Verge Direct.app.fallback', pruner.DIRECT_ID)
         receipt = self.root / 'stage-path.txt'
+        registrations = self.root / 'registrations.jsonl'
+        wrapper = self.root / 'lsregister-trace'
+        wrapper.write_text('''#!/usr/bin/python3
+import json, os, pathlib, plistlib, subprocess, sys
+args = sys.argv[1:]
+if args == ['-dump']:
+    raise SystemExit(subprocess.run([REAL_LSREGISTER, *args]).returncode)
+path = pathlib.Path(args[-1])
+info = path / 'Contents/Info.plist'
+generation = None
+if info.is_file():
+    generation = plistlib.loads(info.read_bytes()).get('FixtureGeneration')
+with open(os.environ['REGISTRATION_RECEIPT'], 'a') as stream:
+    stream.write(json.dumps({'args': args, 'exists': path.exists(),
+                             'generation': generation}) + '\\n')
+if args[0] == '-u' and str(path) == os.environ.get('FAIL_UNREGISTER_PATH'):
+    raise SystemExit(19)
+raise SystemExit(subprocess.run([REAL_LSREGISTER, *args]).returncode)
+'''.replace('REAL_LSREGISTER', repr(str(pruner.LSREGISTER))), encoding='utf-8')
+        wrapper.chmod(0o755)
+        installer = scripts / 'install-multi.sh'
+        installer.write_text(installer.read_text().replace(str(pruner.LSREGISTER), str(wrapper)))
         env = os.environ.copy()
         env.update(CLASH_MULTI_INSTALL_ROOT=str(self.install),
                    CLASH_LEGACY_CLEANUP_ROOTS=str(self.root),
-                   BUILD_STAGE_RECEIPT=str(receipt))
+                   BUILD_STAGE_RECEIPT=str(receipt),
+                   REGISTRATION_RECEIPT=str(registrations))
+        return installer, receipt, registrations, env
+
+    def registered_install(self, generation=None):
+        current = self.app(pruner.APP_NAME, root=self.install)
+        info = current / 'Contents/Info.plist'
+        data = plistlib.loads(info.read_bytes())
+        if generation:
+            data['FixtureGeneration'] = generation
+        info.write_bytes(plistlib.dumps(data))
+        executable = current / 'Contents/MacOS/fixture'
+        shutil.copyfile('/usr/bin/true', executable)
+        executable.chmod(0o755)
+        for target in (executable, current):
+            subprocess.run(['/usr/bin/codesign', '--force', '--sign', '-',
+                            '--timestamp=none', str(target)], check=True, capture_output=True)
+        subprocess.run([str(pruner.LSREGISTER), '-f', str(current)],
+                       check=True, capture_output=True, timeout=15)
+        self.addCleanup(subprocess.run, [str(pruner.LSREGISTER), '-u', str(current)],
+                        capture_output=True, timeout=15)
+        return current
+
+    def test_install_replaces_helper_prunes_duplicates_and_removes_staging(self):
+        installer, receipt, registrations, env = self.installer_fixture()
+        current = self.registered_install('old')
+        backup = self.app(pruner.APP_NAME + '.backup-20261108', root=self.install)
+        direct = self.app('Clash Verge Direct.app.fallback', pruner.DIRECT_ID)
         try:
-            result = subprocess.run(['/bin/bash', str(scripts / 'install-multi.sh')],
+            result = subprocess.run(['/bin/bash', str(installer)],
                                     env=env, text=True, capture_output=True, timeout=40)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue((current / 'Contents/MacOS/fixture').is_file())
@@ -204,9 +290,47 @@ PY
             self.assertFalse(Path(receipt.read_text().strip()).parent.exists())
             subprocess.run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(current)],
                            capture_output=True, check=True, timeout=15)
+            events = [json.loads(line) for line in registrations.read_text().splitlines()]
+            canonical = [event for event in events if event['args'][-1] == str(current)]
+            self.assertEqual([event['args'][0] for event in canonical], ['-u', '-f'])
+            self.assertEqual(canonical[0]['generation'], 'old')
+            self.assertTrue(canonical[0]['exists'])
+            self.assertIsNone(canonical[1]['generation'])
+            self.assertTrue(canonical[1]['exists'])
+            self.assertEqual([event['args'][-1] for event in events if event['args'][0] == '-f'],
+                             [str(current)])
         finally:
             subprocess.run([str(pruner.LSREGISTER), '-u', str(current)],
                            capture_output=True, timeout=15)
+
+    def test_failed_unregister_preserves_old_install_and_cleans_staging(self):
+        installer, receipt, registrations, env = self.installer_fixture()
+        current = self.registered_install()
+        original = (current / 'Contents/Info.plist').read_bytes()
+        env['FAIL_UNREGISTER_PATH'] = str(current)
+        result = subprocess.run(['/bin/bash', str(installer)], env=env,
+                                text=True, capture_output=True, timeout=40)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((current / 'Contents/Info.plist').read_bytes(), original)
+        self.assertFalse(Path(receipt.read_text().strip()).parent.exists())
+        events = [json.loads(line) for line in registrations.read_text().splitlines()]
+        self.assertTrue(any(event['args'] == ['-u', str(current)] and event['exists']
+                            for event in events))
+        self.assertFalse(any(event['args'][0] == '-f' for event in events))
+
+    def test_unregistered_incomplete_install_can_be_replaced(self):
+        installer, receipt, registrations, env = self.installer_fixture()
+        current = self.app(pruner.APP_NAME, root=self.install)
+        self.addCleanup(subprocess.run, [str(pruner.LSREGISTER), '-u', str(current)],
+                        capture_output=True, timeout=15)
+        result = subprocess.run(['/bin/bash', str(installer)], env=env,
+                                text=True, capture_output=True, timeout=40)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((current / 'Contents/MacOS/fixture').is_file())
+        self.assertFalse(Path(receipt.read_text().strip()).parent.exists())
+        events = [json.loads(line) for line in registrations.read_text().splitlines()]
+        canonical = [event['args'][0] for event in events if event['args'][-1] == str(current)]
+        self.assertEqual(canonical, ['-f'])
 
 
 if __name__ == '__main__':

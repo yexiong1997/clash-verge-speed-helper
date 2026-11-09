@@ -11,6 +11,7 @@ readonly PRUNE_SCRIPT="$PROJECT_DIR/Scripts/prune-clash-apps.sh"
 readonly INSTALL_ROOT="${CLASH_MULTI_INSTALL_ROOT:-$HOME/Applications}"
 readonly APP_NAME='Clash 多订阅测速助手.app'
 readonly APP_PATH="$INSTALL_ROOT/$APP_NAME"
+readonly LSREGISTER='/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister'
 stage=''
 
 usage() {
@@ -50,8 +51,7 @@ cleanup() {
     local status=$?
     trap - EXIT
     if [[ -n "$stage" && -d "$stage" && ! -L "$stage" && -O "$stage" ]]; then
-        /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
-            -u "$stage/$APP_NAME" >/dev/null 2>&1 || :
+        "$LSREGISTER" -u "$stage/$APP_NAME" >/dev/null 2>&1 || :
         /bin/rm -rf -- "$stage"
     fi
     exit "$status"
@@ -115,10 +115,14 @@ PY
 # Only immediate children with the helper's exact name family are removable.
 # This includes the active app, runtime fallback copies, and dated backups,
 # while leaving Clash Verge and every unrelated .app untouched.
-/usr/bin/python3 -I - "$INSTALL_ROOT" "$APP_NAME" <<'PY'
-import os, shutil, stat, sys
-root, app_name = sys.argv[1:]
+/usr/bin/python3 -I - "$INSTALL_ROOT" "$APP_NAME" "$LSREGISTER" <<'PY'
+import os, re, shutil, stat, subprocess, sys
+root, app_name, lsregister = sys.argv[1:]
 root = os.path.realpath(root)
+dump = subprocess.run([lsregister, '-dump'], check=True, capture_output=True,
+                      text=True, timeout=30).stdout
+registered = {os.path.realpath(match.group(1)) for match in
+              re.finditer(r'^path:\s+(.+) \(0x[0-9a-f]+\)\s*$', dump, re.M)}
 base = app_name[:-4]  # remove .app
 allowed = {
     app_name,
@@ -137,6 +141,10 @@ for entry in os.scandir(root):
     elif stat.S_ISDIR(info.st_mode):
         if info.st_uid != os.geteuid():
             raise SystemExit('refusing to remove a helper variant owned by another user: ' + path)
+        # Unregister while the old bundle still exists. After replacement the
+        # same pathname identifies a different filesystem object.
+        if os.path.realpath(path) in registered:
+            subprocess.run([lsregister, '-u', path], check=True, timeout=15)
         shutil.rmtree(path)
     else:
         raise SystemExit('refusing to remove an unexpected helper entry: ' + path)
@@ -144,7 +152,7 @@ PY
 
 /usr/bin/ditto "$STAGED_APP" "$APP_PATH"
 /usr/bin/codesign --verify --deep --strict "$APP_PATH"
-/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
-    -f "$APP_PATH"
+/usr/bin/mdimport -i "$APP_PATH"
+"$LSREGISTER" -f "$APP_PATH"
 printf 'Installed and verified: %s\n' "$APP_PATH"
 printf 'Removed stale helper variants from: %s\n' "$INSTALL_ROOT"

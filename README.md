@@ -21,7 +21,7 @@
 
 该流程只修改运行时内存，不写入 Clash Verge `.app`，不重新签名，也不安装登录项。首次运行需要在“系统设置 → 隐私与安全性 → 辅助功能”授予本助手权限；缺少权限、找不到官方包或签名不匹配时，窗口会明确显示失败原因，测速仍可继续使用。退出助手会关闭桥接，不退出 Clash Verge。刷新或重建 WebView 后，下一次启动助手会重新注入。
 
-多订阅版本的构建与安装使用 [`Scripts/install-multi.sh`](Scripts/install-multi.sh)。它先构建并核验新包，再清理本项目的旧助手、Direct/Patched 构建包和临时验收包，并注销已经失效的应用注册，最后安装唯一的 `~/Applications/Clash 多订阅测速助手.app`。清理按目录、Bundle ID 和签名识别生成包；官方原版、正式助手和此次安装的新包受到保护。需要检查清理范围时运行 [`Scripts/prune-clash-apps.sh`](Scripts/prune-clash-apps.sh) 的 `--dry-run`，可通过 `CLASH_LEGACY_CLEANUP_ROOTS` 限定到隔离测试目录。
+多订阅版本的构建与安装使用 [`Scripts/install-multi.sh`](Scripts/install-multi.sh)。它先构建并核验新包，再清理本项目的旧助手、Direct/Patched 构建包、临时验收包和带有本项目构建标记的失败输出，并注销已经失效的应用注册，最后安装唯一的 `~/Applications/Clash 多订阅测速助手.app`。替换前会注销已登记的旧助手，新包核验后只重新导入该 App 的元数据并登记。清理按目录、Bundle ID、签名和构建标记识别生成包；官方原版、正式助手和此次安装的新包受到保护。需要检查清理范围时运行 [`Scripts/prune-clash-apps.sh`](Scripts/prune-clash-apps.sh) 的 `--dry-run`，可通过 `CLASH_LEGACY_CLEANUP_ROOTS` 限定到隔离测试目录。
 
 在项目根目录执行：
 

@@ -20,7 +20,7 @@ HELPER_IDS = {
     'local.clash.node-speed-helper.auto',
 }
 REGISTERED_IDS = HELPER_IDS | {STOCK_ID, DIRECT_ID, 'local.synthetic.clash-smoke'}
-TMP_PREFIXES = ('clash-runtime-', 'clashmulti-', 'clash-multi-')
+TMP_PREFIXES = ('clash-runtime-', 'clashmulti-', 'clash-multi-', 'clash-multi.')
 LSREGISTER = Path('/System/Library/Frameworks/CoreServices.framework/Frameworks/'
                   'LaunchServices.framework/Support/lsregister')
 
@@ -59,7 +59,30 @@ def is_adhoc(path):
     return result.returncode == 0 and 'Signature=adhoc' in result.stderr.splitlines()
 
 
+def incomplete_build(path):
+    # The builder writes Info.plist late. A failed compile can leave a .app
+    # folder outside normal application metadata and registration results.
+    # Accept only our private staging family,
+    # exact output name, missing plist and complete, non-symlink build markers.
+    parent = path.parent
+    if (path.name != APP_NAME or parent.parent != Path('/private/tmp') or
+            not parent.name.startswith(TMP_PREFIXES) or
+            os.path.lexists(path / 'Contents/Info.plist')):
+        return False
+    directories = [path / 'Contents', path / 'Contents/MacOS',
+                   path / '.build-multi-work', path / '.build-multi-work/Sources',
+                   path / '.build-multi-work/worker-project',
+                   path / '.build-multi-work/worker-project/Scripts']
+    markers = [path / '.build-multi-work/Sources/MultiMain.swift',
+               path / '.build-multi-work/worker-project/Scripts/build-verified-worker.sh']
+    return (all(p.is_dir() and not p.is_symlink() for p in directories) and
+            all(p.is_file() and not p.is_symlink() and p.stat().st_uid == os.geteuid()
+                for p in markers))
+
+
 def generated(path, identifier):
+    if identifier is None:
+        return incomplete_build(path)
     if identifier in HELPER_IDS:
         return True
     if identifier == DIRECT_ID:
@@ -144,8 +167,11 @@ def cleanup(roots, protected, dry_run, custom=False, register_apps=()):
         if path != physical(path) or path.stat().st_uid != os.geteuid():
             raise RuntimeError(f'candidate is not an owned physical bundle: {path}')
         prefix = str(path) + '/Contents/'
-        if any(line.strip().startswith(prefix) for line in commands):
-            raise RuntimeError(f'refusing to remove a running app: {path}')
+        if any(line.strip().startswith(prefix) or
+               str(path / '.build-multi-work') + '/' in line or
+               ('build-multi.sh' in line and str(path) in line)
+               for line in commands):
+            raise RuntimeError(f'refusing to remove a running app or build: {path}')
     for path in sorted(candidates):
         if dry_run:
             print(f'would remove: {path}')

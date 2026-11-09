@@ -70,9 +70,13 @@ env VERIFIED_WORKER_OFFLINE_CACHE="/绝对路径/可信缓存" \
 /bin/bash Scripts/install-multi.sh
 ```
 
-脚本先在 `/private/tmp` 构建并核验新包，再清理本项目的旧助手、Direct/Patched 构建包和临时验收包，最后安装到 `~/Applications/Clash 多订阅测速助手.app` 并再次核验。默认检查 `/Applications`、`~/Applications`、本项目 `build/`、`~/Documents/Codex`、废纸篓和 `/private/tmp` 中本项目命名前缀的构建/验收目录。仅目录名相似不足以删除：必须匹配本项目的 Bundle ID；与原版同 Bundle ID 的实验包还必须位于生成位置且为 ad-hoc 签名。官方原版、正式助手和此次构建的新包受到保护。
+脚本先在 `/private/tmp` 构建并核验新包，再清理本项目的旧助手、Direct/Patched 构建包和临时验收包，最后安装到 `~/Applications/Clash 多订阅测速助手.app` 并再次核验。默认检查 `/Applications`、`~/Applications`、本项目 `build/`、`~/Documents/Codex`、废纸篓和 `/private/tmp` 中本项目命名前缀的构建/验收目录。仅目录名相似不足以删除：完整 App 必须匹配本项目的 Bundle ID；与原版同 Bundle ID 的实验包还必须位于生成位置且为 ad-hoc 签名。官方原版、正式助手和此次构建的新包受到保护。
+
+编译失败时还可能留下没有 `Info.plist` 的同名 `.app` 目录，常规应用搜索不会列出它。清理器会检查 `clash-multi.` 等本项目临时目录前缀，并只在目录名、缺失的 plist 和 `.build-multi-work` 构建标记全部符合时清理这种残留；正在编译的输出会保留。
 
 清理器还会逐条注销已删除包及失效的本项目应用注册，不重置其他应用的图标布局。遇到正在运行的旧实验包时，清理会停止，不会强行结束它。安装过程中若正式助手仍在运行，安装脚本会先请求它退出，无法退出就保留旧安装并失败。安装暂存包退出清理时会注销，避免再次留下临时图标。以后更新也使用此安装脚本。
+
+替换正式助手前，安装脚本先检查其现有系统登记，并在旧包仍存在时注销；注销失败会保留旧包并停止安装。没有登记的不完整安装可以直接替换。新包复制并通过签名核验后，脚本只重新导入该 App 的 Spotlight 元数据，再登记安装路径；不会重建整盘索引或重置启动器布局。
 
 需要先检查清理范围时运行：
 
