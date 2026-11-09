@@ -70,12 +70,29 @@ env VERIFIED_WORKER_OFFLINE_CACHE="/绝对路径/可信缓存" \
 /bin/bash Scripts/install-multi.sh
 ```
 
-脚本先在 `/private/tmp` 构建并核验新包，再只清理当前用户 `~/Applications` 下名称属于本助手的旧包、运行时副本和 dated backup，最后安装到 `~/Applications/Clash 多订阅测速助手.app` 并再次核验。它不会删除官方 `Clash Verge.app` 或其他应用。以后更新也使用这个脚本；若助手正在运行，脚本会先请求它退出，无法退出就保留旧安装并失败。
+脚本先在 `/private/tmp` 构建并核验新包，再清理本项目的旧助手、Direct/Patched 构建包和临时验收包，最后安装到 `~/Applications/Clash 多订阅测速助手.app` 并再次核验。默认检查 `/Applications`、`~/Applications`、本项目 `build/`、`~/Documents/Codex`、废纸篓和 `/private/tmp` 中本项目命名前缀的构建/验收目录。仅目录名相似不足以删除：必须匹配本项目的 Bundle ID；与原版同 Bundle ID 的实验包还必须位于生成位置且为 ad-hoc 签名。官方原版、正式助手和此次构建的新包受到保护。
+
+清理器还会逐条注销已删除包及失效的本项目应用注册，不重置其他应用的图标布局。遇到正在运行的旧实验包时，清理会停止，不会强行结束它。安装过程中若正式助手仍在运行，安装脚本会先请求它退出，无法退出就保留旧安装并失败。安装暂存包退出清理时会注销，避免再次留下临时图标。以后更新也使用此安装脚本。
+
+需要先检查清理范围时运行：
+
+```bash
+Scripts/prune-clash-apps.sh --dry-run
+```
+
+如需隔离验证，设置由当前用户拥有的冒号分隔根目录：
+
+```bash
+CLASH_LEGACY_CLEANUP_ROOTS="/private/tmp/my-clash-artifacts" \
+  Scripts/prune-clash-apps.sh --dry-run
+```
 
 如需在隔离目录中验证清理逻辑，可设置一个由当前用户拥有的临时目录：
 
 ```bash
-CLASH_MULTI_INSTALL_ROOT="/private/tmp/my-clash-apps" /bin/bash Scripts/install-multi.sh
+CLASH_MULTI_INSTALL_ROOT="/private/tmp/my-clash-apps" \
+CLASH_LEGACY_CLEANUP_ROOTS="/private/tmp/my-clash-apps" \
+  /bin/bash Scripts/install-multi.sh
 ```
 
 此构建使用本机 **ad-hoc 签名**，没有 Developer ID 签名，也没有 Apple 公证。macOS 可能阻止首次打开；只有在您确认来源可信并接受风险时，才使用系统提供的针对该应用的允许打开流程。不要全局关闭 Gatekeeper，也不要用管理员权限覆盖现有应用。

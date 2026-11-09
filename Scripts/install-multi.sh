@@ -7,6 +7,7 @@ export COPYFILE_DISABLE=1
 
 readonly PROJECT_DIR="$(cd -P "$(dirname "$0")/.." && pwd -P)"
 readonly BUILD_SCRIPT="$PROJECT_DIR/Scripts/build-multi.sh"
+readonly PRUNE_SCRIPT="$PROJECT_DIR/Scripts/prune-clash-apps.sh"
 readonly INSTALL_ROOT="${CLASH_MULTI_INSTALL_ROOT:-$HOME/Applications}"
 readonly APP_NAME='Clash 多订阅测速助手.app'
 readonly APP_PATH="$INSTALL_ROOT/$APP_NAME"
@@ -19,9 +20,11 @@ Usage:
 
 Builds a fresh verified app in /private/tmp, verifies it, replaces the current
 user's Clash 多订阅测速助手 app, and removes stale helper variants/backups from
-the same Applications directory. It never touches the official Clash Verge.app
-or unrelated applications. Set CLASH_MULTI_INSTALL_ROOT only for an explicit,
-user-owned test/install root.
+the same Applications directory. It also removes allowlisted generated
+Clash Verge Direct/Patched bundles from the standard local cleanup roots. It
+never touches the official Clash Verge.app or unrelated applications. Set
+CLASH_MULTI_INSTALL_ROOT only for an explicit, user-owned test/install root;
+set CLASH_LEGACY_CLEANUP_ROOTS for an explicit cleanup-root list.
 HELP
 }
 
@@ -34,6 +37,7 @@ fi
 [[ $# -eq 0 ]] || { usage >&2; exit 2; }
 [[ "$(uname -s)" == 'Darwin' && "$(uname -m)" == 'arm64' ]] || die 'Apple Silicon macOS is required'
 [[ -f "$BUILD_SCRIPT" && ! -L "$BUILD_SCRIPT" && -x "$BUILD_SCRIPT" ]] || die 'build-multi.sh is missing or not executable'
+[[ -f "$PRUNE_SCRIPT" && ! -L "$PRUNE_SCRIPT" && -x "$PRUNE_SCRIPT" ]] || die 'prune-clash-apps.sh is missing or not executable'
 
 if [[ ! -e "$INSTALL_ROOT" && ! -L "$INSTALL_ROOT" ]]; then
     /bin/mkdir -p "$INSTALL_ROOT"
@@ -46,6 +50,8 @@ cleanup() {
     local status=$?
     trap - EXIT
     if [[ -n "$stage" && -d "$stage" && ! -L "$stage" && -O "$stage" ]]; then
+        /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+            -u "$stage/$APP_NAME" >/dev/null 2>&1 || :
         /bin/rm -rf -- "$stage"
     fi
     exit "$status"
@@ -55,6 +61,10 @@ trap cleanup EXIT
 readonly STAGED_APP="$stage/$APP_NAME"
 /bin/bash "$BUILD_SCRIPT" --output "$STAGED_APP"
 /usr/bin/codesign --verify --deep --strict "$STAGED_APP"
+
+# Remove stale generated Clash bundles before replacing the helper. The
+# cleanup script protects the stock app and refuses to remove a running bundle.
+/bin/bash "$PRUNE_SCRIPT" --keep "$STAGED_APP"
 
 # Do not remove an installed app while its executable is still running. The
 # helper is intentionally the only process path this script is allowed to stop.
@@ -134,5 +144,7 @@ PY
 
 /usr/bin/ditto "$STAGED_APP" "$APP_PATH"
 /usr/bin/codesign --verify --deep --strict "$APP_PATH"
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+    -f "$APP_PATH"
 printf 'Installed and verified: %s\n' "$APP_PATH"
 printf 'Removed stale helper variants from: %s\n' "$INSTALL_ROOT"
