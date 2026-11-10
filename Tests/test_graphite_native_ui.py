@@ -21,7 +21,7 @@ extension MultiAppDelegate {
         let option = ProfileOption(uid: "synthetic", name: "示例订阅", path: "/fixture/unused.yaml", isCurrent: true)
         let names = ["JP 日本东京 01 · 电信联通", "JP 日本东京 02 · 电信联通", "HK 香港 01 · 三网优化", "SG 新加坡 01 · 家宽优化", "US 美国洛杉矶 01 · 流媒体", "HK 香港 05 · 电信联通", "JP 日本大阪 02 · 联通优化", "SG 新加坡 03 · 高速线路", "DE 德国法兰克福 01", "US 美国圣何塞 03"]
         let profile = MultiProfileSnapshot(option: option, data: Data("synthetic".utf8), version: MultiFileVersion(stat()), names: names)
-        let batch = MultiPreparedBatch(registry: [option], registryData: Data(), registryVersion: MultiFileVersion(stat()), profiles: [profile], options: MultiBatchOptions(downloadBytes: 1_048_576, streams: 2, latencyTimeout: "1s", downloadTimeout: "5s"), parallel: 10, jobCount: names.count, requestedBytes: names.count * 1_048_576, previewOnly: true)
+        let batch = MultiPreparedBatch(registry: [option], registryData: Data(), registryVersion: MultiFileVersion(stat()), profiles: [profile], options: MultiBatchOptions(downloadBytes: 1_048_576, streams: 2, latencyTimeout: "1s", downloadTimeout: "3s"), parallel: 10, jobCount: names.count, requestedBytes: names.count * 1_048_576, previewOnly: true)
         registry = [option]; selected = [option.id]; selectionPreview = batch
         rows = multiPreviewRows(batch); nodeSelection = Set(rows.map(\.identity))
         for i in 0..<5 {

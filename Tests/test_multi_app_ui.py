@@ -49,7 +49,7 @@ private func fixtureBatch() -> MultiPreparedBatch {
     ]
     return MultiPreparedBatch(registry: [first, second], registryData: Data("fixture".utf8),
         registryVersion: version, profiles: profiles,
-        options: MultiBatchOptions(downloadBytes: 262144, streams: 2, latencyTimeout: "1s", downloadTimeout: "5s"),
+        options: MultiBatchOptions(downloadBytes: 262144, streams: 2, latencyTimeout: "1s", downloadTimeout: "3s"),
         parallel: 10, jobCount: 8, requestedBytes: 8 * 262144, previewOnly: true)
 }
 
@@ -224,7 +224,7 @@ private func fixtureRows(_ rows: [MultiRow]) -> [[String: Any]] {
             do {
                 let registry = try ProfileRegistry.options(root: root)
                 stage = "prepare"
-                let options = MultiBatchOptions(downloadBytes: 262144, streams: 2, latencyTimeout: "1s", downloadTimeout: "5s")
+                let options = MultiBatchOptions(downloadBytes: 262144, streams: 2, latencyTimeout: "1s", downloadTimeout: "3s")
                 let selectedNodes = (input["selectedNodes"] as? [[String: String]]).map { entries in
                     Set(entries.map { MultiIdentity(profile: Data($0["uid"]!.utf8), node: $0["node"]!) })
                 }
@@ -271,7 +271,7 @@ private func fixtureRows(_ rows: [MultiRow]) -> [[String: Any]] {
         case "snapshot":
             let root = URL(fileURLWithPath: input["root"] as! String, isDirectory: true)
             let registry = try ProfileRegistry.options(root: root)
-            let options = MultiBatchOptions(downloadBytes: 262144, streams: 2, latencyTimeout: "1s", downloadTimeout: "5s")
+            let options = MultiBatchOptions(downloadBytes: 262144, streams: 2, latencyTimeout: "1s", downloadTimeout: "3s")
             let batch = try multiPrepare(root: root, registry: registry, selected: Set(registry.map(\.id)), options: options, parallel: 1)
             let snapshot = batch.profiles[0]
             let profileURL = URL(fileURLWithPath: snapshot.option.path)
@@ -289,7 +289,7 @@ private func fixtureRows(_ rows: [MultiRow]) -> [[String: Any]] {
             }
             out["after"] = multiProfileSnapshotMatches(root: root, profile: snapshot)
         case "decode":
-            let options = MultiBatchOptions(downloadBytes: 262144, streams: 2, latencyTimeout: "1s", downloadTimeout: "5s")
+            let options = MultiBatchOptions(downloadBytes: 262144, streams: 2, latencyTimeout: "1s", downloadTimeout: "3s")
             let job = MultiBatchJob(profileIdentity: Data("uid".utf8), nodeName: "节点", yamlSnapshot: Data("fixture".utf8), index: 0, options: options)
             let strings = input["lines"] as! [String]
             let result = multiDecode(.success(strings), job: job)

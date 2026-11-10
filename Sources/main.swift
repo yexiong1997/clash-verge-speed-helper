@@ -488,7 +488,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
         rows.removeAll(); failureCount = 0; table.reloadData(); setRunning(true)
         let batch = BatchRunner(executable: executable, config: snapshot, names: names, size: size * 1024 * 1024,
                                 parallel: quick ? 4 : 1, streams: quick ? 2 : 4,
-                                latencyTimeout: quick ? "1s" : "2s", downloadTimeout: quick ? "5s" : "8s",
+                                latencyTimeout: quick ? "1s" : "2s", downloadTimeout: "3s",
                                 onResult: { [weak self] index, name, fields in self?.addResult(index: index, name: name, fields: fields) },
                                 onFinish: { [weak self] cancelled, _, _ in self?.finished(cancelled: cancelled) })
         runner = batch; stopButton.isEnabled = true; statusLabel.stringValue = "测速中：正在同时处理最多 \(quick ? 4 : 1) 个节点，可随时停止。"; batch.start()
