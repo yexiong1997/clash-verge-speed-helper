@@ -513,8 +513,8 @@ def instrument(source, fixture_root, event_file, put_marker, socket_path):
         'remove service socket and require fixture socket')
     require('/var/run/clash-verge-service' not in source, 'service socket reference remains')
     source = replace_once(source,
-        'latencyTimeout: quick ? "2s" : "5s", downloadTimeout: quick ? "12s" : "30s"), parallel)',
-        'latencyTimeout: quick ? "2s" : "5s", downloadTimeout: quick ? "12s" : "30s", serverURL: ' + literal(TARGET) + '), parallel)',
+        'latencyTimeout: quick ? "1s" : "2s", downloadTimeout: quick ? "5s" : "8s"), parallel)',
+        'latencyTimeout: quick ? "1s" : "2s", downloadTimeout: quick ? "5s" : "8s", serverURL: ' + literal(TARGET) + '), parallel)',
         'offline synthetic target')
     source = replace_once(source, '        window.makeKeyAndOrderFront(nil)\n        NSApp.activate(ignoringOtherApps: true)',
                           '        // Fixture: construct but do not present the window.', 'window presentation')
@@ -596,7 +596,7 @@ args = sys.argv[1:]
 load = os.environ['FIXTURE_SCENARIO'] == 'load-run'
 size = 20971520 if load else 3145728
 expected = ['-c', '/dev/stdin', '-f', None, '-download-size', str(size),
-            '-concurrent', '4' if load else '2', '-timeout', '30s' if load else '12s', '-max-latency', '5s' if load else '2s',
+            '-concurrent', '4' if load else '2', '-timeout', '8s' if load else '5s', '-max-latency', '2s' if load else '1s',
             '-rename=false', '-server-url', 'http://127.0.0.1:1/synthetic-disabled', '-json-v1']
 if len(args) != len(expected) or any(v is not None and v != args[i] for i, v in enumerate(expected)):
     event('X'); sys.exit(2)

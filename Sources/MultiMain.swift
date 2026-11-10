@@ -2547,7 +2547,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
               (1...10).contains(parallel), sizeValues.indices.contains(sizePopup.indexOfSelectedItem) else { return nil }
         let quick = modePopup.indexOfSelectedItem == 0
         return (MultiBatchOptions(downloadBytes: sizeValues[sizePopup.indexOfSelectedItem], streams: quick ? 2 : 4,
-                                  latencyTimeout: quick ? "2s" : "5s", downloadTimeout: quick ? "12s" : "30s"), parallel)
+                                  latencyTimeout: quick ? "1s" : "2s", downloadTimeout: quick ? "5s" : "8s"), parallel)
     }
     private func describe(_ batch: MultiPreparedBatch) -> String? {
         let profiles = batch.profiles.map { "• \($0.option.name)（UID：\($0.option.uid)，\($0.names.count) 个节点）" }.joined(separator: "\n")
@@ -2583,7 +2583,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         cancelled = false; busy = true; updateControls(); status.stringValue = "正在本地读取节点列表，不会测速…"
         let root = self.root, registry = self.registry, selected = self.selected
         let previewOptions = MultiBatchOptions(downloadBytes: 256 * 1024, streams: 2,
-                                               latencyTimeout: "2s", downloadTimeout: "12s")
+                                               latencyTimeout: "1s", downloadTimeout: "5s")
         DispatchQueue.global(qos: .userInitiated).async {
             let batch = try? multiPrepare(root: root, registry: registry, selected: selected,
                                           options: previewOptions, parallel: 1, previewOnly: true)
