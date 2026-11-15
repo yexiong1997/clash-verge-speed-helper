@@ -23,7 +23,7 @@ from http.server import BaseHTTPRequestHandler
 PROJECT = Path(__file__).resolve().parent.parent
 SOURCES = ('MultiMain.swift', 'ProfileRegistry.swift', 'MultiBatchRunner.swift',
            'VerifiedMeasurement.swift', 'CompositeScore.swift', 'TestSchedule.swift',
-           'SwitchController.swift', 'AssistedSwitch.swift')
+           'SwitchController.swift', 'AssistedSwitch.swift', 'TelemetryHistory.swift')
 A_NODES = tuple('A%02d' % i for i in range(1, 13))
 B_NODES = ('B01', 'B02')
 SELECT_A = ('A01', 'Shared', 'é', 'e\u0301')
@@ -38,11 +38,12 @@ SCENARIOS = ('startup', 'same', 'other', 'stop', 'scheduled-stale', 'during-stal
              'group-stale', 'now-stale', 'preput-stale', 'allfailed', 'uncertain',
              'delayed', 'close-busy', 'schedule-overlap', 'manual-no-auto', 'partial-failure',
              'scheduled-other-no-auto', 'only-other', *SELECTION_CASES, 'zero-selection',
-             'load-run', 'manual-same', 'manual-unchecked', 'manual-other', 'manual-revoked',
+             'load-run', 'funnel-run', 'funnel-subset-group', 'funnel-allfailed', 'funnel-abort-resets-stage', 'funnel-cross-profile', 'manual-same', 'manual-unchecked', 'manual-other', 'manual-revoked',
              'manual-unknown', 'manual-group-stale', 'manual-now-stale',
              'result-ranked', 'no-group-start', 'multiple-groups', 'mixed-groups', 'global-only', 'old-scores',
              'quick-stop-valid', 'quick-stop-stale', 'quick-load-stop', 'scheduled-decision-disarm',
-             'scheduled-quick-stop', 'scheduled-quick-close')
+             'scheduled-quick-stop', 'scheduled-quick-close',
+             'history-archive-and-leaderboard', 'patrol-rotation-and-quota', 'health-penalty-probe')
 
 QUICK_STOP_CASES = ('quick-stop-valid', 'quick-stop-stale', 'quick-load-stop',
                     'scheduled-quick-stop', 'scheduled-quick-close')
@@ -249,7 +250,7 @@ private extension MultiAppDelegate {
         guard wait(30, { !self.groupRefreshInFlight }) else { return fail("group-refresh-timeout") }
         if scenario != "only-other" {
             guard wait(30, { self.groupContext?.profile.option.id == uidA }) else { return fail("group-preview") }
-            if !["no-group-start", "multiple-groups", "mixed-groups", "global-only"].contains(scenario) {
+            if !["no-group-start", "multiple-groups", "global-only"].contains(scenario) {
                 guard selectedGroupCapture()?.profile.option.id == uidA,
                       selectedGroupCapture().map({ multiBytesEqual($0.groupName, "SyntheticSelect") && multiBytesEqual($0.now, "A02") }) == true
                 else { return fail("group-default") }
@@ -268,13 +269,18 @@ private extension MultiAppDelegate {
             else { return fail("select-top-n") }
             return finish()
         }
-        if ["multiple-groups", "mixed-groups", "global-only"].contains(scenario) {
+        if scenario == "mixed-groups" {
+            guard let context = groupContext,
+                  Set(context.groups.map { Data($0.name.utf8) }) == Set([Data("GLOBAL".utf8), Data("SyntheticSelect".utf8)]),
+                  selectedGroupCapture().map({ multiBytesEqual($0.groupName, "SyntheticSelect") }) == true
+            else { return fail("mixed-group-smart-select") }
+            guard highlight(MultiIdentity(profile: uidA, node: "A03")),
+                  click(switchResultButton, #selector(switchSelectedResult(_:))), wait(30, { idle() }), !noPut()
+            else { return fail("mixed-group-switch") }
+            return finish()
+        }
+        if ["multiple-groups", "global-only"].contains(scenario) {
             guard groupPopup.indexOfSelectedItem == 0, selectedGroupCapture() == nil else { return fail("group-not-explicit") }
-            if scenario == "mixed-groups" {
-                guard let context = groupContext,
-                      Set(context.groups.map { Data($0.name.utf8) }) == Set([Data("GLOBAL".utf8), Data("SyntheticSelect".utf8)])
-                else { return fail("mixed-group-candidates") }
-            }
             guard highlight(MultiIdentity(profile: uidA, node: "A03")),
                   click(switchResultButton, #selector(switchSelectedResult(_:))), wait(10, { idle() }), noPut()
             else { return fail("group-implicit-switch") }
@@ -315,7 +321,11 @@ private extension MultiAppDelegate {
         }
         if scenario == "zero-selection" {
             guard click(clearShownButton, #selector(clearShownNodes(_:))), nodeSelection?.isEmpty == true else { return fail("zero-clear") }
-            guard !startButton.isEnabled, !scheduleButton.isEnabled else { return fail("zero-controls-enabled") }
+            guard !startButton.isEnabled, !scheduleButton.isEnabled, !funnelButton.isEnabled, !loadTestButton.isEnabled else { return fail("zero-controls-enabled") }
+            let oldParallel = parallelBox.stringValue, oldMode = modePopup.indexOfSelectedItem, oldSize = sizePopup.indexOfSelectedItem
+            startLoadTest(nil); startFunnelTest(nil)
+            guard parallelBox.stringValue == oldParallel, modePopup.indexOfSelectedItem == oldMode,
+                  sizePopup.indexOfSelectedItem == oldSize, funnelStage == 0, funnelPromotedSelection == nil else { return fail("zero-preset-mutated") }
             autoSwitch.state = .off; startManual(nil)
             guard wait(30, { idle() }), !started(), noPut(), settleDisarmed() else { return fail("zero-launched") }
             return finish()
@@ -326,6 +336,198 @@ private extension MultiAppDelegate {
             guard wait(30, { idle() }), !started(), noPut(),
                   status.stringValue.contains("请先在主界面选择当前订阅的策略组"),
                   status.stringValue.contains("未开始测速") else { return fail("no-group-start-prompt") }
+            return finish()
+        }
+        if scenario == "history-archive-and-leaderboard" {
+            autoSwitch.state = .off
+            for _ in 0..<2 {
+                guard click(startButton, #selector(startManual(_:))), wait(30, { idle() }) else {
+                    return fail("history-manual-run")
+                }
+            }
+            guard click(loadTestButton, #selector(startLoadTest(_:))), wait(30, { idle() }) else {
+                return fail("history-load-run")
+            }
+            guard wait(10, { self.telemetryStore.sampleCount() == 42 }) else {
+                return fail("history-sample-count")
+            }
+            guard click(historyModeButton, #selector(viewModeChanged(_:))),
+                  wait(10, { self.viewMode == .history && self.historySummaries.count == 14 }) else {
+                return fail("history-view-switch")
+            }
+            guard let top = historySummaries.first, top.nodeName == "A01",
+                  top.isQualified, top.successCount == 3, top.totalCount == 3, noPut() else {
+                return fail("history-leaderboard-ranking")
+            }
+            guard click(historyWin24hButton, #selector(historyWindowChanged(_:))),
+                  wait(5, { self.historyWindow == .hours24 && self.historySummaries.count == 14 }),
+                  historySummaries.first?.nodeName == "A01",
+                  click(historyWin30dButton, #selector(historyWindowChanged(_:))),
+                  wait(5, { self.historyWindow == .days30 && self.historySummaries.count == 14 }),
+                  click(historyWinPeakButton, #selector(historyWindowChanged(_:))),
+                  wait(5, { self.historyWindow == .peakHours }),
+                  click(historyWin7dButton, #selector(historyWindowChanged(_:))),
+                  wait(5, { self.historyWindow == .days7 && self.historySummaries.count == 14 }) else {
+                return fail("history-window-switch")
+            }
+            guard click(clearHistoryButton, #selector(clearHistoryPressed(_:))),
+                  clearHistoryButton.title == "确认清空?",
+                  telemetryStore.sampleCount() == 42 else {
+                return fail("history-clear-arm")
+            }
+            guard click(clearHistoryButton, #selector(clearHistoryPressed(_:))),
+                  wait(10, { self.telemetryStore.sampleCount() == 0 && self.historySummaries.isEmpty }),
+                  clearHistoryButton.title == "清空记录",
+                  !clearHistoryButton.isEnabled, noPut() else {
+                return fail("history-clear-confirm")
+            }
+            guard click(liveModeButton, #selector(viewModeChanged(_:))),
+                  wait(5, { self.viewMode == .live }) else {
+                return fail("history-return-live")
+            }
+            return finish()
+        }
+        if scenario == "patrol-rotation-and-quota" {
+            let expectedSelection = Set([MultiIdentity(profile: uidA, node: "A01"), MultiIdentity(profile: uidA, node: "A02")])
+            guard click(clearShownButton, #selector(clearShownNodes(_:))),
+                  setNode(MultiIdentity(profile: uidA, node: "A01"), true),
+                  setNode(MultiIdentity(profile: uidA, node: "A02"), true),
+                  nodeSelection == expectedSelection else {
+                return fail("patrol-manual-selection")
+            }
+            guard arm(), schedule.isArmed else { return fail("patrol-pre-arm") }
+            patrolQuotaPopup.selectItem(at: 0)
+            guard NSApp.sendAction(patrolQuotaPopup.action!, to: patrolQuotaPopup.target, from: patrolQuotaPopup),
+                  click(patrolButton, #selector(togglePatrol(_:))),
+                  wait(15, { !self.busy && self.patrolSchedule.isArmed }),
+                  !schedule.isArmed else {
+                return fail("patrol-arm-mutex")
+            }
+            for tick in 1...3 {
+                Fixture.clockOffset += 3601
+                pollPatrolSchedule()
+                guard wait(35, { idle() }),
+                      wait(10, { self.telemetryStore.sampleCount() == tick * 8 }) else {
+                    return fail("patrol-tick-run")
+                }
+                guard patrolSchedule.isArmed, !schedule.isArmed,
+                      nodeSelection == expectedSelection,
+                      rows.count == 14, noPut(),
+                      cachedPatrolBytesToday == tick * 8 * 1_048_576 else {
+                    return fail("patrol-tick-invariants")
+                }
+            }
+            let covered = Set(telemetryStore.computeSummaries(window: .days7).map(\.identity))
+            guard covered.count == 14 else { return fail("patrol-rotation-coverage") }
+            let nowTs = Date().timeIntervalSince1970
+            let aNodes = (1...12).map { String(format: "A%02d", $0) }
+            for idx in 0..<26 {
+                let nodeName = aNodes[idx % aNodes.count]
+                telemetryStore.recordSample(TelemetrySampleRecord(
+                    timestamp: nowTs, profileUID: "a", profileName: "Synthetic-A",
+                    nodeName: nodeName, nodeType: "http", source: .patrol,
+                    requestedBytes: 1_048_576, streams: 2, downloadComplete: true,
+                    downloadBytesPerSecond: 10_485_760, latencyMilliseconds: 20, jitterMilliseconds: 2,
+                    headAttempts: 6, headSuccesses: 6, compositeScore: 60.0
+                ))
+            }
+            Fixture.clockOffset += 3601
+            pollPatrolSchedule()
+            guard wait(10, { idle() }),
+                  patrolLastSummaryText == "今日配额已满",
+                  status.stringValue.contains("配额已用完"),
+                  noPut() else {
+                return fail("patrol-quota-cap")
+            }
+            guard click(patrolButton, #selector(togglePatrol(_:))),
+                  !patrolSchedule.isArmed else {
+                return fail("patrol-disarm")
+            }
+            let workersBefore = (try? Data(contentsOf: URL(fileURLWithPath: Fixture.events))) ?? Data()
+            Fixture.clockOffset += 5000
+            pollPatrolSchedule()
+            pause(0.4)
+            let workersAfter = (try? Data(contentsOf: URL(fileURLWithPath: Fixture.events))) ?? Data()
+            guard !patrolSchedule.isArmed, workersBefore == workersAfter, settleDisarmed() else {
+                return fail("patrol-settle")
+            }
+            return finish()
+        }
+        if scenario == "health-penalty-probe" {
+            autoSwitch.state = .off
+            let idA01 = MultiIdentity(profile: uidA, node: "A01")
+            let idA02 = MultiIdentity(profile: uidA, node: "A02")
+            let telA02 = TelemetryIdentity(profile: uidA, nodeName: "A02")
+            guard click(clearShownButton, #selector(clearShownNodes(_:))),
+                  setNode(idA01, true),
+                  setNode(idA02, true) else {
+                return fail("health-node-select")
+            }
+            for round in 1...3 {
+                guard click(startButton, #selector(startManual(_:))),
+                      wait(30, { idle() }),
+                      wait(10, { self.telemetryStore.sampleCount() == round * 2 }) else {
+                    return fail("health-seed-samples")
+                }
+            }
+            guard mark("probe-drop") else { return fail("health-mark-drop") }
+            tickPassiveHealthProbe()
+            guard wait(15, { !self.healthProbeInFlight && self.healthProbeStatusText == "● 控制器未连通" }),
+                  telemetryStore.healthEventCount() == 0,
+                  telemetryStore.healthState(for: telA02).penalty == 0 else {
+                return fail("health-transport-no-penalty")
+            }
+            guard mark("probe-502") else { return fail("health-mark-502") }
+            tickPassiveHealthProbe()
+            guard wait(15, { !self.healthProbeInFlight && self.telemetryStore.healthEventCount() == 1 }),
+                  wait(5, { self.healthProbeStatusText.contains("活跃探测超时") }),
+                  telemetryStore.healthState(for: telA02).penalty == 0 else {
+                return fail("health-first-timeout")
+            }
+            tickPassiveHealthProbe()
+            guard wait(15, { !self.healthProbeInFlight && self.telemetryStore.healthEventCount() == 2 }),
+                  wait(5, { self.healthProbeStatusText.contains("活跃异常") }),
+                  telemetryStore.healthState(for: telA02).penalty > 0 else {
+                return fail("health-second-penalty")
+            }
+            for expectedEvents in 3...6 {
+                tickPassiveHealthProbe()
+                guard wait(15, { !self.healthProbeInFlight && self.telemetryStore.healthEventCount() == expectedEvents }) else {
+                    return fail("health-streak-build")
+                }
+            }
+            let maxHealth = telemetryStore.healthState(for: telA02)
+            guard abs(maxHealth.penalty - 25.0) < 1e-6 else {
+                return fail("health-penalty-cap")
+            }
+            guard click(historyModeButton, #selector(viewModeChanged(_:))),
+                  wait(10, { self.viewMode == .history && self.historySummaries.count == 2 }),
+                  let summaryA02 = historySummaries.first(where: { $0.nodeName == "A02" }),
+                  abs(summaryA02.healthPenalty - 25.0) < 1e-6,
+                  abs(summaryA02.longTermScore - max(0.0, summaryA02.baseScore - 25.0)) < 1e-6 else {
+                return fail("health-history-summary")
+            }
+            guard mark("probe-ok") else { return fail("health-mark-ok") }
+            tickPassiveHealthProbe()
+            guard wait(15, { !self.healthProbeInFlight && self.telemetryStore.healthEventCount() == 7 }),
+                  wait(5, { self.healthProbeStatusText == "● 活跃正常 42ms" }) else {
+                return fail("health-probe-recovery")
+            }
+            let damped = telemetryStore.healthState(for: telA02)
+            guard damped.streak > 0, damped.streak < maxHealth.streak, damped.penalty == 0 else {
+                return fail("health-probe-damp")
+            }
+            guard click(liveModeButton, #selector(viewModeChanged(_:))),
+                  wait(5, { self.viewMode == .live }),
+                  click(startButton, #selector(startManual(_:))),
+                  wait(30, { idle() }),
+                  wait(10, { self.telemetryStore.sampleCount() == 8 }) else {
+                return fail("health-speed-retest")
+            }
+            let cleared = telemetryStore.healthState(for: telA02)
+            guard cleared.streak == 0, cleared.penalty == 0, noPut() else {
+                return fail("health-speed-clears")
+            }
             return finish()
         }
         if scenario == "manual-group-stale" || scenario == "manual-now-stale" {
@@ -356,6 +558,7 @@ private extension MultiAppDelegate {
             return finish()
         }
         autoSwitch.state = ["schedule-overlap", "manual-no-auto", "scheduled-other-no-auto", "select-exact", "load-run", "result-ranked", "old-scores"].contains(scenario) ? .off : .on
+        let funnelScenario = scenario.hasPrefix("funnel-")
         let quickStop = ["quick-stop-valid", "quick-stop-stale", "quick-load-stop", "scheduled-quick-stop", "scheduled-quick-close"].contains(scenario)
         if ["stop", "allfailed", "close-busy", "schedule-overlap", "scheduled-stale", "partial-failure", "scheduled-other-no-auto", "load-run", "scheduled-decision-disarm"].contains(scenario) || quickStop {
             guard arm(), !started() else { return fail("schedule-arm") }
@@ -369,7 +572,23 @@ private extension MultiAppDelegate {
         } else if scenario == "load-run" || scenario == "quick-load-stop" {
             guard click(loadTestButton, #selector(startLoadTest(_:))), parallelBox.stringValue == "2", modePopup.indexOfSelectedItem == 1,
                   sizeValues[sizePopup.indexOfSelectedItem] == 20 * 1_048_576, !schedule.isArmed else { return fail("load-preset") }
-        } else { guard click(startButton, #selector(startManual(_:))) else { return fail("start-control") } }
+        } else if funnelScenario {
+            topNBox.stringValue = "2"
+            if let scoreCol = resultTable.tableColumns.first(where: { $0.identifier.rawValue == "score" }) {
+                tableView(resultTable, didClick: scoreCol)
+                tableView(resultTable, didClick: scoreCol)
+                guard sortColumnIdentifier == "score", sortColumnAscending == true else { return fail("funnel-pre-sort") }
+            }
+            guard click(funnelButton, #selector(startFunnelTest(_:))), parallelBox.stringValue == "10", modePopup.indexOfSelectedItem == 0,
+                  sizeValues[sizePopup.indexOfSelectedItem] == 1 * 1_048_576, funnelStage == 1, !schedule.isArmed else { return fail("funnel-preset") }
+        } else {
+            if scenario == "result-ranked", let scoreCol = resultTable.tableColumns.first(where: { $0.identifier.rawValue == "score" }) {
+                tableView(resultTable, didClick: scoreCol)
+                tableView(resultTable, didClick: scoreCol)
+                guard sortColumnIdentifier == "score", sortColumnAscending == true else { return fail("ranked-pre-sort") }
+            }
+            guard click(startButton, #selector(startManual(_:))) else { return fail("start-control") }
+        }
         if ["scheduled-stale", "group-stale", "now-stale"].contains(scenario) {
             guard wait(30, { idle() }), !started(), noPut(), settleDisarmed() else { return fail("prelaunch-stop") }
             return finish()
@@ -430,9 +649,14 @@ private extension MultiAppDelegate {
         guard wait(35, { self.runner != nil && started() }) else { return fail("worker-start") }
         guard currentBatch?.parallel == (scenario == "load-run" ? 2 : 10) else { return fail("batch-parallel") }
         if scenario == "during-stale" { guard stale() else { return fail("fixture-open") } }
-        if scenario == "stop" || scenario == "close-busy" {
-            if scenario == "stop" { stop(nil) } else if windowShouldClose(window) { return fail("close-allowed-while-busy") }
-            guard wait(30, { idle() }), noPut(), settleDisarmed() else { return fail("stop-or-close") }
+        if scenario == "stop" || scenario == "close-busy" || scenario == "funnel-abort-resets-stage" {
+            if scenario == "close-busy" {
+                if windowShouldClose(window) { return fail("close-allowed-while-busy") }
+            } else {
+                guard click(stopButton, #selector(stop(_:))) else { return fail("stop-control") }
+            }
+            guard wait(30, { idle() }), funnelStage == 0, funnelPromotedSelection == nil,
+                  nodeSelection?.count == 14, noPut(), settleDisarmed() else { return fail("stop-or-close") }
             return finish()
         }
         if scenario == "schedule-overlap" {
@@ -440,7 +664,7 @@ private extension MultiAppDelegate {
             guard activeToken == token, runner != nil, schedule.isArmed else { return fail("schedule-overlap") }
         }
         if scenario == "delayed" { guard wait(40, { !noPut() }), applying else { return fail("delayed-put-not-observed") }; stop(nil) }
-        guard wait(30, { idle() }), Fixture.peak >= 2 && Fixture.peak <= 10 else { return fail("finish-or-peak") }
+        guard wait(funnelScenario ? 45 : 30, { idle() }), Fixture.peak >= 2 && Fixture.peak <= 10 else { return fail("finish-or-peak") }
         switch scenario {
         case "select-exact":
             let expected = Set([MultiIdentity(profile: uidA, node: "Shared"), MultiIdentity(profile: uidA, node: "\u{00E9}"), MultiIdentity(profile: uidB, node: "e\u{0301}")])
@@ -448,8 +672,62 @@ private extension MultiAppDelegate {
                   rows.filter({ !expected.contains($0.identity) }).allSatisfy({ $0.measurement == nil }), noPut() else { return fail("selected-rows") }
         case "load-run":
             guard rows.count == 14, rows.allSatisfy({ $0.measurement?.score != nil }), Fixture.peak <= 2, noPut(), !schedule.isArmed else { return fail("load-execution") }
+        case "funnel-run":
+            guard wait(10, { !self.groupRefreshInFlight }) else { return fail("funnel-run-refresh") }
+            let stage2Rows = rows.filter { $0.measurement?.expectedBytes == 20_971_520 }
+            let expectedPromoted = Set(["A01", "A02", "A03", "A04", "A05", "A06", "A07", "A08", "A09", "A10"])
+            guard rows.count == 14, nodeSelection?.count == 14,
+                  sortColumnIdentifier == nil,
+                  parallelBox.stringValue == "2", modePopup.indexOfSelectedItem == 1,
+                  sizeValues[sizePopup.indexOfSelectedItem] == 20 * 1_048_576,
+                  funnelStage == 0, funnelPromotedSelection == nil, Fixture.peak <= 2,
+                  stage2Rows.count == 10,
+                  Set(stage2Rows.map(\.nodeName)) == expectedPromoted,
+                  rows[0].nodeName == "A03", rows[1].nodeName == "A04", rows[2].nodeName == "A05",
+                  Array(rows[10...12].map(\.nodeName)) == ["B02", "A11", "B01"],
+                  rows[10...12].allSatisfy({ $0.measurement == nil && $0.stage1Score != nil && $0.state.hasPrefix("初筛 ") }),
+                  rows[13].nodeName == "A12" && rows[13].measurement == nil && rows[13].state == "初筛无效",
+                  visibleRows.map({ rows[$0].identity }) == rows.map(\.identity),
+                  click(filterAllButton, #selector(statusFilterChanged(_:))),
+                  visibleRows.map({ rows[$0].identity }) == rows.map(\.identity),
+                  !noPut(), status.stringValue.contains("已切换"),
+                  lastUndoSwitchChoice?.node == "A02", lastUndoSwitchChoice?.profile.names.count == 12,
+                  !undoSwitchButton.isHidden, undoSwitchButton.isEnabled, !schedule.isArmed else { return fail("funnel-run") }
+        case "funnel-subset-group":
+            let stage2Rows = rows.filter { $0.measurement?.expectedBytes == 20_971_520 }
+            guard rows.count == 14, nodeSelection?.count == 14,
+                  sortColumnIdentifier == nil,
+                  funnelStage == 0, funnelPromotedSelection == nil, Fixture.peak <= 2,
+                  stage2Rows.count == 10, Set(stage2Rows.map(\.nodeName)).isSuperset(of: Set(["A01", "A03", "A05"])),
+                  rows.first?.nodeName == "A01",
+                  visibleRows.map({ rows[$0].identity }) == rows.map(\.identity), noPut(),
+                  status.stringValue.contains("不在所选策略组"), !schedule.isArmed else { return fail("funnel-subset-group") }
+        case "funnel-allfailed":
+            guard rows.count == 14, nodeSelection?.count == 14,
+                  sortColumnIdentifier == nil,
+                  parallelBox.stringValue == "10", funnelStage == 0, funnelPromotedSelection == nil,
+                  rows.allSatisfy({ $0.eligibleScore == nil }),
+                  status.stringValue.contains("没有合格节点可晋级二阶段 20MiB 加压"),
+                  noPut(), settleDisarmed() else { return fail("funnel-allfailed") }
+        case "funnel-cross-profile":
+            let stage2Rows = rows.filter { $0.measurement?.expectedBytes == 20_971_520 }
+            guard rows.count == 14, nodeSelection?.count == 14,
+                  sortColumnIdentifier == nil,
+                  funnelStage == 0, funnelPromotedSelection == nil, Fixture.peak <= 2,
+                  stage2Rows.count == 10, Set(stage2Rows.map(\.nodeName)).isSuperset(of: Set(["B01", "B02"])),
+                  rows.first?.nodeName == "B01",
+                  visibleRows.map({ rows[$0].identity }) == rows.map(\.identity),
+                  pendingWinner != nil, noPut(), !schedule.isArmed,
+                  continuePending(), wait(10, { idle() }), noPut(), registryToB(),
+                  continuePending(), wait(10, { idle() }), noPut(),
+                  refreshed(uidB), pendingWinner != nil, continuePending(), wait(30, { idle() && !self.groupRefreshInFlight }),
+                  pendingWinner == nil, !noPut(), status.stringValue.contains("已切换") else { return fail("funnel-cross-profile") }
         case "result-ranked":
-            guard rows.count == 14, rows[0].nodeName == "A12", rows[0].index == 11, noPut(), highlight(rows[0].identity),
+            guard rows.count == 14, sortColumnIdentifier == nil, rows[0].nodeName == "A12", rows[0].index == 11,
+                  visibleRows.map({ rows[$0].identity }) == rows.map(\.identity),
+                  click(filterAllButton, #selector(statusFilterChanged(_:))),
+                  visibleRows.map({ rows[$0].identity }) == rows.map(\.identity),
+                  noPut(), highlight(rows[0].identity),
                   click(switchResultButton, #selector(switchSelectedResult(_:))), wait(30, { idle() }), !noPut() else { return fail("ranked-result-switch") }
         case "same":
             guard rows.count == 14, rows.allSatisfy({ $0.measurement?.score != nil }), rows.first?.nodeName == "A01", !noPut(), status.stringValue.contains("已切换") else { return fail("same-winner") }
@@ -513,8 +791,8 @@ def instrument(source, fixture_root, event_file, put_marker, socket_path):
         'remove service socket and require fixture socket')
     require('/var/run/clash-verge-service' not in source, 'service socket reference remains')
     source = replace_once(source,
-        'latencyTimeout: quick ? "1s" : "2s", downloadTimeout: "3s"), parallel)',
-        'latencyTimeout: quick ? "1s" : "2s", downloadTimeout: "3s", serverURL: ' + literal(TARGET) + '), parallel)',
+        'latencyTimeout: "3s", downloadTimeout: "3s"), parallel)',
+        'latencyTimeout: "3s", downloadTimeout: "3s", serverURL: ' + literal(TARGET) + '), parallel)',
         'offline synthetic target')
     source = replace_once(source, '        window.makeKeyAndOrderFront(nil)\n        NSApp.activate(ignoringOtherApps: true)',
                           '        // Fixture: construct but do not present the window.', 'window presentation')
@@ -527,6 +805,7 @@ def instrument(source, fixture_root, event_file, put_marker, socket_path):
             re.search(r'\bNSAlert\s*\(', source) is None, 'unexpected additional alert or modal remains')
     for anchor in (
         'startButton.action = #selector(startManual(_:))',
+        'funnelButton.action = #selector(startFunnelTest(_:))',
         'loadTestButton.action = #selector(startLoadTest(_:))',
         'switchResultButton.action = #selector(switchSelectedResult(_:))',
         'scheduleButton.action = #selector(toggleSchedule(_:))',
@@ -584,19 +863,34 @@ def instrument(source, fixture_root, event_file, put_marker, socket_path):
 WORKER = r'''#!/usr/bin/python3
 import fcntl, hashlib, json, os, re, signal, sys, time
 log = os.environ['FIXTURE_EVENTS']
-def event(letter):
+def event(letter, extra=None):
+    line = '%s %d\n' % (letter, os.getpid()) if extra is None else '%s %d %s\n' % (letter, os.getpid(), extra)
     with open(log, 'a', encoding='ascii') as f:
         fcntl.flock(f, fcntl.LOCK_EX)
-        f.write('%s %d\n' % (letter, os.getpid())); f.flush()
+        f.write(line); f.flush()
         fcntl.flock(f, fcntl.LOCK_UN)
 def stopped(*unused):
     raise SystemExit(0)
 signal.signal(signal.SIGTERM, stopped)
 args = sys.argv[1:]
-load = os.environ['FIXTURE_SCENARIO'] == 'load-run'
-size = 20971520 if load else 3145728
+scenario = os.environ['FIXTURE_SCENARIO']
+if len(args) != 16 or args[4] != '-download-size' or not args[5].isdigit():
+    event('X'); sys.exit(2)
+size = int(args[5])
+if scenario == 'load-run' and size != 20971520:
+    event('X'); sys.exit(2)
+if scenario == 'patrol-rotation-and-quota' and size != 1048576:
+    event('X'); sys.exit(2)
+if scenario.startswith('funnel-') and size not in (1048576, 20971520):
+    event('X'); sys.exit(2)
+if size == 20971520:
+    concurrent = '4'
+elif size in (1048576, 3145728):
+    concurrent = '2'
+else:
+    event('X'); sys.exit(2)
 expected = ['-c', '/dev/stdin', '-f', None, '-download-size', str(size),
-            '-concurrent', '4' if load else '2', '-timeout', '3s', '-max-latency', '2s' if load else '1s',
+            '-concurrent', concurrent, '-timeout', '3s', '-max-latency', '3s',
             '-rename=false', '-server-url', 'http://127.0.0.1:1/synthetic-disabled', '-json-v1']
 if len(args) != len(expected) or any(v is not None and v != args[i] for i, v in enumerate(expected)):
     event('X'); sys.exit(2)
@@ -625,19 +919,43 @@ if selected:
 started = False
 signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
 try:
-    event('S'); started = True
+    event('S', size); started = True
     signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
     time.sleep(0.7)
-    if os.environ['FIXTURE_SCENARIO'] == 'partial-failure' and name in ('A02', 'B02'):
+    if scenario == 'partial-failure' and name in ('A02', 'B02'):
         sys.exit(23)
-    failed = os.environ['FIXTURE_SCENARIO'] == 'allfailed'
-    best = ('B01' if os.environ['FIXTURE_SCENARIO'] in ('other', 'only-other', 'scheduled-other-no-auto', 'other-group-denied', 'other-consent-denied')
-            else 'A12' if os.environ['FIXTURE_SCENARIO'] == 'result-ranked' else 'A01')
+    failed = scenario in ('allfailed', 'funnel-allfailed') or (scenario == 'funnel-run' and size == 1048576 and name == 'A12')
+    speed = 1048576
+    if scenario == 'funnel-run':
+        if size == 1048576:
+            speed = {
+                'A04': 83886080, 'A03': 62914560, 'A05': 41943040,
+                'A01': 8388608, 'A02': 7340032, 'A06': 6291456, 'A07': 5242880,
+                'A08': 4194304, 'A09': 3145728, 'A10': 2621440,
+                'B02': 1677721, 'A11': 1363148, 'B01': 1048576,
+            }.get(name, 1048576)
+        else:
+            speed = {'A03': 104857600, 'A04': 52428800, 'A05': 31457280}.get(name, 1048576)
+    elif scenario == 'funnel-subset-group':
+        if size == 1048576:
+            speed = {'A01': 83886080, 'A03': 62914560, 'A05': 41943040}.get(name, 1048576)
+        else:
+            speed = {'A01': 104857600, 'A03': 52428800, 'A05': 31457280}.get(name, 1048576)
+    elif scenario == 'funnel-cross-profile':
+        if size == 1048576:
+            speed = {'B01': 83886080, 'B02': 62914560}.get(name, 1048576)
+        else:
+            speed = {'B01': 104857600, 'B02': 52428800}.get(name, 1048576)
+    else:
+        best = ('B01' if scenario in ('other', 'only-other', 'scheduled-other-no-auto', 'other-group-denied', 'other-consent-denied')
+                else 'A12' if scenario == 'result-ranked' else 'A01')
+        if name == best:
+            speed = 104857600
     record = {'version': 1, 'node_name': name, 'node_type': 'http', 'head_attempts': 6,
               'head_successes': 0 if failed else 6, 'latency_ms': 0 if failed else 20,
               'jitter_ms': 0 if failed else 2, 'expected_bytes': size,
               'received_bytes': 0 if failed else size, 'download_complete': not failed,
-              'download_bytes_per_second': 0 if failed else (104857600 if name == best else 1048576)}
+              'download_bytes_per_second': 0 if failed else speed}
     print(json.dumps(record, separators=(',', ':')), flush=True)
 finally:
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -697,7 +1015,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
                     with (case.root / 'profiles/a.yaml').open('a', encoding='ascii') as f:
                         f.write('\n# synthetic pre-put stale\n')
             current = 'A03' if state == 'now-stale' else case.current
-            members = list(SELECT_A + SELECT_B if case.name in SELECTION_CASES else ALL_NODES)
+            members = list(SELECT_A + SELECT_B if case.name in SELECTION_CASES else ['A02', 'A04'] if case.name == 'funnel-subset-group' else ALL_NODES)
             if state == 'group-stale':
                 members.remove('A01')
         group = {'name': GROUP, 'type': 'Direct' if state == 'group-stale' else 'Selector', 'now': current, 'all': members}
@@ -714,6 +1032,20 @@ class ControllerHandler(BaseHTTPRequestHandler):
             self.reply(200, other)
         elif self.path == '/proxies/GLOBAL' and case.name == 'global-only':
             self.reply(200, global_group)
+        elif case.name == 'health-penalty-probe' and self.path.startswith('/proxies/') and '/delay?' in self.path:
+            if state == 'probe-drop':
+                self.close_connection = True
+                try:
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                self.connection.close()
+            elif state == 'probe-502':
+                self.reply(502)
+            elif state == 'probe-ok':
+                self.reply(200, {'delay': 42})
+            else:
+                self.reply(200, {'delay': 35})
         else:
             case.error('unexpected mock GET'); self.reply(404)
 
@@ -727,8 +1059,8 @@ class ControllerHandler(BaseHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError):
             case.error('malformed mock PUT'); self.reply(400); return
         winner = ('e\u0301' if case.name == 'manual-unicode'
-                  else 'B01' if case.name in ('other', 'only-other', 'manual-other')
-                  else 'A03' if case.name in ('manual-same', 'manual-unchecked', 'manual-revoked', 'manual-unknown', 'multiple-groups', 'mixed-groups')
+                  else 'B01' if case.name in ('other', 'only-other', 'manual-other', 'funnel-cross-profile')
+                  else 'A03' if case.name in ('manual-same', 'manual-unchecked', 'manual-revoked', 'manual-unknown', 'multiple-groups', 'mixed-groups', 'funnel-run')
                   else 'A12' if case.name == 'result-ranked' else 'A01')
         with case.lock:
             case.events.append(('PUT', self.path, body))
@@ -836,10 +1168,12 @@ def check_events(case, worker_events, scenario):
     puts = [i for i, event in enumerate(case.events) if event[0] == 'PUT']
     put_cases = ('same', 'other', 'only-other', 'uncertain', 'delayed', 'partial-failure',
                  'manual-same', 'manual-unchecked', 'manual-other', 'manual-unknown',
-                 'result-ranked', 'multiple-groups', 'mixed-groups', 'manual-unicode')
+                 'result-ranked', 'multiple-groups', 'mixed-groups', 'manual-unicode',
+                 'funnel-run', 'funnel-cross-profile')
     require(len(puts) == (1 if scenario in put_cases else 0), 'unexpected mock PUT count in ' + scenario)
     confirmed = ('same', 'other', 'only-other', 'partial-failure', 'manual-same',
-                 'manual-unchecked', 'manual-other', 'result-ranked', 'multiple-groups', 'mixed-groups', 'manual-unicode')
+                 'manual-unchecked', 'manual-other', 'result-ranked', 'multiple-groups', 'mixed-groups', 'manual-unicode',
+                 'funnel-run', 'funnel-cross-profile')
     if scenario in confirmed:
         i = puts[0]
         require(any(e[:2] == ('GET', '/proxies/' + GROUP) for e in case.events[:i]) and
@@ -850,27 +1184,32 @@ def check_events(case, worker_events, scenario):
     if scenario in ('group-stale', 'now-stale', 'manual-group-stale', 'manual-now-stale'):
         require(sum(e[:2] == ('GET', '/proxies') for e in case.events) >= 2,
                 'mock did not reach displayed-group revalidation')
-    active, peak, starts, jobs = set(), 0, 0, []
+    active, peak, peak_20m, starts, jobs, sizes = {}, 0, 0, 0, [], []
     for line in worker_events.splitlines():
         if line.startswith('J '):
             require(scenario == 'select-exact' and re.fullmatch(r'J [0-9a-f]{64} [0-9a-f]+', line), 'invalid synthetic job log')
             jobs.append(tuple(line.split()[1:]))
             continue
-        match = re.fullmatch(r'([SEX]) ([0-9]+)', line)
+        match = re.fullmatch(r'([SEX]) ([0-9]+)(?: ([0-9]+))?', line)
         require(match is not None, 'invalid synthetic worker log')
-        kind, pid = match.groups()
+        kind, pid, size_str = match.groups()
         require(kind != 'X', 'synthetic worker rejected inputs')
         if kind == 'S':
-            require(pid not in active, 'duplicate synthetic worker start')
-            active.add(pid); starts += 1; peak = max(peak, len(active))
+            require(size_str is not None and pid not in active, 'duplicate or unsized synthetic worker start')
+            size_val = int(size_str)
+            active[pid] = size_val; sizes.append(size_val); starts += 1
+            peak = max(peak, len(active))
+            if size_val == 20971520:
+                peak_20m = max(peak_20m, sum(1 for v in active.values() if v == 20971520))
         else:
             require(pid in active, 'unexpected synthetic worker exit')
-            active.remove(pid)
+            del active[pid]
     if scenario == 'select-exact':
         ha, hb = (hashlib.sha256(fixture_yaml(n)).hexdigest() for n in (SELECT_A, SELECT_B))
         wanted_jobs = [(ha, 'Shared'.encode().hex()), (ha, 'é'.encode().hex()), (hb, 'e\u0301'.encode().hex())]
         require(sorted(jobs) == sorted(wanted_jobs), 'byte-exact selected job identities differ')
     require(peak <= (2 if scenario == 'load-run' else 10), 'worker concurrency exceeded limit')
+    require(peak_20m <= 2, '20MiB worker concurrency exceeded limit')
     require(not active, 'synthetic worker did not exit in ' + scenario)
     no_workers = ('startup', 'no-group-start', 'scheduled-stale', 'group-stale', 'now-stale', 'select-preview',
                   'select-stale', 'select-invalid', 'zero-selection', 'manual-same', 'manual-unchecked',
@@ -878,8 +1217,23 @@ def check_events(case, worker_events, scenario):
                   'multiple-groups', 'mixed-groups', 'global-only', 'manual-unicode', *NO_WORKER_REGRESSIONS)
     if scenario in no_workers:
         require(starts == 0, 'unexpected worker before valid preflight')
-    elif scenario in ('stop', 'close-busy', 'during-stale'):
+    elif scenario in ('stop', 'close-busy', 'during-stale', 'funnel-abort-resets-stage'):
         require(1 <= starts <= 14, 'cancelled worker launch mismatch in ' + scenario)
+        if scenario == 'funnel-abort-resets-stage':
+            require(all(s == 1048576 for s in sizes), 'aborted funnel launched stage 2')
+    elif scenario in ('funnel-run', 'funnel-subset-group', 'funnel-cross-profile'):
+        require(starts == 24 and sizes == [1048576] * 14 + [20971520] * 10 and peak >= 2, 'funnel 2-stage counts mismatch in ' + scenario)
+    elif scenario == 'funnel-allfailed':
+        require(starts == 14 and sizes == [1048576] * 14 and peak >= 2, 'funnel allfailed ran unexpected stage 2')
+    elif scenario == 'history-archive-and-leaderboard':
+        require(starts == 42 and sizes == [3145728] * 28 + [20971520] * 14 and peak >= 2,
+                'history archive worker count/size mismatch')
+    elif scenario == 'patrol-rotation-and-quota':
+        require(starts == 24 and sizes == [1048576] * 24 and peak >= 2 and peak <= 4,
+                'patrol worker count/size/peak mismatch')
+    elif scenario == 'health-penalty-probe':
+        require(starts == 8 and sizes == [3145728] * 8 and peak == 2,
+                'health penalty probe worker count mismatch')
     else:
         expected_starts = 2 if scenario == 'only-other' else 3 if scenario == 'select-exact' else 16 if scenario == 'old-scores' else 14
         require(starts == expected_starts and peak >= 2, 'worker launch or peak mismatch in ' + scenario)
@@ -955,7 +1309,10 @@ def main():
                 (config / 'profiles.yaml').write_text(registry('a', scenario in SELECTION_CASES), encoding='ascii')
                 (config / 'registry-b.json').write_text(registry('b', scenario in SELECTION_CASES), encoding='ascii')
                 (config / 'clash-verge.yaml').write_text('external-controller-unix: ' + json.dumps(str(socket_path)) + '\n', encoding='ascii')
-                for path in (marker, events, root / 'controller-events', config / 'mock-state'):
+                db_dir = home / 'Library' / 'Application Support' / 'local.clashverge.multispeedhelper'
+                for path in (marker, events, root / 'controller-events', config / 'mock-state',
+                             db_dir / 'telemetry-v1.sqlite', db_dir / 'telemetry-v1.sqlite-wal',
+                             db_dir / 'telemetry-v1.sqlite-shm', db_dir / 'telemetry-v1.sqlite-journal'):
                     if path.exists(): path.unlink()
                 case = MockCase(scenario, config, marker); server.case = case
                 env['FIXTURE_SCENARIO'] = scenario

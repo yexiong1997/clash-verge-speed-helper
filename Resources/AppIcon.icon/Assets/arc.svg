@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="gArc" x1="15%" y1="85%" x2="88%" y2="20%">
+      <stop offset="0%" stop-color="#6EA2FA"/>
+      <stop offset="56%" stop-color="#A9C7FF"/>
+      <stop offset="100%" stop-color="#84D2B1"/>
+    </linearGradient>
+  </defs>
+  <path d="M 254.87 719.52 A 346.00 346.00 0 1 1 832.81 358.39 A 36.00 36.00 0 0 1 766.05 385.36 A 274.00 274.00 0 1 0 308.38 671.34 A 36.00 36.00 0 0 1 254.87 719.52 Z" fill="url(#gArc)"/>
+</svg>

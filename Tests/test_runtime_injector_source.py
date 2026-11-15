@@ -23,6 +23,9 @@ def main():
         '/private/tmp/clash-verge-runtime-state.json',
         'kAXPressAction',
         'CGEvent',
+        'Privacy_Accessibility',
+        'NSWorkspace.shared.open',
+        'hasAccessibilityPermission',
     ]
     for needle in required:
         require(needle in SOURCE, f"runtime injector lost required contract: {needle}")
@@ -37,11 +40,16 @@ def main():
         text = script.read_text(encoding="utf-8")
         require("ClashRuntimeInjector.swift" in text, f"build script does not compile runtime injector: {script}")
     single = (PROJECT / "Sources/main.swift").read_text(encoding="utf-8")
-    require("ClashRuntimeInjector.shared.start" in single, "single-subscription app does not start runtime injection")
+    require("ClashRuntimeInjector.shared.reconnectSilently" in single, "single-subscription launch must only probe an existing bridge")
+    require("ClashRuntimeInjector.shared.start" not in single, "single-subscription launch must not bootstrap the Inspector")
     require("ClashRuntimeInjector.shared.stop" in single, "single-subscription app does not stop runtime injection")
     multi = (PROJECT / "Sources/MultiMain.swift").read_text(encoding="utf-8")
-    require("runtimeInjector.start" in multi, "multi-subscription app does not start runtime injection")
+    require("runtimeInjector.reconnectSilently" in multi, "multi-subscription launch must only probe an existing bridge")
+    require("runtimeInjector.start" not in multi, "launch/focus must not bootstrap the Inspector")
     require("runtimeInjector.stop" in multi, "multi-subscription app does not stop runtime injection")
+    require("reconnectRuntimeBridgeSilently" in multi, "multi-subscription app must reconnect without Accessibility UI")
+    require(SOURCE.index("readSingletonRecord()") < SOURCE.index("guard AXIsProcessTrusted()"),
+            "runtime injector must verify local singleton record before triggering Accessibility UI")
     print("Runtime injector source contract PASS")
 
 

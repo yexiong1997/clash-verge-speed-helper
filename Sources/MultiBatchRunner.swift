@@ -65,6 +65,24 @@ public enum MultiBatchResult: Equatable, Sendable {
     case cancelled
 }
 
+public struct MultiBatchProgress: Equatable, Sendable {
+    public enum Phase: String, Equatable, Sendable {
+        case head
+        case download
+    }
+    public let phase: Phase
+    public let receivedBytes: Int64
+    public let expectedBytes: Int64
+    public let bytesPerSecond: Double
+
+    public init(phase: Phase, receivedBytes: Int64, expectedBytes: Int64, bytesPerSecond: Double) {
+        self.phase = phase
+        self.receivedBytes = receivedBytes
+        self.expectedBytes = expectedBytes
+        self.bytesPerSecond = bytesPerSecond
+    }
+}
+
 public struct MultiBatchSummary: Sendable {
     public let cancelled: Bool
     /// Jobs for which a result callback was delivered, including launch errors.
@@ -101,6 +119,7 @@ public struct MultiBatchSummary: Sendable {
 /// without atomic pipe2, unrelated fork/spawn calls must not race pipe creation:
 /// FD_CLOEXEC alone cannot close that process-wide descriptor inheritance race.
 public final class MultiBatchRunner: @unchecked Sendable {
+    public typealias ProgressCallback = (MultiBatchJob, MultiBatchProgress) -> Void
     public typealias ResultCallback = (MultiBatchJob, MultiBatchResult) -> Void
     public typealias FinishCallback = (MultiBatchSummary) -> Void
     public typealias PreLaunch = (MultiBatchJob) -> Bool
@@ -113,6 +132,7 @@ public final class MultiBatchRunner: @unchecked Sendable {
     private let terminationGrace: TimeInterval
     private let preLaunch: PreLaunch
     private let asyncPreLaunch: AsyncPreLaunch?
+    private let onProgress: ProgressCallback?
     private let onResult: ResultCallback
     private let onFinish: FinishCallback
 
@@ -165,6 +185,7 @@ public final class MultiBatchRunner: @unchecked Sendable {
     public init(executable: URL, jobs: [MultiBatchJob], parallel: Int,
                 watchdog: TimeInterval = 180, terminationGrace: TimeInterval = 2,
                 preLaunch: @escaping PreLaunch = { _ in true },
+                onProgress: ProgressCallback? = nil,
                 onResult: @escaping ResultCallback, onFinish: @escaping FinishCallback) {
         self.executable = executable
         self.jobs = jobs
@@ -173,6 +194,7 @@ public final class MultiBatchRunner: @unchecked Sendable {
         self.terminationGrace = Self.duration(terminationGrace, defaultValue: 2)
         self.preLaunch = preLaunch
         self.asyncPreLaunch = nil
+        self.onProgress = onProgress
         self.onResult = onResult
         self.onFinish = onFinish
     }
@@ -184,6 +206,7 @@ public final class MultiBatchRunner: @unchecked Sendable {
     public init(executable: URL, jobs: [MultiBatchJob], parallel: Int,
                 watchdog: TimeInterval = 180, terminationGrace: TimeInterval = 2,
                 asyncPreLaunch: @escaping AsyncPreLaunch,
+                onProgress: ProgressCallback? = nil,
                 onResult: @escaping ResultCallback, onFinish: @escaping FinishCallback) {
         self.executable = executable
         self.jobs = jobs
@@ -192,6 +215,7 @@ public final class MultiBatchRunner: @unchecked Sendable {
         self.terminationGrace = Self.duration(terminationGrace, defaultValue: 2)
         self.preLaunch = { _ in true }
         self.asyncPreLaunch = asyncPreLaunch
+        self.onProgress = onProgress
         self.onResult = onResult
         self.onFinish = onFinish
     }
@@ -358,12 +382,20 @@ public final class MultiBatchRunner: @unchecked Sendable {
                     "-concurrent", String(options.streams), "-timeout", options.downloadTimeout,
                     "-max-latency", options.latencyTimeout, "-rename=false", "-server-url", target, "-json-v1"]
         let id = UUID()
+        let progressHandler: (@Sendable (MultiBatchProgress) -> Void)?
+        if onProgress != nil {
+            progressHandler = { [weak self] progress in
+                DispatchQueue.main.async { [weak self] in self?.workerProgress(id: id, job: job, progress: progress) }
+            }
+        } else {
+            progressHandler = nil
+        }
         let worker = DirectWorker(executable: executable, arguments: args, job: job,
                                   watchdog: watchdog, grace: terminationGrace,
                                   shouldCancel: { [weak self] in self?.isCancellationRequested ?? true },
                                   onSpawn: { [weak self] in
             DispatchQueue.main.async { [weak self] in self?.workerSpawned(id) }
-        }, onComplete: { [weak self] outcome in
+        }, onProgress: progressHandler, onComplete: { [weak self] outcome in
             DispatchQueue.main.async { [weak self] in self?.workerFinished(id: id, job: job, outcome: outcome) }
         })
         cancellationLock.lock()
@@ -383,6 +415,15 @@ public final class MultiBatchRunner: @unchecked Sendable {
         active[id] = item
         launched += 1
         peakWorkers = max(peakWorkers, active.values.filter { $0.spawned }.count)
+    }
+
+    private func workerProgress(id: UUID, job: MultiBatchJob, progress: MultiBatchProgress) {
+        precondition(Thread.isMainThread)
+        guard !finished, !isCancellationRequested, active[id] != nil, let onProgress else { return }
+        callbackDepth += 1
+        onProgress(job, progress)
+        callbackDepth -= 1
+        finishIfDone()
     }
 
     private func workerFinished(id: UUID, job: MultiBatchJob, outcome: DirectWorker.Completion) {
@@ -437,6 +478,32 @@ public final class MultiBatchRunner: @unchecked Sendable {
         return expression + "\\z"
     }
 
+    private struct RawProgress: Decodable {
+        let progress: Int
+        let phase: String
+        let received_bytes: Int64
+        let expected_bytes: Int64
+        let bps: Double
+    }
+
+    fileprivate static func parseProgress(_ data: Data) -> MultiBatchProgress? {
+        guard !data.isEmpty, data.count <= 512,
+              data.first == 0x7b, data.last == 0x7d,
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              obj.count == 5,
+              let decoded = try? JSONDecoder().decode(RawProgress.self, from: data),
+              decoded.progress == 1,
+              let phase = MultiBatchProgress.Phase(rawValue: decoded.phase),
+              decoded.received_bytes >= 0, decoded.expected_bytes > 0,
+              decoded.bps.isFinite, decoded.bps >= 0 else { return nil }
+        return MultiBatchProgress(
+            phase: phase,
+            receivedBytes: min(decoded.received_bytes, decoded.expected_bytes),
+            expectedBytes: decoded.expected_bytes,
+            bytesPerSecond: decoded.bps
+        )
+    }
+
     fileprivate static func parseOutput(_ data: Data, job: MultiBatchJob) -> [String]? {
         guard VerifiedMeasurement.decode(data, expectedName: job.nodeName,
                                          requestedBytes: job.options.downloadBytes,
@@ -474,6 +541,7 @@ private final class DirectWorker: @unchecked Sendable {
     private let grace: TimeInterval
     private let shouldCancel: @Sendable () -> Bool
     private let onSpawn: @Sendable () -> Void
+    private let onProgress: (@Sendable (MultiBatchProgress) -> Void)?
     private let onComplete: @Sendable (Completion) -> Void
     private let lock = NSLock()
     private var stop: StopReason?
@@ -483,6 +551,7 @@ private final class DirectWorker: @unchecked Sendable {
          watchdog: TimeInterval, grace: TimeInterval,
          shouldCancel: @escaping @Sendable () -> Bool,
          onSpawn: @escaping @Sendable () -> Void,
+         onProgress: (@Sendable (MultiBatchProgress) -> Void)? = nil,
          onComplete: @escaping @Sendable (Completion) -> Void) {
         self.executable = executable
         self.arguments = arguments
@@ -491,6 +560,7 @@ private final class DirectWorker: @unchecked Sendable {
         self.grace = grace
         self.shouldCancel = shouldCancel
         self.onSpawn = onSpawn
+        self.onProgress = onProgress
         self.onComplete = onComplete
     }
 
@@ -630,7 +700,14 @@ private final class DirectWorker: @unchecked Sendable {
         guard let outPipe = Self.makePipe() else { complete(.failure(.launchFailed)); return }
         var outputRead = outPipe[0], outputWrite = outPipe[1]
         defer { Self.closeFD(&outputRead); Self.closeFD(&outputWrite) }
-        guard Self.suppressSIGPIPE(inputWrite), Self.nonblocking(inputWrite), Self.nonblocking(outputRead) else {
+        var errRead: Int32 = -1, errWrite: Int32 = -1
+        if onProgress != nil {
+            guard let errPipe = Self.makePipe() else { complete(.failure(.launchFailed)); return }
+            errRead = errPipe[0]; errWrite = errPipe[1]
+        }
+        defer { Self.closeFD(&errRead); Self.closeFD(&errWrite) }
+        guard Self.suppressSIGPIPE(inputWrite), Self.nonblocking(inputWrite), Self.nonblocking(outputRead),
+              (errRead < 0 || Self.nonblocking(errRead)) else {
             complete(.failure(.launchFailed)); return
         }
 #if canImport(Darwin)
@@ -642,8 +719,11 @@ private final class DirectWorker: @unchecked Sendable {
         defer { posix_spawn_file_actions_destroy(&actions) }
         var rc = posix_spawn_file_actions_adddup2(&actions, inputRead, STDIN_FILENO)
         if rc == 0 { rc = posix_spawn_file_actions_adddup2(&actions, outputWrite, STDOUT_FILENO) }
-        if rc == 0 { rc = posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0) }
-        for fd in [inputRead, inputWrite, outputRead, outputWrite] where rc == 0 {
+        if rc == 0 {
+            if errWrite >= 0 { rc = posix_spawn_file_actions_adddup2(&actions, errWrite, STDERR_FILENO) }
+            else { rc = posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0) }
+        }
+        for fd in [inputRead, inputWrite, outputRead, outputWrite, errRead, errWrite] where rc == 0 && fd >= 0 {
             rc = posix_spawn_file_actions_addclose(&actions, fd)
         }
         if rc == 0 {
@@ -677,16 +757,43 @@ private final class DirectWorker: @unchecked Sendable {
         defer { for entry in argv { free(entry) } }
         guard argv.allSatisfy({ $0 != nil }) else { complete(.failure(.launchFailed)); return }
         argv.append(nil)
+        var childEnv: [UnsafeMutablePointer<CChar>?] = []
+        if onProgress != nil {
+            var envStrings: [String] = []
+            if var ptr = Optional(environ) {
+                while let entry = ptr.pointee {
+                    let s = String(cString: entry)
+                    if !s.hasPrefix("CLASH_VERIFIED_PROGRESS=") {
+                        envStrings.append(s)
+                    }
+                    ptr = ptr.advanced(by: 1)
+                }
+            }
+            envStrings.append("CLASH_VERIFIED_PROGRESS=1")
+            childEnv = envStrings.map { strdup($0) }
+            guard childEnv.allSatisfy({ $0 != nil }) else {
+                for entry in childEnv { free(entry) }
+                complete(.failure(.launchFailed)); return
+            }
+            childEnv.append(nil)
+        }
+        defer { for entry in childEnv { free(entry) } }
         if stopReason() != nil { complete(.cancelled); return }
         var pid: pid_t = 0
         let spawnResult = executable.path.withCString { path in
             argv.withUnsafeMutableBufferPointer { buffer in
-                posix_spawn(&pid, path, &actions, &attributes, buffer.baseAddress!, environ)
+                if !childEnv.isEmpty {
+                    return childEnv.withUnsafeMutableBufferPointer { envBuf in
+                        posix_spawn(&pid, path, &actions, &attributes, buffer.baseAddress!, envBuf.baseAddress!)
+                    }
+                }
+                return posix_spawn(&pid, path, &actions, &attributes, buffer.baseAddress!, environ)
             }
         }
         if spawnResult != 0 { complete(.failure(.launchFailed)); return }
         Self.closeFD(&inputRead)
         Self.closeFD(&outputWrite)
+        Self.closeFD(&errWrite)
         spawnLockHeld = false
         Self.spawnLock.unlock()
         onSpawn()
@@ -695,6 +802,8 @@ private final class DirectWorker: @unchecked Sendable {
         var inputOK = false
         var outputOK = true
         var output = Data()
+        var progressBuffer = Data()
+        var dropUntilNewline = false
         var buffer = [UInt8](repeating: 0, count: 16_384)
         var status: Int32 = 0
         var reaped = false
@@ -721,6 +830,7 @@ private final class DirectWorker: @unchecked Sendable {
                 }
                 Self.closeFD(&inputWrite)
                 Self.closeFD(&outputRead)
+                Self.closeFD(&errRead)
                 if reaped { complete(.cancelled); return }
             } else {
                 if inputWrite >= 0 {
@@ -744,7 +854,36 @@ private final class DirectWorker: @unchecked Sendable {
                         outputOK = false; Self.closeFD(&outputRead)
                     }
                 }
+                if errRead >= 0 {
+                    let n = buffer.withUnsafeMutableBytes { read(errRead, $0.baseAddress, $0.count) }
+                    if n > 0 {
+                        for byte in buffer[0..<n] {
+                            if byte == 0x0a {
+                                if !dropUntilNewline {
+                                    if progressBuffer.last == 0x0d { progressBuffer.removeLast() }
+                                    if let parsed = MultiBatchRunner.parseProgress(progressBuffer) {
+                                        onProgress?(parsed)
+                                    }
+                                }
+                                progressBuffer.removeAll(keepingCapacity: true)
+                                dropUntilNewline = false
+                            } else if !dropUntilNewline {
+                                if progressBuffer.count < 512 {
+                                    progressBuffer.append(byte)
+                                } else {
+                                    progressBuffer.removeAll(keepingCapacity: true)
+                                    dropUntilNewline = true
+                                }
+                            }
+                        }
+                    } else if n == 0 {
+                        Self.closeFD(&errRead)
+                    } else if errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR {
+                        Self.closeFD(&errRead)
+                    }
+                }
                 if reaped && inputWrite < 0 && outputRead < 0 {
+                    Self.closeFD(&errRead)
                     let result: MultiBatchResult
                     if !inputOK { result = .failure(.inputFailed) }
                     else if waitFailed || (status & 0x7f) != 0 || ((status >> 8) & 0xff) != 0 {
@@ -759,6 +898,7 @@ private final class DirectWorker: @unchecked Sendable {
             var pollFDs: [pollfd] = []
             if inputWrite >= 0 { pollFDs.append(pollfd(fd: inputWrite, events: Int16(POLLOUT), revents: 0)) }
             if outputRead >= 0 { pollFDs.append(pollfd(fd: outputRead, events: Int16(POLLIN), revents: 0)) }
+            if errRead >= 0 { pollFDs.append(pollfd(fd: errRead, events: Int16(POLLIN), revents: 0)) }
             _ = poll(&pollFDs, nfds_t(pollFDs.count), 20)
         }
     }

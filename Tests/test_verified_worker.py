@@ -221,6 +221,9 @@ class FixtureHandler(BaseHTTPRequestHandler):
         number = case.event("GET", self.path, self.headers.get("Range"))
         if self.path == "/redirect-target":
             return self.respond_empty(200)
+        if case.mode == "header-timeout":
+            time.sleep(2.0)
+            return self.respond_empty(200)
         if case.mode == "get-error" or (case.mode == "one-get-error" and number == 1):
             return self.respond_empty(503)
         if case.mode == "get-redirect":
@@ -242,22 +245,40 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 pass
             self.close_connection = True
             return
+        req_chunk = 65536 if case.mode == "slowloris-overall" else CHUNK
         self.send_response(206)
         start = 1 if case.mode == "bad-range" else 0
-        self.send_header("Content-Range", f"bytes {start}-{start + CHUNK - 1}/{CHUNK + 100}")
-        self.send_header("Content-Length", str(CHUNK))
+        self.send_header("Content-Range", f"bytes {start}-{start + req_chunk - 1}/{req_chunk + 100}")
+        self.send_header("Content-Length", str(req_chunk))
         self.send_header("Connection", "close")
         self.end_headers()
-        length = CHUNK
+        length = req_chunk
         if case.mode == "truncated" or (case.mode == "one-truncated" and number == 1):
-            length = CHUNK // 2
+            length = req_chunk // 2
         elif case.mode == "timeout":
-            length = CHUNK // 4
+            length = req_chunk // 4
         try:
-            self.wfile.write(b"x" * length)
-            self.wfile.flush()
-            if case.mode == "timeout":
-                time.sleep(3)
+            if case.mode == "slow-stream-completes":
+                part = length // 4
+                rem = length - part * 3
+                for idx, chunk_len in enumerate((part, part, part, rem)):
+                    self.wfile.write(b"x" * chunk_len)
+                    self.wfile.flush()
+                    if idx < 3:
+                        time.sleep(0.4)
+            elif case.mode == "slowloris-overall":
+                sent = 0
+                while sent < length:
+                    step = min(64, length - sent)
+                    self.wfile.write(b"x" * step)
+                    self.wfile.flush()
+                    sent += step
+                    time.sleep(0.08)
+            else:
+                self.wfile.write(b"x" * length)
+                self.wfile.flush()
+                if case.mode == "timeout":
+                    time.sleep(3)
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
             pass
         self.close_connection = True
@@ -348,9 +369,13 @@ def run_case(mode, profile, binary, target, primary, secondary, allowed, env):
         url += "/fixture"
     config = make_yaml(primary_port, other_port)
     secrets = (USER, PASSWORD, AUTH, "127.0.0.1", url, str(allowed), str(PROJECT))
+    expected_streams = 1 if mode == "slowloris-overall" else STREAMS
+    expected_chunk = 65536 if mode == "slowloris-overall" else CHUNK
+    expected_total = expected_streams * expected_chunk
+    dl_timeout = "200ms" if mode == "slowloris-overall" else "1s"
     command = [str(binary), "-c", "/dev/stdin", "-f", "^" + NAME + "$",
-               "-server-url", url, "-download-size", str(TOTAL),
-               "-concurrent", str(STREAMS), "-timeout", "1s",
+               "-server-url", url, "-download-size", str(expected_total),
+               "-concurrent", str(expected_streams), "-timeout", dl_timeout,
                "-max-latency", "1s", "-rename=false", "-json-v1"]
     with secondary.lock:
         old_other = secondary.connections
@@ -389,12 +414,12 @@ def run_case(mode, profile, binary, target, primary, secondary, allowed, env):
     # HEAD health and GET completeness are distinct observations. A worker may
     # still perform a GET after every HEAD failed; it must not count a 3xx/5xx
     # HEAD as success or follow redirects in either method.
-    require(gets == STREAMS and ranges == [f"bytes=0-{CHUNK - 1}"] * STREAMS,
+    require(gets == expected_streams and ranges == [f"bytes=0-{expected_chunk - 1}"] * expected_streams,
             mode + ": wrong stream count or per-stream size")
-    require(value["expected_bytes"] == TOTAL, mode + ": wrong expected bytes")
-    require(value["received_bytes"] <= TOTAL + STREAMS, mode + ": exceeded per-stream size+1")
-    if mode in ("complete", "server-mode", "one-head", "head-error", "head-redirect"):
-        require(value["download_complete"] and value["received_bytes"] == TOTAL,
+    require(value["expected_bytes"] == expected_total, mode + ": wrong expected bytes")
+    require(value["received_bytes"] <= expected_total + expected_streams, mode + ": exceeded per-stream size+1")
+    if mode in ("complete", "server-mode", "one-head", "head-error", "head-redirect", "slow-stream-completes"):
+        require(value["download_complete"] and value["received_bytes"] == expected_total,
                 mode + ": complete download rejected or wrong byte count")
         require(value["download_bytes_per_second"] > 0, mode + ": missing valid speed")
     else:
@@ -612,6 +637,45 @@ with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
           "accepted; SSH, WireGuard, and custom HTTP headers disabled")
 
 
+def verify_progress_streaming(profile, binary, target, primary, allowed, env):
+    case = Case("slow-stream-completes")
+    target.case = case
+    url = f"http://127.0.0.1:{target.server_address[1]}/fixture"
+    config = make_yaml(primary.server_address[1], primary.server_address[1])
+    secrets = (USER, PASSWORD, AUTH, "127.0.0.1", url, str(allowed), str(PROJECT))
+    command = [str(binary), "-c", "/dev/stdin", "-f", "^" + NAME + "$",
+               "-server-url", url, "-download-size", str(TOTAL),
+               "-concurrent", str(STREAMS), "-timeout", "1s",
+               "-max-latency", "1s", "-rename=false", "-json-v1"]
+    progress_env = dict(env, CLASH_VERIFIED_PROGRESS="1")
+    run = execute(profile, command, allowed, progress_env, input=config, text=True)
+    no_leaks(run.stdout + run.stderr, secrets)
+    require(run.returncode == 0, "progress-stream: worker failed")
+    out_lines = run.stdout.splitlines()
+    require(len(out_lines) == 1, "progress-stream: expected single JSON stdout line")
+    res = json.loads(out_lines[0])
+    require(res.get("download_complete") is True and res.get("download_bytes_per_second", 0) > 0,
+            "progress-stream: invalid final result")
+    err_lines = [ln for ln in run.stderr.splitlines() if ln.strip()]
+    require(len(err_lines) >= 2, f"progress-stream: expected >=2 progress lines, got {err_lines!r}")
+    phases = []
+    prev_received = -1
+    for ln in err_lines:
+        obj = json.loads(ln, parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
+        require(set(obj) == {"progress", "phase", "received_bytes", "expected_bytes", "bps"},
+                f"progress-stream: unexpected keys {obj!r}")
+        require(obj["progress"] == 1 and obj["phase"] in ("head", "download"), f"bad progress {obj!r}")
+        require(type(obj["received_bytes"]) is int and 0 <= obj["received_bytes"] <= obj["expected_bytes"],
+                f"bad received_bytes {obj!r}")
+        require(obj["received_bytes"] >= prev_received, f"non-monotonic received_bytes {obj!r}")
+        prev_received = obj["received_bytes"]
+        require(type(obj["bps"]) in (int, float) and math.isfinite(obj["bps"]) and obj["bps"] >= 0,
+                f"bad bps {obj!r}")
+        phases.append(obj["phase"])
+    require(phases[0] == "head" and "download" in phases, f"missing expected phases {phases!r}")
+    print("PASS progress-stream")
+
+
 def main():
     if sys.platform != "darwin" or not SANDBOX_EXEC.is_file():
         raise RuntimeError("macOS sandbox-exec is required; refusing to run unsandboxed")
@@ -654,10 +718,12 @@ def main():
                 print("PASS sandbox: only fixture proxy and Unix socket allowed; TCP/Unix/read/write canaries denied")
                 verify_rejected_inputs(profile, binary, target, primary, secondary, allowed, env)
                 verify_endpoint_validation(profile, binary, target, primary, allowed, env)
-                for mode in ("complete", "server-mode", "truncated", "one-truncated", "timeout", "get-error",
+                for mode in ("complete", "server-mode", "slow-stream-completes", "header-timeout", "slowloris-overall",
+                             "truncated", "one-truncated", "timeout", "get-error",
                              "one-get-error", "oversize", "one-oversize", "head-error",
                              "head-redirect", "get-redirect", "bad-range", "one-head"):
                     run_case(mode, profile, binary, target, primary, secondary, allowed, env)
+                verify_progress_streaming(profile, binary, target, primary, allowed, env)
                 with primary.lock:
                     require(not primary.errors, "proxy received an unexpected destination")
                 with secondary.lock:

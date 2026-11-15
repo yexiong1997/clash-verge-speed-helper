@@ -285,14 +285,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildWindow()
-        ClashRuntimeInjector.shared.start { [weak self] result in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                if case .failure(let error) = result {
-                    self.statusLabel.stringValue = "Clash Verge 运行时补丁未连接：\(error.localizedDescription)"
-                }
-            }
-        }
+        ClashRuntimeInjector.shared.reconnectSilently()
         useCurrentProfile(nil); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }

@@ -115,6 +115,8 @@ cat > "$app_path/Contents/Info.plist" <<PLIST
   <key>CFBundleDevelopmentRegion</key><string>zh_CN</string>
   <key>CFBundleDisplayName</key><string>$display_name</string>
   <key>CFBundleExecutable</key><string>ClashSpeedHelper</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>CFBundleIconName</key><string>AppIcon</string>
   <key>CFBundleIdentifier</key><string>$bundle_id</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>$display_name</string>
@@ -126,6 +128,11 @@ cat > "$app_path/Contents/Info.plist" <<PLIST
   <key>NSPrincipalClass</key><string>NSApplication</string>
 </dict></plist>
 PLIST
+for asset in AppIcon.icns Assets.car; do
+    asset_src="$PROJECT_DIR/Resources/$asset"
+    [[ -f "$asset_src" && ! -L "$asset_src" && -r "$asset_src" && -s "$asset_src" ]] || die "icon asset missing or unsafe: $asset_src"
+    cp "$asset_src" "$app_path/Contents/Resources/$asset"
+done
 cp "$worker" "$app_path/Contents/Resources/clash-speedtest"
 # Detect a changed input during copying; signing deliberately changes this copy.
 copy_sha="$(shasum -a 256 < "$app_path/Contents/Resources/clash-speedtest" | awk '{print $1}')"
@@ -167,7 +174,7 @@ swiftc -swift-version 5 -O -target arm64-apple-macos12.0 \
 # App files need normal distribution permissions even though build/ is private.
 chmod 755 "$app_path" "$app_path/Contents" "$app_path/Contents/MacOS" \
     "$app_path/Contents/Resources" "$app_path/Contents/MacOS/ClashSpeedHelper"
-chmod 644 "$app_path/Contents/Info.plist"
+chmod 644 "$app_path/Contents/Info.plist" "$app_path/Contents/Resources/AppIcon.icns" "$app_path/Contents/Resources/Assets.car"
 if [[ $allow_unverified -eq 1 ]]; then
     chmod 644 "$app_path/Contents/Resources/LOCAL-DEVELOPMENT-ONLY.txt"
 else

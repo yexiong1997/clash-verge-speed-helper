@@ -128,14 +128,25 @@ PY
 # or copy the legacy worker. Do not run until the owners have finished editing.
 readonly SOURCES_DIR="$PROJECT_DIR/Sources"
 readonly WORKER_DIR="$PROJECT_DIR/Worker"
+readonly APP_RESOURCES_DIR="$PROJECT_DIR/Resources"
+readonly ICON_SOURCE="$APP_RESOURCES_DIR/AppIcon.icon"
 readonly WORKER_BUILDER="$PROJECT_DIR/Scripts/build-verified-worker.sh"
 [[ -d "$SOURCES_DIR" && ! -L "$SOURCES_DIR" && -d "$WORKER_DIR" && ! -L "$WORKER_DIR" ]] || die 'source or worker directory is missing or a symlink'
-swift_sources=(MultiMain.swift ProfileRegistry.swift MultiBatchRunner.swift VerifiedMeasurement.swift CompositeScore.swift TestSchedule.swift SwitchController.swift AssistedSwitch.swift ClashRuntimeInjector.swift)
-for name in "${swift_sources[@]}"; do
+[[ -d "$APP_RESOURCES_DIR" && ! -L "$APP_RESOURCES_DIR" && -d "$ICON_SOURCE" && ! -L "$ICON_SOURCE" && -d "$ICON_SOURCE/Assets" && ! -L "$ICON_SOURCE/Assets" ]] || die 'icon resource directory is missing or a symlink'
+swift_sources=(MultiMain.swift ProfileRegistry.swift MultiBatchRunner.swift VerifiedMeasurement.swift CompositeScore.swift TestSchedule.swift SwitchController.swift AssistedSwitch.swift ClashRuntimeInjector.swift TelemetryHistory.swift)
+source_snapshots=("${swift_sources[@]}" RuntimeBrokerMain.swift)
+for name in "${source_snapshots[@]}"; do
     [[ -f "$SOURCES_DIR/$name" && ! -L "$SOURCES_DIR/$name" && -r "$SOURCES_DIR/$name" ]] || die "required Swift source missing or unsafe: $name"
 done
 for input in "$WORKER_BUILDER" "$WORKER_DIR/verified-worker.patch" "$WORKER_DIR/UPSTREAM-GPL-3.0.txt" "$WORKER_DIR/NOTICE.md" "$WORKER_DIR/CONTRACT.md"; do
     [[ -f "$input" && ! -L "$input" && -r "$input" ]] || die "required worker input missing or unsafe: $input"
+done
+icon_sources=(icon.json Assets/base.svg Assets/arc.svg Assets/wave.svg)
+for rel in "${icon_sources[@]}"; do
+    [[ -f "$ICON_SOURCE/$rel" && ! -L "$ICON_SOURCE/$rel" && -r "$ICON_SOURCE/$rel" ]] || die "required icon source missing or unsafe: $rel"
+done
+for asset in AppIcon.icns Assets.car; do
+    [[ -f "$APP_RESOURCES_DIR/$asset" && ! -L "$APP_RESOURCES_DIR/$asset" && -r "$APP_RESOURCES_DIR/$asset" && -s "$APP_RESOURCES_DIR/$asset" ]] || die "required prebuilt icon asset missing or unsafe: $asset"
 done
 
 # A failed build is never auto-deleted. Disable any output executables only if
@@ -196,7 +207,7 @@ cleanup_on_exit() {
     fi
     if [[ $status -ne 0 && $app_created -eq 1 ]]; then
         if app_is_ours && [[ -d "$app_path/Contents" && ! -L "$app_path/Contents" && -d "$app_path/Contents/MacOS" && ! -L "$app_path/Contents/MacOS" ]]; then
-            for target in "$app_path/Contents/MacOS/$BUNDLE_EXECUTABLE" "$app_path/Contents/MacOS/clash-speedtest"; do
+            for target in "$app_path/Contents/MacOS/$BUNDLE_EXECUTABLE" "$app_path/Contents/MacOS/clash-speedtest" "$app_path/Contents/MacOS/ClashRuntimeBroker"; do
                 if [[ -f "$target" && ! -L "$target" && -O "$target" ]]; then
                     /bin/chmod 644 "$target" || :
                 fi
@@ -238,7 +249,7 @@ sdk_path="$(/usr/bin/env -i PATH="$PATH" HOME="$WORK/home" TMPDIR="$swift_tmp/" 
 # Snapshot all build inputs first. The worker builder resolves its own root, so
 # this isolated copy has the same build/verified-worker/clash-speedtest output
 # layout without touching existing repository caches or worker binaries.
-for name in "${swift_sources[@]}"; do /bin/cp -X "$SOURCES_DIR/$name" "$WORK/Sources/$name"; done
+for name in "${source_snapshots[@]}"; do /bin/cp -X "$SOURCES_DIR/$name" "$WORK/Sources/$name"; done
 /bin/cp -X "$WORKER_BUILDER" "$WORK/worker-project/Scripts/build-verified-worker.sh"
 /bin/cp -X "$WORKER_DIR/verified-worker.patch" "$WORK/worker-project/Worker/verified-worker.patch"
 /bin/cp -X "$WORKER_DIR/UPSTREAM-GPL-3.0.txt" "$RESOURCES/UPSTREAM-GPL-3.0.txt"
@@ -246,6 +257,24 @@ for name in "${swift_sources[@]}"; do /bin/cp -X "$SOURCES_DIR/$name" "$WORK/Sou
 /bin/cp -X "$WORKER_DIR/CONTRACT.md" "$RESOURCES/CONTRACT.md"
 /bin/cp -X "$WORK/worker-project/Worker/verified-worker.patch" "$RESOURCES/verified-worker.patch"
 /bin/cp -X "$WORK/worker-project/Scripts/build-verified-worker.sh" "$RESOURCES/build-verified-worker.sh"
+/bin/mkdir -p "$swift_tmp/AppIcon.icon/Assets" "$swift_tmp/icon-out" "$WORK/icon-fallback" "$WORK/icon-out"
+for rel in "${icon_sources[@]}"; do /bin/cp -X "$ICON_SOURCE/$rel" "$swift_tmp/AppIcon.icon/$rel"; done
+for asset in AppIcon.icns Assets.car; do /bin/cp -X "$APP_RESOURCES_DIR/$asset" "$WORK/icon-fallback/$asset"; done
+actool_bin="$(/usr/bin/env -i PATH="$PATH" HOME="$WORK/home" TMPDIR="$swift_tmp/" /usr/bin/xcrun --find actool 2>/dev/null || true)"
+if [[ -n "$actool_bin" && -x "$actool_bin" ]]; then
+    /usr/bin/env -i PATH="$PATH" HOME="$WORK/home" TMPDIR="$swift_tmp/" \
+        "$actool_bin" --compile "$swift_tmp/icon-out" \
+        --platform macosx --minimum-deployment-target 12.0 \
+        --app-icon AppIcon --standalone-icon-behavior all \
+        --output-partial-info-plist "$swift_tmp/icon-partial.plist" \
+        --errors --warnings "$swift_tmp/AppIcon.icon" > "$WORK/actool.plist" || die 'icon asset compilation failed'
+    for asset in AppIcon.icns Assets.car; do
+        [[ -f "$swift_tmp/icon-out/$asset" && ! -L "$swift_tmp/icon-out/$asset" && -s "$swift_tmp/icon-out/$asset" ]] || die "compiled icon asset missing: $asset"
+        /bin/cp -X "$swift_tmp/icon-out/$asset" "$WORK/icon-out/$asset"
+    done
+else
+    for asset in AppIcon.icns Assets.car; do /bin/cp -X "$WORK/icon-fallback/$asset" "$WORK/icon-out/$asset"; done
+fi
 
 printf '%s\n' 'Compiling the multi-subscription AppKit helper without launching it...'
 swift_inputs=()
@@ -257,6 +286,12 @@ for name in "${swift_sources[@]}"; do swift_inputs+=("$WORK/Sources/$name"); don
     -module-cache-path "$WORK/cache" "${swift_inputs[@]}" -o "$WORK/$BUNDLE_EXECUTABLE" \
     || die 'Swift compilation failed'
 [[ -f "$WORK/$BUNDLE_EXECUTABLE" && ! -L "$WORK/$BUNDLE_EXECUTABLE" ]] || die 'Swift executable was not created'
+/usr/bin/env -i PATH="$PATH" HOME="$WORK/home" TMPDIR="$swift_tmp/" \
+    "$swiftc_path" -swift-version 5 -O -parse-as-library \
+    -target arm64-apple-macos12.0 -sdk "$sdk_path" -framework AppKit \
+    -module-cache-path "$WORK/cache" "$WORK/Sources/ClashRuntimeInjector.swift" \
+    "$WORK/Sources/RuntimeBrokerMain.swift" -o "$WORK/ClashRuntimeBroker" \
+    || die 'Runtime broker compilation failed'
 
 # The online worker keeps the upstream archive in its bootstrap cache; its
 # offline path instead copies and verifies that archive inside its unique private
@@ -290,10 +325,16 @@ source_sha="$(/usr/bin/shasum -a 256 < "$source_archive" | /usr/bin/awk '{print 
 [[ "$source_sha" == "$UPSTREAM_SHA256" ]] || die 'verified upstream source archive does not match the expected commit archive'
 
 # Do not ship a mixture of files from concurrently changing inputs.
-for name in "${swift_sources[@]}"; do /usr/bin/cmp -s "$SOURCES_DIR/$name" "$WORK/Sources/$name" || die "Swift source changed during build: $name"; done
+for name in "${source_snapshots[@]}"; do /usr/bin/cmp -s "$SOURCES_DIR/$name" "$WORK/Sources/$name" || die "Swift source changed during build: $name"; done
 /usr/bin/cmp -s "$WORKER_BUILDER" "$RESOURCES/build-verified-worker.sh" || die 'worker builder changed during build'
 for name in verified-worker.patch UPSTREAM-GPL-3.0.txt NOTICE.md CONTRACT.md; do
     /usr/bin/cmp -s "$WORKER_DIR/$name" "$RESOURCES/$name" || die "worker input changed during build: $name"
+done
+for rel in "${icon_sources[@]}"; do
+    /usr/bin/cmp -s "$ICON_SOURCE/$rel" "$swift_tmp/AppIcon.icon/$rel" || die "icon input changed during build: $rel"
+done
+for asset in AppIcon.icns Assets.car; do
+    /usr/bin/cmp -s "$APP_RESOURCES_DIR/$asset" "$WORK/icon-fallback/$asset" || die "icon asset changed during build: $asset"
 done
 cleanup_swift_tmp || die 'safe compiler scratch cleanup failed; incomplete app retained'
 swift_tmp=''
@@ -314,6 +355,7 @@ check_arm64_executable() {
     /usr/bin/lipo -verify_arch arm64 "$binary" || die 'executable does not contain arm64 code'
 }
 check_arm64_executable "$WORK/$BUNDLE_EXECUTABLE"
+check_arm64_executable "$WORK/ClashRuntimeBroker"
 check_arm64_executable "$worker"
 worker_sha="$(/usr/bin/shasum -a 256 < "$worker" | /usr/bin/awk '{print $1}')"
 patch_sha="$(/usr/bin/shasum -a 256 < "$RESOURCES/verified-worker.patch" | /usr/bin/awk '{print $1}')"
@@ -322,9 +364,16 @@ builder_sha="$(/usr/bin/shasum -a 256 < "$RESOURCES/build-verified-worker.sh" | 
 # executed even briefly as it is copied into the still-incomplete app bundle.
 (umask 777; /bin/cp -X "$WORK/$BUNDLE_EXECUTABLE" "$app_path/Contents/MacOS/$BUNDLE_EXECUTABLE")
 (umask 777; /bin/cp -X "$worker" "$app_path/Contents/MacOS/clash-speedtest")
-/bin/chmod 644 "$app_path/Contents/MacOS/$BUNDLE_EXECUTABLE" "$app_path/Contents/MacOS/clash-speedtest"
+(umask 777; /bin/cp -X "$WORK/ClashRuntimeBroker" "$app_path/Contents/MacOS/ClashRuntimeBroker")
+/bin/chmod 644 "$app_path/Contents/MacOS/$BUNDLE_EXECUTABLE" "$app_path/Contents/MacOS/clash-speedtest" "$app_path/Contents/MacOS/ClashRuntimeBroker"
+/usr/bin/cmp -s "$WORK/ClashRuntimeBroker" "$app_path/Contents/MacOS/ClashRuntimeBroker" || die 'Runtime broker changed while being copied'
 /usr/bin/cmp -s "$WORK/$BUNDLE_EXECUTABLE" "$app_path/Contents/MacOS/$BUNDLE_EXECUTABLE" || die 'Swift executable changed while being copied'
 /usr/bin/cmp -s "$worker" "$app_path/Contents/MacOS/clash-speedtest" || die 'worker changed while being copied'
+for asset in AppIcon.icns Assets.car; do
+    (umask 777; /bin/cp -X "$WORK/icon-out/$asset" "$app_path/Contents/Resources/$asset")
+    /bin/chmod 644 "$app_path/Contents/Resources/$asset"
+    /usr/bin/cmp -s "$WORK/icon-out/$asset" "$app_path/Contents/Resources/$asset" || die "icon asset changed while being copied: $asset"
+done
 
 cat > "$app_path/Contents/Resources/BUILD-PROVENANCE.txt" <<NOTICE
 Worker: faceair/clash-speedtest v1.8.6, modified STRICT JSON-v1 worker
@@ -354,6 +403,8 @@ cat > "$app_path/Contents/Info.plist" <<'PLIST'
   <key>CFBundleDevelopmentRegion</key><string>zh_CN</string>
   <key>CFBundleDisplayName</key><string>Clash 多订阅测速助手</string>
   <key>CFBundleExecutable</key><string>ClashMultiSpeedHelper</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>CFBundleIconName</key><string>AppIcon</string>
   <key>CFBundleIdentifier</key><string>local.clashverge.multispeedhelper</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>Clash 多订阅测速助手</string>
@@ -366,7 +417,7 @@ cat > "$app_path/Contents/Info.plist" <<'PLIST'
 </dict></plist>
 PLIST
 /usr/bin/plutil -lint "$app_path/Contents/Info.plist" >/dev/null || die 'Info.plist is invalid'
-for pair in "CFBundleExecutable:$BUNDLE_EXECUTABLE" "CFBundleIdentifier:$BUNDLE_ID" 'CFBundlePackageType:APPL' 'LSMinimumSystemVersion:12.0'; do
+for pair in "CFBundleExecutable:$BUNDLE_EXECUTABLE" "CFBundleIdentifier:$BUNDLE_ID" 'CFBundleIconFile:AppIcon' 'CFBundleIconName:AppIcon' 'CFBundlePackageType:APPL' 'LSMinimumSystemVersion:12.0'; do
     key="${pair%%:*}"; expected="${pair#*:}"
     actual="$(/usr/libexec/PlistBuddy -c "Print :$key" "$app_path/Contents/Info.plist")" || die "missing Info.plist key: $key"
     [[ "$actual" == "$expected" ]] || die "incorrect Info.plist key: $key"
@@ -412,18 +463,20 @@ PY
 
 app_is_ours || die 'output changed before signing'
 /bin/chmod 755 "$app_path" "$app_path/Contents" "$app_path/Contents/MacOS" "$app_path/Contents/Resources" "$RESOURCES"
-/bin/chmod 644 "$app_path/Contents/Info.plist" "$app_path/Contents/Resources/BUILD-PROVENANCE.txt" "$RESOURCES"/*
+/bin/chmod 644 "$app_path/Contents/Info.plist" "$app_path/Contents/Resources/BUILD-PROVENANCE.txt" "$app_path/Contents/Resources/AppIcon.icns" "$app_path/Contents/Resources/Assets.car" "$RESOURCES"/*
 # Sign the nested worker first. Both executables are still non-executable until
 # signing completes. Only remove FinderInfo from the exact newly-created root.
 umask 022
 /usr/bin/codesign --force --sign - --timestamp=none "$app_path/Contents/MacOS/clash-speedtest" || die 'worker signing failed'
+/usr/bin/codesign --force --sign - --timestamp=none "$app_path/Contents/MacOS/ClashRuntimeBroker" || die 'broker signing failed'
 attributes="$(/usr/bin/xattr "$app_path")" || die 'cannot inspect output extended attributes'
 if printf '%s\n' "$attributes" | /usr/bin/grep -Fxq 'com.apple.FinderInfo'; then
     app_is_ours || die 'output changed before FinderInfo removal'
     /usr/bin/xattr -d com.apple.FinderInfo "$app_path" || die 'cannot remove FinderInfo from new output root'
 fi
 /usr/bin/codesign --force --sign - --timestamp=none "$app_path" || die 'app signing failed'
-/bin/chmod 755 "$app_path/Contents/MacOS/$BUNDLE_EXECUTABLE" "$app_path/Contents/MacOS/clash-speedtest"
+/bin/chmod 755 "$app_path/Contents/MacOS/$BUNDLE_EXECUTABLE" "$app_path/Contents/MacOS/clash-speedtest" "$app_path/Contents/MacOS/ClashRuntimeBroker"
+/usr/bin/codesign --verify --strict "$app_path/Contents/MacOS/ClashRuntimeBroker" || die 'broker signature verification failed'
 /usr/bin/codesign --verify --strict "$app_path/Contents/MacOS/clash-speedtest" || die 'worker signature verification failed'
 /usr/bin/codesign --verify --deep --strict "$app_path" || die 'app signature verification failed'
 for target in "$app_path/Contents/MacOS/clash-speedtest" "$app_path"; do

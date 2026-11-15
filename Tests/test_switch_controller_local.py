@@ -201,7 +201,52 @@ import Foundation
             let text = "\(failure) \(failure.localizedDescription)"
             precondition(!text.contains(secret) && !text.contains(socket) && !text.contains(node))
         }
-        print("Swift callbacks, guards, verified and uncertain outcomes: OK")
+        func probe(_ target: String, timeoutMs: Int = 3500, testURL: String = "http://www.gstatic.com/generate_204") -> Result<Double, SwitchFailure> {
+            wait { ctl.probeNodeDelay(node: target, timeoutMs: timeoutMs, testURL: testURL, completion: $0) }
+        }
+        guard case .success(let dInt) = probe("ProbeOK"), abs(dInt - 123.0) < 1e-9 else {
+            fatalError("probe integer delay failed")
+        }
+        guard case .success(let dFloat) = probe(node, timeoutMs: 1800, testURL: "https://cp.cloudflare.com/generate_204"),
+              abs(dFloat - 45.5) < 1e-9 else {
+            fatalError("probe float/encoded node delay failed")
+        }
+        guard case .success(let dUtf8) = probe("Probe ü/é"), abs(dUtf8 - 88.25) < 1e-9 else {
+            fatalError("probe utf8/slash node delay failed")
+        }
+        for statusName in ["Probe408", "Probe500", "Probe502", "Probe503", "Probe504", "ProbeRedirect"] {
+            guard case .failure(.unexpectedHTTPStatus) = probe(statusName) else {
+                fatalError("probe unexpected status not rejected: \(statusName)")
+            }
+        }
+        for badDelayName in ["ProbeDup", "ProbeDupEsc", "ProbeMissing", "ProbeZero", "ProbeNegative", "ProbeTooLarge", "ProbeOversized", "ProbeBadJSON"] {
+            guard case .failure(.invalidResponse) = probe(badDelayName) else {
+                fatalError("probe invalid response accepted: \(badDelayName)")
+            }
+        }
+        guard case .failure(.transportError) = probe("ProbeDrop") else {
+            fatalError("probe transport drop not reported as transportError")
+        }
+        for badNode in ["", ".", "..", "bad\nnode"] {
+            guard case .failure(.invalidNode) = probe(badNode) else {
+                fatalError("invalid probe node accepted")
+            }
+        }
+        for badTimeout in [99, 30_001] {
+            guard case .failure(.invalidNode) = probe("ProbeOK", timeoutMs: badTimeout) else {
+                fatalError("invalid probe timeout accepted")
+            }
+        }
+        for badURL in ["", "ftp://example.com", "http://bad\nurl"] {
+            guard case .failure(.invalidNode) = probe("ProbeOK", testURL: badURL) else {
+                fatalError("invalid probe URL accepted")
+            }
+        }
+        let badSettingsProbe: Result<Double, SwitchFailure> = wait { invalid.probeNodeDelay(node: "ProbeOK", completion: $0) }
+        guard case .failure(.invalidSettings) = badSettingsProbe else {
+            fatalError("invalid probe settings accepted")
+        }
+        print("Swift callbacks, guards, probeNodeDelay, verified and uncertain outcomes: OK")
     }
 }
 '''
@@ -268,6 +313,57 @@ class Handler(BaseHTTPRequestHandler):
             self.server.errors.append('bad UTF-8 route')
             return None
     def do_GET(self):
+        path_only, sep, query = self.path.partition('?')
+        if sep and path_only.startswith('/proxies/') and path_only.endswith('/delay'):
+            _ = self.checked_name()
+            raw_node = path_only[len('/proxies/'):-len('/delay')]
+            if '/' in raw_node or not raw_node:
+                self.server.errors.append('malformed probe route')
+                return self.response(400)
+            try:
+                node_name = urllib.parse.unquote(raw_node, encoding='utf-8', errors='strict')
+            except ValueError:
+                self.server.errors.append('bad UTF-8 probe node')
+                return self.response(400)
+            with self.server.lock:
+                self.server.events.append(('PROBE', node_name, self.path))
+            if node_name == 'ProbeOK':
+                if query != 'timeout=3500&url=http%3A%2F%2Fwww.gstatic.com%2Fgenerate_204':
+                    self.server.errors.append('unexpected default probe query')
+                return self.response(200, {'delay': 123})
+            if node_name == NODE:
+                if query != 'timeout=1800&url=https%3A%2F%2Fcp.cloudflare.com%2Fgenerate_204':
+                    self.server.errors.append('unexpected custom probe query')
+                return self.response(200, {'delay': 45.5})
+            if node_name == 'Probe ü/é':
+                return self.response(200, {'delay': 88.25})
+            status_map = {'Probe408': 408, 'Probe500': 500, 'Probe502': 502, 'Probe503': 503, 'Probe504': 504}
+            if node_name in status_map:
+                return self.response(status_map[node_name])
+            if node_name == 'ProbeRedirect':
+                return self.response(302, location='http://localhost/proxies/RedirectTarget')
+            if node_name == 'ProbeDup':
+                return self.response(200, b'{"delay":100,"delay":200}')
+            if node_name == 'ProbeDupEsc':
+                return self.response(200, b'{"delay":100,"d\u0065lay":200}')
+            if node_name == 'ProbeMissing':
+                return self.response(200, b'{}')
+            if node_name == 'ProbeZero':
+                return self.response(200, b'{"delay":0}')
+            if node_name == 'ProbeNegative':
+                return self.response(200, b'{"delay":-5}')
+            if node_name == 'ProbeTooLarge':
+                return self.response(200, b'{"delay":60001}')
+            if node_name == 'ProbeOversized':
+                return self.response(200, b'{"delay":10,"pad":"' + b'x' * 4100 + b'"}')
+            if node_name == 'ProbeBadJSON':
+                return self.response(200, b'{not json')
+            if node_name == 'ProbeDrop':
+                self.close_connection = True
+                self.connection.shutdown(socket.SHUT_RDWR)
+                return
+            self.server.errors.append('unexpected probe target: ' + node_name)
+            return self.response(404)
         name = self.checked_name()
         with self.server.lock:
             self.server.events.append(('GET', name, self.path))
@@ -384,7 +480,11 @@ def main():
             assert all(event[1] != 'RedirectTarget' for event in server.events), 'redirect was followed'
             main_paths = [p for method, name, p in server.events if name == MAIN]
             assert main_paths and all(p == '/proxies/' + urllib.parse.quote(MAIN, safe='-._~') for p in main_paths)
-            print('Private synthetic socket, no unsafe PUT/retry, exact route, argv secrecy and no redirects: OK')
+            probe_paths = [(name, p) for method, name, p in server.events if method == 'PROBE']
+            assert len(probe_paths) == 18, f'unexpected probe request count: {len(probe_paths)}'
+            assert ('Probe ü/é', '/proxies/Probe%20%C3%BC%2F%C3%A9/delay?timeout=3500&url=http%3A%2F%2Fwww.gstatic.com%2Fgenerate_204') in probe_paths
+            assert (NODE, '/proxies/' + urllib.parse.quote(NODE, safe='-._~') + '/delay?timeout=1800&url=https%3A%2F%2Fcp.cloudflare.com%2Fgenerate_204') in probe_paths
+            print('Private synthetic socket, no unsafe PUT/retry, exact route, probeNodeDelay, argv secrecy and no redirects: OK')
         finally:
             server.shutdown()
             server.server_close()

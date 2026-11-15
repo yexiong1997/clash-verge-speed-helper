@@ -49,7 +49,7 @@ private func fixtureBatch() -> MultiPreparedBatch {
     ]
     return MultiPreparedBatch(registry: [first, second], registryData: Data("fixture".utf8),
         registryVersion: version, profiles: profiles,
-        options: MultiBatchOptions(downloadBytes: 262144, streams: 2, latencyTimeout: "1s", downloadTimeout: "3s"),
+        options: MultiBatchOptions(downloadBytes: 262144, streams: 2, latencyTimeout: "3s", downloadTimeout: "3s"),
         parallel: 10, jobCount: 8, requestedBytes: 8 * 262144, previewOnly: true)
 }
 
@@ -206,13 +206,80 @@ private func fixtureRows(_ rows: [MultiRow]) -> [[String: Any]] {
             let ranked = multiRank(rows)
             let promoted = multiFunnelPromotedIdentities(rows: ranked, runIdentities: Set(rows.map(\.identity)), topCount: 2)
             let promotedIndices = ranked.filter { promoted.contains($0.identity) }.map(\.index)
+            var stage1Rows = multiPreviewRows(batch)
+            func scored(_ name: String, speedMiB: Double, latency: Double = 30) -> VerifiedMeasurement {
+                VerifiedMeasurement(nodeName: name, nodeType: "fixture", headAttempts: 6, headSuccesses: 6,
+                                    latencyMilliseconds: latency, jitterMilliseconds: 2.0,
+                                    expectedBytes: 1_048_576, receivedBytes: 1_048_576, downloadComplete: true,
+                                    downloadBytesPerSecond: speedMiB * 1_048_576)
+            }
+            stage1Rows[0].measurement = scored(stage1Rows[0].nodeName, speedMiB: 20)
+            stage1Rows[0].state = "有效"
+            stage1Rows[1].measurement = scored(stage1Rows[1].nodeName, speedMiB: 4)
+            stage1Rows[1].state = "有效"
+            stage1Rows[6].measurement = scored(stage1Rows[6].nodeName, speedMiB: 12)
+            stage1Rows[6].state = "有效"
+            let infoRow = MultiRow(identity: MultiIdentity(profile: Data("é".utf8), node: "剩余流量"),
+                                   profileName: "First [é]", nodeName: "剩余流量", index: 2,
+                                   measurement: fixtureMeasurement("剩余流量"), state: "信息项（不参与排名）")
+            stage1Rows[2] = infoRow
+            stage1Rows[3].measurement = VerifiedMeasurement(nodeName: stage1Rows[3].nodeName, nodeType: "fixture",
+                headAttempts: 6, headSuccesses: 0, latencyMilliseconds: 0, jitterMilliseconds: 0,
+                expectedBytes: 262144, receivedBytes: 0, downloadComplete: false, downloadBytesPerSecond: 0)
+            stage1Rows[3].state = "无效"
+            stage1Rows[4].state = "已取消"
+            stage1Rows[5].state = "待测速"
+            let stage2Job = MultiBatchJob(profileIdentity: stage1Rows[0].identity.profile, nodeName: stage1Rows[0].nodeName,
+                                          yamlSnapshot: Data("synthetic".utf8), index: 0, options: batch.options)
+            let stage2Rows = multiFunnelStage2Rows(stage1Rows, jobs: [stage2Job])!
+            let stage2Failed = multiVisibleRows(stage2Rows, query: "", statusFilter: .failedOnly).map { stage2Rows[$0].index }
+            let stage2Testing = multiVisibleRows(stage2Rows, query: "", statusFilter: .testingOnly).map { stage2Rows[$0].index }
+            var finishedStage2Rows = stage2Rows
+            finishedStage2Rows[0].measurement = scored(finishedStage2Rows[0].nodeName, speedMiB: 30)
+            finishedStage2Rows[0].state = "有效"
+            let stage2Ranked = multiRank(finishedStage2Rows).map(\.index)
+            let stage2ScoreDesc = multiVisibleRows(finishedStage2Rows, query: "", sortColumn: "score", sortAscending: false).map { finishedStage2Rows[$0].index }
+            let stage2ScoreAsc = multiVisibleRows(finishedStage2Rows, query: "", sortColumn: "score", sortAscending: true).map { finishedStage2Rows[$0].index }
+            let nodeSortedAsc = multiVisibleRows(finishedStage2Rows, query: "", sortColumn: "node", sortAscending: true).map { finishedStage2Rows[$0].nodeName }
+            let nodeSortedDesc = multiVisibleRows(finishedStage2Rows, query: "", sortColumn: "node", sortAscending: false).map { finishedStage2Rows[$0].nodeName }
+            let clearedStage1 = multiRunRows(finishedStage2Rows, jobs: [stage2Job])!
+            let clearedRanked = multiRank(clearedStage1).map(\.index)
+            let manyEligible = (0..<12).map { i in
+                MultiRow(identity: MultiIdentity(profile: Data("é".utf8), node: "n\(i)"), profileName: "P",
+                         nodeName: "n\(i)", index: i, measurement: scored("n\(i)", speedMiB: Double(i + 1)), state: "有效")
+            }
+            let cap10Promoted = multiFunnelPromotedIdentities(rows: manyEligible, runIdentities: Set(manyEligible.map(\.identity)), topCount: multiFunnelMaxPromoted)
+            let under10 = Array(manyEligible.prefix(4))
+            let under10Promoted = multiFunnelPromotedIdentities(rows: under10, runIdentities: Set(under10.map(\.identity)), topCount: multiFunnelMaxPromoted)
+            let dupJob = MultiBatchJob(profileIdentity: stage1Rows[0].identity.profile, nodeName: stage1Rows[0].nodeName,
+                                       yamlSnapshot: Data("synthetic".utf8), index: 1, options: batch.options)
+            let missingJob = MultiBatchJob(profileIdentity: Data("missing".utf8), nodeName: "none",
+                                           yamlSnapshot: Data("synthetic".utf8), index: 0, options: batch.options)
+            let dupCatalogue = stage1Rows + [stage1Rows[0]]
             out = [
                 "valid": validIndices,
                 "testing": testingIndices,
                 "failed": failedIndices,
                 "latencyAsc": sortedLatencyAsc,
                 "latencyDesc": sortedLatencyDesc,
-                "promoted": promotedIndices
+                "promoted": promotedIndices,
+                "stage2States": stage2Rows.map(\.state),
+                "stage2HasMeasurement": stage2Rows.map { $0.measurement != nil },
+                "stage2Eligible": stage2Rows.map { $0.eligibleScore != nil },
+                "stage2FailedFilter": stage2Failed,
+                "stage2TestingFilter": stage2Testing,
+                "stage2Ranked": stage2Ranked,
+                "stage2ScoreDesc": stage2ScoreDesc,
+                "stage2ScoreAsc": stage2ScoreAsc,
+                "nodeSortedAsc": nodeSortedAsc,
+                "nodeSortedDesc": nodeSortedDesc,
+                "clearedRanked": clearedRanked,
+                "cap10Count": cap10Promoted.count,
+                "under10Count": under10Promoted.count,
+                "stage2RejectsEmpty": multiFunnelStage2Rows(stage1Rows, jobs: []) == nil,
+                "stage2RejectsDupJob": multiFunnelStage2Rows(stage1Rows, jobs: [stage2Job, dupJob]) == nil,
+                "stage2RejectsMissing": multiFunnelStage2Rows(stage1Rows, jobs: [missingJob]) == nil,
+                "stage2RejectsDupCatalogue": multiFunnelStage2Rows(dupCatalogue, jobs: [stage2Job]) == nil
             ]
         case "inspect":
             let data = (input["yaml"] as! String).data(using: .utf8)!
@@ -224,7 +291,7 @@ private func fixtureRows(_ rows: [MultiRow]) -> [[String: Any]] {
             do {
                 let registry = try ProfileRegistry.options(root: root)
                 stage = "prepare"
-                let options = MultiBatchOptions(downloadBytes: 262144, streams: 2, latencyTimeout: "1s", downloadTimeout: "3s")
+                let options = MultiBatchOptions(downloadBytes: 262144, streams: 2, latencyTimeout: "3s", downloadTimeout: "3s")
                 let selectedNodes = (input["selectedNodes"] as? [[String: String]]).map { entries in
                     Set(entries.map { MultiIdentity(profile: Data($0["uid"]!.utf8), node: $0["node"]!) })
                 }
@@ -271,7 +338,7 @@ private func fixtureRows(_ rows: [MultiRow]) -> [[String: Any]] {
         case "snapshot":
             let root = URL(fileURLWithPath: input["root"] as! String, isDirectory: true)
             let registry = try ProfileRegistry.options(root: root)
-            let options = MultiBatchOptions(downloadBytes: 262144, streams: 2, latencyTimeout: "1s", downloadTimeout: "3s")
+            let options = MultiBatchOptions(downloadBytes: 262144, streams: 2, latencyTimeout: "3s", downloadTimeout: "3s")
             let batch = try multiPrepare(root: root, registry: registry, selected: Set(registry.map(\.id)), options: options, parallel: 1)
             let snapshot = batch.profiles[0]
             let profileURL = URL(fileURLWithPath: snapshot.option.path)
@@ -289,7 +356,7 @@ private func fixtureRows(_ rows: [MultiRow]) -> [[String: Any]] {
             }
             out["after"] = multiProfileSnapshotMatches(root: root, profile: snapshot)
         case "decode":
-            let options = MultiBatchOptions(downloadBytes: 262144, streams: 2, latencyTimeout: "1s", downloadTimeout: "3s")
+            let options = MultiBatchOptions(downloadBytes: 262144, streams: 2, latencyTimeout: "3s", downloadTimeout: "3s")
             let job = MultiBatchJob(profileIdentity: Data("uid".utf8), nodeName: "节点", yamlSnapshot: Data("fixture".utf8), index: 0, options: options)
             let strings = input["lines"] as! [String]
             let result = multiDecode(.success(strings), job: job)
@@ -354,9 +421,40 @@ private func fixtureRows(_ rows: [MultiRow]) -> [[String: Any]] {
                    "ordinaryPreservesPrevious": choice(previous, nil, controller, profile, both),
                    "ordinarySoleNonGlobal": choice(nil, nil, controller, profile, [group2]),
                    "ordinaryNoGlobalDefault": choice(nil, nil, controller, profile, [global]),
-                   "ordinaryMixedNoGuess": choice(nil, nil, controller, profile, [global, group2]),
+                   "ordinaryMixedSelectsNonGlobal": choice(nil, nil, controller, profile, [global, group2]),
                    "ordinaryMultipleNoGuess": choice(nil, nil, controller, profile, both),
                    "ordinaryEmpty": choice(nil, nil, controller, profile, [])]
+        case "smartGroup":
+            let controller = MultiControllerIdentity(path: "/fixture/s.sock", device: 1, inode: 2)
+            let option = ProfileOption(uid: "u", name: "fixture", path: "/fixture/p", isCurrent: true)
+            let version = MultiFileVersion(stat())
+            let nodes = ["N1", "N2", "N3", "N4", "N5"]
+            let profile = MultiProfileSnapshot(option: option, data: Data("p".utf8), version: version, names: nodes)
+            func pick(_ groups: [ProxyGroup]) -> String {
+                switch multiGroupRefreshChoice(previous: nil, recurring: nil, controller: controller, profile: profile, candidates: groups) {
+                case .select(let i): return groups[i].name
+                case .noSelection: return "none"
+                case .invalidateRecurringAuthorization: return "invalidate"
+                }
+            }
+            let global = ProxyGroup(name: "GLOBAL", now: "N1", all: nodes)
+            let proxyFull = ProxyGroup(name: "PROXY", now: "N1", all: nodes)
+            let emojiSelect = ProxyGroup(name: "🚀 节点选择", now: "N1", all: nodes)
+            let streamingFull = ProxyGroup(name: "🎬 流媒体", now: "N1", all: nodes)
+            let partialHK = ProxyGroup(name: "🇭🇰 香港节点", now: "N1", all: ["N1"])
+            let dominantMain = ProxyGroup(name: "自定义主组", now: "N1", all: ["N1", "N2", "N3", "N4"])
+            let customFullA = ProxyGroup(name: "Alpha", now: "N1", all: nodes)
+            let customFullB = ProxyGroup(name: "Beta", now: "N1", all: nodes)
+            let manualAlt = ProxyGroup(name: "手动切换", now: "N1", all: nodes)
+            out = [
+                "globalAndProxy": pick([global, proxyFull]),
+                "globalFullAndPartial": pick([global, partialHK, customFullA]),
+                "emojiPrimaryAndStreaming": pick([global, streamingFull, emojiSelect]),
+                "dominantMainOverPartial": pick([global, partialHK, dominantMain]),
+                "ambiguousTie": pick([global, customFullA, customFullB]),
+                "ambiguousTwoPrimaries": pick([global, emojiSelect, manualAlt]),
+                "globalOnly": pick([global]),
+            ]
         case "groups":
             let raw = input["groups"] as! [[String: Any]]
             let groups = raw.map { ProxyGroup(name: $0["name"] as! String, now: $0["now"] as! String, all: $0["all"] as! [String]) }
@@ -485,7 +583,7 @@ class MultiAppHeadlessTests(unittest.TestCase):
         cls.binary = cls.work / "driver"
         sources = ["MultiMain.swift", "ProfileRegistry.swift", "MultiBatchRunner.swift",
                    "VerifiedMeasurement.swift", "CompositeScore.swift", "TestSchedule.swift",
-                   "SwitchController.swift", "AssistedSwitch.swift"]
+                   "SwitchController.swift", "AssistedSwitch.swift", "TelemetryHistory.swift"]
         # Keep compiler inputs immutable even while collaborators edit the checkout.
         for name in sources:
             shutil.copyfile(PROJECT / "Sources" / name, cls.work / name)
@@ -666,7 +764,17 @@ class MultiAppHeadlessTests(unittest.TestCase):
             "recurringChangedPath": "invalidate", "recurringChangedContents": "invalidate",
             "recurringChangedFileVersion": "invalidate", "ordinaryPreservesPrevious": "select:0",
             "ordinarySoleNonGlobal": "select:0", "ordinaryNoGlobalDefault": "none",
-            "ordinaryMixedNoGuess": "none", "ordinaryMultipleNoGuess": "none", "ordinaryEmpty": "none",
+            "ordinaryMixedSelectsNonGlobal": "select:1", "ordinaryMultipleNoGuess": "none", "ordinaryEmpty": "none",
+        })
+        smart = self.run_driver({"action": "smartGroup"})
+        self.assertEqual(smart, {
+            "globalAndProxy": "PROXY",
+            "globalFullAndPartial": "Alpha",
+            "emojiPrimaryAndStreaming": "🚀 节点选择",
+            "dominantMainOverPartial": "自定义主组",
+            "ambiguousTie": "none",
+            "ambiguousTwoPrimaries": "none",
+            "globalOnly": "none",
         })
 
     def test_capture_requires_exact_socket_profile_group_now_and_membership(self):
@@ -902,6 +1010,32 @@ class MultiAppHeadlessTests(unittest.TestCase):
         self.assertEqual(out["latencyAsc"], [0, 3, 6])
         self.assertEqual(out["latencyDesc"], [6, 3, 0])
         self.assertEqual(out["promoted"], [0, 3])
+        self.assertEqual(out["stage2States"][0], "等待")
+        self.assertTrue(out["stage2States"][1].startswith("初筛 ") and out["stage2States"][1].endswith("分"))
+        self.assertEqual(out["stage2States"][2], "初筛信息项")
+        self.assertEqual(out["stage2States"][3], "初筛无效")
+        self.assertEqual(out["stage2States"][4], "已取消")
+        self.assertEqual(out["stage2States"][5], "未勾选")
+        self.assertTrue(out["stage2States"][6].startswith("初筛 ") and out["stage2States"][6].endswith("分"))
+        self.assertEqual(out["stage2States"][7], "未勾选")
+        self.assertEqual(out["stage2HasMeasurement"], [False] * 8)
+        self.assertEqual(out["stage2Eligible"], [False] * 8)
+        self.assertEqual(out["stage2FailedFilter"], [3, 4])
+        self.assertEqual(out["stage2TestingFilter"], [0])
+        self.assertEqual(out["stage2Ranked"], [0, 6, 1, 2, 3, 4, 5, 7])
+        self.assertEqual(out["stage2ScoreDesc"], [0, 6, 1, 2, 3, 4, 5, 7])
+        self.assertEqual(out["stage2ScoreAsc"], [0, 1, 6, 2, 3, 4, 5, 7])
+        self.assertLess(out["nodeSortedAsc"].index("Alpha"), out["nodeSortedAsc"].index("Bravo"))
+        self.assertLess(out["nodeSortedAsc"].index("Bravo"), out["nodeSortedAsc"].index("same"))
+        self.assertGreater(out["nodeSortedDesc"].index("Alpha"), out["nodeSortedDesc"].index("Bravo"))
+        self.assertGreater(out["nodeSortedDesc"].index("Bravo"), out["nodeSortedDesc"].index("same"))
+        self.assertEqual(out["clearedRanked"], list(range(8)))
+        self.assertEqual(out["cap10Count"], 10)
+        self.assertEqual(out["under10Count"], 4)
+        self.assertTrue(out["stage2RejectsEmpty"])
+        self.assertTrue(out["stage2RejectsDupJob"])
+        self.assertTrue(out["stage2RejectsMissing"])
+        self.assertTrue(out["stage2RejectsDupCatalogue"])
 
 
 if __name__ == "__main__":

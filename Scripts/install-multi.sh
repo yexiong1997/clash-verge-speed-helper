@@ -154,5 +154,19 @@ PY
 /usr/bin/codesign --verify --deep --strict "$APP_PATH"
 /usr/bin/mdimport -i "$APP_PATH"
 "$LSREGISTER" -f "$APP_PATH"
+# Rebuilding ad-hoc changes the binary cdhash, leaving any earlier
+# Accessibility entry in TCC mismatched even though System Settings still
+# shows its switch enabled. Reset only this helper's Accessibility entry on
+# default user installs so the next prompt binds the newly installed cdhash.
+if [[ -z "${CLASH_MULTI_INSTALL_ROOT:-}" && -x /usr/bin/tccutil ]]; then
+    if /usr/bin/tccutil reset Accessibility local.clashverge.multispeedhelper >/dev/null 2>&1; then
+        printf 'Reset stale Accessibility TCC entry for: %s\n' 'local.clashverge.multispeedhelper'
+    else
+        printf 'Note: could not reset Accessibility TCC entry automatically; remove and re-add %s in System Settings if switching reports missing permission.\n' "$APP_NAME" >&2
+    fi
+fi
 printf 'Installed and verified: %s\n' "$APP_PATH"
 printf 'Removed stale helper variants from: %s\n' "$INSTALL_ROOT"
+if [[ -z "${CLASH_MULTI_INSTALL_ROOT:-}" ]]; then
+    /usr/bin/python3 -I "$PROJECT_DIR/Scripts/install-runtime-broker.py" --app "$APP_PATH" --restart-clash
+fi

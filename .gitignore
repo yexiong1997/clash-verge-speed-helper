@@ -27,6 +27,7 @@ credentials
 *.yaml
 *.yml
 *.json
+!Resources/AppIcon.icon/icon.json
 *.conf
 .env
 .env.*

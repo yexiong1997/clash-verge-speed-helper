@@ -98,8 +98,19 @@ try:
         event("bad-argv", {"actual": sanitized, "expected": expected})
         sys.stderr.write("SYNTHETIC_SECRET_STDERR invalid argv\n")
         sys.exit(21)
-    time.sleep(config.get("delay", 0))
     behavior = config.get("behavior", "normal")
+    if behavior == "progress_stream":
+        expected_bytes = (config["bytes"] // config["streams"]) * config["streams"]
+        if os.environ.get("CLASH_VERIFIED_PROGRESS") == "1":
+            sys.stderr.write(json.dumps({"progress": 1, "phase": "head", "received_bytes": 0, "expected_bytes": expected_bytes, "bps": 0}) + "\n")
+            sys.stderr.write("SYNTHETIC_SECRET_STDERR mixed line\n")
+            sys.stderr.write("X" * 600 + "\n")
+            sys.stderr.write(json.dumps({"progress": 1, "phase": "download", "received_bytes": expected_bytes // 2, "expected_bytes": expected_bytes, "bps": 2097152, "extra": "SYNTHETIC_SECRET_STDERR"}) + "\n")
+            sys.stderr.write(json.dumps({"progress": 1, "phase": "download", "received_bytes": expected_bytes // 2, "expected_bytes": expected_bytes, "bps": 2097152}) + "\n")
+            sys.stderr.flush()
+        time.sleep(config.get("delay", 0.08))
+    else:
+        time.sleep(config.get("delay", 0))
     if behavior == "bad_utf8":
         os.write(1, b"\xff\xfe\n")
         sys.exit(0)
@@ -358,15 +369,27 @@ let executable = URL(fileURLWithPath: input["executable"] as! String)
 let parallel = input["parallel"] as! Int
 let watchdog = input["watchdog"] as? Double ?? 180
 let grace = input["termination_grace"] as? Double ?? 2
+let collectProgress = input["collect_progress"] as? Bool == true
+let onProgress: MultiBatchRunner.ProgressCallback? = !collectProgress ? nil : { job, progress in
+    precondition(Thread.isMainThread && !inResult && !inPreLaunch && !finished)
+    events.append([
+        "event": "progress",
+        "index": job.index,
+        "phase": progress.phase.rawValue,
+        "received": progress.receivedBytes,
+        "expected": progress.expectedBytes,
+        "bps": progress.bytesPerSecond,
+    ])
+}
 let runner: MultiBatchRunner
 if asyncMode {
     runner = MultiBatchRunner(executable: executable, jobs: jobs, parallel: parallel,
                               watchdog: watchdog, terminationGrace: grace,
-                              asyncPreLaunch: asyncHook, onResult: onResult, onFinish: onFinish)
+                              asyncPreLaunch: asyncHook, onProgress: onProgress, onResult: onResult, onFinish: onFinish)
 } else {
     runner = MultiBatchRunner(executable: executable, jobs: jobs, parallel: parallel,
                               watchdog: watchdog, terminationGrace: grace,
-                              preLaunch: syncHook, onResult: onResult, onFinish: onFinish)
+                              preLaunch: syncHook, onProgress: onProgress, onResult: onResult, onFinish: onFinish)
 }
 box.runner = runner
 if input["cancel_on_main_turn"] as? Bool == true {
@@ -588,6 +611,22 @@ class MultiBatchTests(unittest.TestCase):
         self.assertFalse(summary["cancelled"])
         actual = {r["index"]: r["status"] for r in results}
         self.assertEqual(actual, {i: case[2] for i, case in enumerate(cases)})
+
+    def test_progress_streaming_and_secret_stderr_isolation(self):
+        jobs = [job(0, behavior="progress_stream", size=1000, streams=2, delay=0.05)]
+        request = {"jobs": jobs, "parallel": 1, "executable": str(self.worker), "collect_progress": True}
+        self.log.write_text("", encoding="utf-8")
+        process = subprocess.run([str(self.executable)], input=json.dumps(request),
+                                 env=self.env, text=True, capture_output=True, timeout=35)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertNotIn("SYNTHETIC_SECRET_STDERR", process.stdout + process.stderr)
+        events = json.loads(process.stdout)
+        progress = [e for e in events if e["event"] == "progress"]
+        self.assertEqual([(p["phase"], p["received"], p["expected"], p["bps"]) for p in progress],
+                         [("head", 0, 1000, 0.0), ("download", 500, 1000, 2097152.0)])
+        results = [e for e in events if e["event"] == "result"]
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["status"], "success")
 
     def test_valid_unscorable_measurements_are_successful(self):
         behaviors = ["incomplete", "few_heads", "zero_latency"]

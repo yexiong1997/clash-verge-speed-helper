@@ -67,8 +67,10 @@ public final class ClashController: Sendable {
     // Serialize each instance's whole preflight/PUT/verify sequence. This is
     // not a compare-and-swap against users or other controller clients.
     private let queue = DispatchQueue(label: "ClashController.requests", qos: .userInitiated)
+    private let probeQueue = DispatchQueue(label: "ClashController.probe", qos: .utility)
     private static let maximumInputBytes = 8 * 1024
     private static let maximumResponseBytes = 8 * 1024 * 1024
+    private static let maximumProbeResponseBytes = 4096
 
     public init(settings: ControllerSettings) { self.settings = settings }
 
@@ -102,6 +104,14 @@ public final class ClashController: Sendable {
                                                 expectedCurrent: expectedCurrent, prePutGuard: prePutGuard))
         }
     }
+    public func probeNodeDelay(node: String, timeoutMs: Int = 3500,
+                               testURL: String = "http://www.gstatic.com/generate_204",
+                               completion: @escaping (Result<Double, SwitchFailure>) -> Void) {
+        let callback = MainCompletion(completion)
+        probeQueue.async {
+            callback.deliver(self.fetchNodeDelay(node: node, timeoutMs: timeoutMs, testURL: testURL))
+        }
+    }
 
     private static func sameBytes(_ a: String, _ b: String) -> Bool { a.utf8.elementsEqual(b.utf8) }
     private static func hasControls(_ value: String) -> Bool {
@@ -122,6 +132,10 @@ public final class ClashController: Sendable {
     }
     private static func validNode(_ node: String) -> Bool {
         !node.isEmpty && node.utf8.count <= maximumInputBytes && !hasControls(node)
+    }
+    private static func validTestURL(_ url: String) -> Bool {
+        !url.isEmpty && url.utf8.count <= 1024 && !hasControls(url) &&
+            (url.hasPrefix("http://") || url.hasPrefix("https://"))
     }
     // Encode exactly one UTF-8 segment without URL normalization or globbing.
     private static func segment(_ name: String) -> String {
@@ -303,6 +317,28 @@ public final class ClashController: Sendable {
     }
 
     private struct WireGroup: Decodable { let name: String; let type: String; let now: String; let all: [String] }
+    private struct WireDelay: Decodable { let delay: Double }
+    private func fetchNodeDelay(node: String, timeoutMs: Int, testURL: String) -> Result<Double, SwitchFailure> {
+        guard validSettings() else { return .failure(.invalidSettings) }
+        guard Self.validNode(node), node != ".", node != "..",
+              (100...30_000).contains(timeoutMs), Self.validTestURL(testURL) else {
+            return .failure(.invalidNode)
+        }
+        let path = "/proxies/" + Self.segment(node) + "/delay?timeout=\(timeoutMs)&url=" + Self.segment(testURL)
+        let maxTime = max(5, Int(ceil(Double(timeoutMs) / 1000.0)) + 2)
+        let response: Response
+        switch request(method: .get, path: path, body: nil, maxTimeSeconds: maxTime) {
+        case .failure(let error): return .failure(error)
+        case .success(let value): response = value
+        }
+        guard response.status == 200 else { return .failure(.unexpectedHTTPStatus) }
+        guard StrictJSON.validate(response.body, maximumBytes: Self.maximumProbeResponseBytes),
+              let parsed = try? JSONDecoder().decode(WireDelay.self, from: response.body),
+              parsed.delay.isFinite, parsed.delay > 0, parsed.delay <= 60_000 else {
+            return .failure(.invalidResponse)
+        }
+        return .success(parsed.delay)
+    }
     private func fetchGroup(_ name: String) -> Result<ProxyGroup, SwitchFailure> {
         guard validSettings() else { return .failure(.invalidSettings) }
         guard Self.validGroupName(name) else { return .failure(.invalidGroupName) }
@@ -384,7 +420,7 @@ public final class ClashController: Sendable {
         "\"" + value.replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"") + "\""
     }
-    private func request(method: Method, path: String, body: Data?) -> Result<Response, SwitchFailure> {
+    private func request(method: Method, path: String, body: Data?, maxTimeSeconds: Int = 5) -> Result<Response, SwitchFailure> {
         // path is constructed only from fixed strings and segment().
         guard validSettings(), path.hasPrefix("/proxies") else { return .failure(.invalidSettings) }
         var config = "url = \(Self.configQuote("http://localhost" + path))\n"
@@ -401,7 +437,7 @@ public final class ClashController: Sendable {
         // -q must be first. No shell, TCP proxy, redirects, or URL globbing.
         process.arguments = ["-q", "--noproxy", "*", "--proxy", "", "--unix-socket", settings.socket,
                              "--proto", "=http", "--no-location", "--globoff", "--path-as-is",
-                             "--connect-timeout", "2", "--max-time", "5", "--silent",
+                             "--connect-timeout", "2", "--max-time", String(max(5, maxTimeSeconds)), "--silent",
                              "--max-filesize", String(Self.maximumResponseBytes), "--request", method.rawValue,
                              "--write-out", "\n%{http_code}", "-K", "-"]
         let input = Pipe(), output = Pipe()
