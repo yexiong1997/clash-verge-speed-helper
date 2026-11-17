@@ -108,6 +108,34 @@ def read_settings(registry):
         raise ControllerError("controller unavailable") from None
 
 
+def read_tun_enabled(registry):
+    """Safely inspect clash-verge.yaml tun.enable as bool | None.
+
+    Missing or malformed config degrades to None without blocking refresh;
+    reparse-point, path-pinning, and TOCTOU failures propagate as ProfileError.
+    """
+    with _pinned(registry.root) as (root, root_id, profiles_id):
+        if (root_id, profiles_id) != (registry.root_identity, registry.profiles_identity):
+            raise ProfileError("profile changed")
+        try:
+            data, _version = _read(root / "clash-verge.yaml", MAX_REGISTRY)
+        except pywintypes.error as exc:
+            if exc.winerror in (2, 3):
+                return None
+            raise ProfileError("profile unavailable") from None
+    try:
+        document = parse_yaml(data)
+    except ProfileError:
+        return None
+    if not isinstance(document, dict):
+        return None
+    tun = document.get("tun")
+    if not isinstance(tun, dict):
+        return None
+    enabled = tun.get("enable")
+    return enabled if type(enabled) is bool else None
+
+
 def _validate_unix_path(value):
     if not _valid_text(value):
         raise ControllerError("controller unavailable")

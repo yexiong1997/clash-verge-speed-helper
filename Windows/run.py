@@ -7,7 +7,6 @@ import sys
 if not getattr(sys, "frozen", False):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import webview
 from Windows.desktop import Desktop
 
 
@@ -32,12 +31,31 @@ class PublicApi:
     def copy_node_name(self, value): return self._desktop.copy_node_name(value)
 
 
+def resolve_worker(base=None, frozen=None):
+    override = os.environ.get("CLASH_SPEED_HELPER_WORKER", "").strip()
+    if override:
+        return Path(override)
+    if frozen is None:
+        frozen = getattr(sys, "frozen", False)
+    if frozen:
+        return Path(sys.executable).parent / "clash-speedtest.exe"
+    if base is None:
+        base = Path(__file__).resolve().parent.parent
+    primary = base / "build" / "verified-worker" / "clash-speedtest.exe"
+    if primary.is_file():
+        return primary
+    localappdata = os.environ.get("LOCALAPPDATA", "").strip()
+    if localappdata:
+        fallback = Path(localappdata) / "ClashSpeedHelper" / "verified-worker" / "clash-speedtest.exe"
+        if fallback.is_file():
+            return fallback
+    return primary
+
+
 def main():
     frozen = getattr(sys, "frozen", False)
     base = Path(sys._MEIPASS) if frozen else Path(__file__).resolve().parent.parent
-    worker = Path(os.environ.get("CLASH_SPEED_HELPER_WORKER", "")) if os.environ.get("CLASH_SPEED_HELPER_WORKER") else (
-        Path(sys.executable).parent / "clash-speedtest.exe" if frozen
-        else base / "build" / "verified-worker" / "clash-speedtest.exe")
+    worker = resolve_worker(base=base, frozen=frozen)
     if "--smoke-test" in sys.argv:
         return 0 if worker.is_file() and (base / "Windows" / "ui" / "index.html").is_file() else 1
     root = None
@@ -46,6 +64,7 @@ def main():
         if index + 1 >= len(sys.argv):
             return 2
         root = sys.argv[index + 1]
+    import webview
     app = Desktop(worker, root=root)
     webview.settings["ALLOW_DOWNLOADS"] = False
     webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = False

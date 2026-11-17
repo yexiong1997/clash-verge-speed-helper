@@ -15,6 +15,7 @@
       <div class="brand"><span class="brand-icon" aria-hidden="true">ϟ</span><div><strong>Clash 测速工作台</strong><small>Mihomo · Clear Prism Glass</small></div></div>
       <div class="actions"><button id="export">导出 TSV</button><button id="funnel">智能两段优选</button><button id="stress">加压验证 · 20M</button><button id="stop" class="danger">停止</button><button id="start" class="primary">开始测速</button></div>
     </header>
+    <div id="tun-notice" class="tun-notice" role="status" aria-live="polite" hidden>检测到 Clash Verge 已开启 TUN 模式，可能影响测速准确率；建议先手动关闭 TUN，测速结束后再恢复（不阻断本次测速）。</div>
     <section class="overview">
       <article class="champion"><div class="eyebrow">最佳路由 <span>✧</span></div><strong id="best-name">等待测速</strong><div id="best-profile" class="champion-sub">选择订阅源与节点后开始</div><div class="champion-bottom"><div><small>综合评分</small><b id="best-score">—</b></div><div><small>下载速度</small><b id="best-speed">—</b></div><button id="retest-best">复测最优</button><button id="switch-best">切换最优</button></div></article>
       <article class="card sources"><div class="section-head"><div><h2>订阅源矩阵</h2><p>选择要参与测试的订阅</p></div><div><button id="all-profiles" class="quiet">全选</button><button id="clear-profiles" class="quiet">清空</button><button id="refresh" class="quiet">刷新</button></div></div><div id="profiles" class="profile-list"><span class="empty">点击刷新读取本机订阅</span></div><div class="source-foot"><span id="source-summary">尚未加载订阅</span><span id="traffic">预计流量 —</span></div></article>
@@ -36,6 +37,16 @@
     <button id="menu-switch" role="menuitem">切换至此节点</button>
     <button id="menu-retest" role="menuitem">复测此节点</button>
     <button id="menu-copy" role="menuitem">复制节点名称</button>
+  </div>
+  <div id="confirm-dialog" class="confirm-backdrop" role="dialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-message" hidden>
+    <div class="confirm-card card">
+      <h3 id="confirm-title">确认操作</h3>
+      <p id="confirm-message"></p>
+      <div class="confirm-actions">
+        <button id="confirm-cancel" type="button">取消</button>
+        <button id="confirm-accept" type="button" class="primary">确认继续</button>
+      </div>
+    </div>
   </div>
 </body>
 </html>

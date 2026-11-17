@@ -9,7 +9,8 @@ import time
 import win32clipboard
 
 from .batch import Job, MultiBatchRunner
-from .controller import AssistedSwitch, ControllerError, PipeController, SwitchLatch, read_settings
+from .controller import (AssistedSwitch, ControllerError, PipeController, SwitchLatch,
+                         read_settings, read_tun_enabled)
 from .profile_registry import ProfileError, default_root, load_registry, revalidate, snapshot_profile
 from .schedule import TestSchedule
 
@@ -47,6 +48,7 @@ class Desktop:
         self.selected_profiles = set()
         self.groups = []
         self.capture = None
+        self.tun_enabled = None
         self.pending = None
         self.undo = None
         self.status = "请刷新订阅源"
@@ -93,6 +95,7 @@ class Desktop:
             return {"profiles": profiles, "rows": rows, "groups": list(self.groups), "pending": pending,
                     "undo": undo,
                     "funnel_stage": self.funnel_stage,
+                    "tun_enabled": self.tun_enabled,
                     "running": self.running or self.refreshing, "schedule_minutes": schedule_minutes,
                     "schedule_remaining": schedule_remaining, "schedule_active": schedule_active,
                     "status": self.status, "outcome_unknown": self.latch.outcome_unknown}
@@ -122,11 +125,13 @@ class Desktop:
                 if total > 8 * 1024 * 1024 or len(rows) > 2000:
                     raise ProfileError("too many nodes")
             revalidate(registry, snapshots.values())
+            tun_enabled = read_tun_enabled(registry)
             with self.lock:
                 if generation != self.generation or self.closed.is_set():
                     raise ProfileError("cancelled")
                 self.registry, self.snapshots, self.rows = registry, snapshots, rows
                 self.selected_profiles = {p.uid for p in registry.profiles}
+                self.tun_enabled = tun_enabled
                 self.status = f"已加载 {len(registry.profiles)} 个订阅、{len(rows)} 个节点"
                 if pending:
                     uid, node, measurement, old_registry, old_snapshots = pending
@@ -145,6 +150,7 @@ class Desktop:
                 self.registry, self.snapshots, self.rows = None, {}, []
                 self.selected_profiles = set()
                 self.pending = None
+                self.tun_enabled = None
                 self.status = "订阅读取失败：请检查配置格式与文件安全状态"
             return {"ok": False, "error": self.status}
         finally:
@@ -190,6 +196,10 @@ class Desktop:
                 "auto_switch": auto, "group": group}
 
     def refresh_groups(self, preserve_schedule=False):
+        registry = None
+        generation = None
+        tun_updated = False
+        tun_enabled = None
         try:
             with self.lock:
                 if self.running or self.refreshing or not self.registry or self.latch.outcome_unknown:
@@ -201,56 +211,78 @@ class Desktop:
                 snapshot = self.snapshots[current.uid]
                 generation = self.generation
             revalidate(registry, [snapshot])
+            tun_enabled = read_tun_enabled(registry)
+            tun_updated = True
             settings = read_settings(registry)
             controller = PipeController(settings)
             groups = controller.groups(snapshot.names)
             revalidate(registry, [snapshot])
             if read_settings(registry) != settings:
                 raise ControllerError("changed")
+            tun_enabled = read_tun_enabled(registry)
             with self.lock:
                 if generation != self.generation:
                     raise ControllerError("changed")
+                self.tun_enabled = tun_enabled
                 self.capture = (registry, snapshot, settings, controller.identity, tuple(groups))
                 self.groups = [{"name": g.name, "now": g.now} for g in groups]
                 self.status = "策略组已刷新，请选择目标组"
             return {"ok": True}
+        except ProfileError:
+            with self.lock:
+                if self.registry is registry and generation == self.generation:
+                    self.tun_enabled = None
+                self.capture, self.groups = None, []
+                self.status = "无法读取当前订阅的策略组；请确认本地控制器可用"
+            return {"ok": False, "error": self.status}
         except Exception:
             with self.lock:
+                if tun_updated and self.registry is registry and generation == self.generation:
+                    self.tun_enabled = tun_enabled
                 self.capture, self.groups = None, []
                 self.status = "无法读取当前订阅的策略组；请确认本地控制器可用"
             return {"ok": False, "error": self.status}
 
-    def _launch(self, options, token, scheduled):
-        with self.lock:
-            if scheduled and self.schedule.minutes is None:
-                raise ValueError("定时已停止")
-            chosen = [r for r in self.rows if r.selected and r.uid in self.selected_profiles]
-            if not self.registry or not chosen or self.running or self.refreshing or not self.executable.is_file():
-                raise ValueError("请先刷新并选择节点，确认测速程序存在")
-            snapshots = {r.uid: self.snapshots[r.uid] for r in chosen}
-            if sum(len(snapshots[r.uid].data) for r in chosen) > 64 * 1024 * 1024:
-                raise ValueError("所选节点的配置总量超过安全上限")
-            capture = self.capture
-            if options["auto_switch"]:
-                if self.latch.outcome_unknown or not capture or not any(g.name == options["group"] for g in capture[4]):
-                    raise ValueError("请先刷新并选择可用策略组")
-            generation = self.generation
-            streams = 2 if options["mode"] == "fast" else 4
-            latency, download = ("2s", "12s") if streams == 2 else ("5s", "30s")
-            jobs = [Job(row.uid, row.name, snapshots[row.uid].data, options["download_bytes"],
-                        streams, latency, download) for row in chosen]
-            for row in self.rows:
-                row.measurement = None
-                row.state = "等待" if row in chosen else "未勾选"
-            self.running = True
-            self.funnel_stage = 1 if options.get("funnel_top") else None
-            self.pending = None
-            self.status = "测速中"
-            runner = MultiBatchRunner(self.executable, jobs, options["parallel"],
-                       prelaunch=lambda _job: self._prelaunch(generation, snapshots.values()))
-            self.runner = runner
+    def _validate_launch(self, options, scheduled):
+        if scheduled and (self.schedule.minutes is None or self.scheduled_options is not options):
+            raise ValueError("定时已停止")
+        if self.running or self.refreshing or self.closed.is_set():
+            raise ValueError("测速进行中" if options.get("funnel_top") else "已有测速任务进行中")
+        chosen = [r for r in self.rows if r.selected and r.uid in self.selected_profiles]
+        if not self.registry or not chosen or not self.executable.is_file():
+            raise ValueError("请先刷新并选择节点，确认测速程序存在")
+        snapshots = {r.uid: self.snapshots[r.uid] for r in chosen}
+        if sum(len(snapshots[r.uid].data) for r in chosen) > 64 * 1024 * 1024:
+            raise ValueError("所选节点的配置总量超过安全上限")
+        capture = self.capture
+        if options["auto_switch"]:
+            if self.latch.outcome_unknown or not capture or not any(g.name == options["group"] for g in capture[4]):
+                raise ValueError("请先刷新并选择可用策略组")
+        return chosen, snapshots, capture
+
+    def _start_validated_launch(self, options, token, scheduled, chosen, snapshots, capture):
+        generation = self.generation
+        streams = 2 if options["mode"] == "fast" else 4
+        latency, download = ("2s", "12s") if streams == 2 else ("5s", "30s")
+        jobs = [Job(row.uid, row.name, snapshots[row.uid].data, options["download_bytes"],
+                    streams, latency, download) for row in chosen]
+        runner = MultiBatchRunner(self.executable, jobs, options["parallel"],
+                   prelaunch=lambda _job: self._prelaunch(generation, snapshots.values()))
+        for row in self.rows:
+            row.measurement = None
+            row.state = "等待" if row in chosen else "未勾选"
+        self.running = True
+        self.funnel_stage = 1 if options.get("funnel_top") else None
+        self.pending = None
+        self.status = "测速中"
+        self.runner = runner
         threading.Thread(target=self._run, args=(runner, options, capture, snapshots,
                                                  generation, token, scheduled), daemon=True).start()
+
+    def _launch(self, options, token, scheduled):
+        with self.lock:
+            chosen, snapshots, capture = self._validate_launch(options, scheduled)
+            self._start_validated_launch(options, token, scheduled, chosen, snapshots, capture)
 
     def _prelaunch(self, generation, snapshots):
         with self.lock:
@@ -265,16 +297,18 @@ class Desktop:
         try:
             options = self._options(value)
             with self.lock:
+                chosen, snapshots, capture = self._validate_launch(options, False)
+                token = self.schedule.begin_manual()
+                if token is None:
+                    raise ValueError("已有测速任务进行中")
                 if self.schedule.minutes is not None and options != self.scheduled_options:
                     self._invalidate()
-            token = self.schedule.begin_manual()
-            if token is None:
-                raise ValueError("已有测速任务进行中")
-            self._launch(options, token, False)
+                self._start_validated_launch(options, token, False, chosen, snapshots, capture)
             return {"ok": True}
         except (ValueError, KeyError, TypeError) as exc:
             if token is not None:
-                self.schedule.finish(token)
+                with self.lock:
+                    self.schedule.finish(token)
             message = str(exc) if str(exc) and isinstance(exc, ValueError) else "测速参数无效"
             return {"ok": False, "error": message}
 
@@ -288,7 +322,7 @@ class Desktop:
             options = {"parallel": 1, "download_bytes": 20 * 1_048_576, "mode": "accurate",
                        "auto_switch": auto, "group": group}
             with self.lock:
-                if self.running or self.refreshing or self.closed.is_set() or not self.registry:
+                if self.running or self.refreshing or self.schedule.active is not None or self.closed.is_set() or not self.registry:
                     raise ValueError("当前无法开始复测")
                 if uid not in self.selected_profiles or not any(r.uid == uid and r.name == node for r in self.rows):
                     raise ValueError("节点或订阅已变化，请重新选择")
@@ -338,17 +372,17 @@ class Desktop:
             options.update(parallel=10, download_bytes=1_048_576, mode="fast",
                            funnel_top=top_count)
             with self.lock:
-                if self.running or self.refreshing:
-                    raise ValueError("测速进行中")
+                chosen, snapshots, capture = self._validate_launch(options, False)
+                token = self.schedule.begin_manual()
+                if token is None:
+                    raise ValueError("已有测速任务进行中")
                 self._invalidate()
-            token = self.schedule.begin_manual()
-            if token is None:
-                raise ValueError("已有测速任务进行中")
-            self._launch(options, token, False)
+                self._start_validated_launch(options, token, False, chosen, snapshots, capture)
             return {"ok": True}
         except (ValueError, KeyError, TypeError) as exc:
             if token is not None:
-                self.schedule.finish(token)
+                with self.lock:
+                    self.schedule.finish(token)
             message = str(exc) if str(exc) and isinstance(exc, ValueError) else "测速参数无效"
             return {"ok": False, "error": message}
 
@@ -436,7 +470,7 @@ class Desktop:
             with self.lock:
                 self.running, self.runner = False, None
                 self.funnel_stage = None
-            self.schedule.finish(token)
+                self.schedule.finish(token)
 
     def _automatic(self, winner, group_name, capture, generation):
         registry, snapshot, settings, identity, groups = capture
@@ -481,13 +515,14 @@ class Desktop:
     def set_schedule(self, value):
         try:
             minutes = value["minutes"]
-            if minutes == 0:
-                self.schedule.disarm()
-                self.scheduled_options = None
+            if type(minutes) is int and minutes == 0:
+                with self.lock:
+                    self.schedule.disarm()
+                    self.scheduled_options = None
                 return {"ok": True}
             options = self._options(value["options"])
             with self.lock:
-                if self.refreshing or self.running:
+                if self.refreshing or self.running or self.schedule.active is not None or self.closed.is_set():
                     raise ValueError()
                 if not any(r.selected and r.uid in self.selected_profiles for r in self.rows):
                     raise ValueError()
@@ -503,8 +538,10 @@ class Desktop:
     def _timer(self):
         while not self.closed.wait(1):
             with self.lock:
-                state, token = self.schedule.poll(external_busy=self.running)
+                state, token = self.schedule.poll(
+                    external_busy=self.running or self.refreshing or self.closed.is_set())
                 options = self.scheduled_options
+                previous = self.capture
             if state == "started":
                 try:
                     if not options:
@@ -512,20 +549,23 @@ class Desktop:
                     # Refresh the consent-bound controller/group snapshot before
                     # each recurring run; never change the user's chosen group.
                     if options["auto_switch"]:
-                        previous = self.capture
                         if not previous or not self.refresh_groups(preserve_schedule=True)["ok"]:
                             raise ValueError()
-                        current = self.capture
-                        if (current[:4] != previous[:4] or
-                                not any(g.name == options["group"] for g in current[4])):
-                            raise ValueError()
-                    self._launch(options, token, True)
-                except Exception:
-                    self.schedule.finish(token)
-                    self.schedule.disarm()
                     with self.lock:
-                        self.scheduled_options = None
-                        self.status = "定时已停止：配置或授权已变化"
+                        if options["auto_switch"]:
+                            current = self.capture
+                            if (not current or current[:4] != previous[:4] or
+                                    not any(g.name == options["group"] for g in current[4])):
+                                raise ValueError()
+                        chosen, snapshots, capture = self._validate_launch(options, True)
+                        self._start_validated_launch(options, token, True, chosen, snapshots, capture)
+                except Exception:
+                    with self.lock:
+                        self.schedule.finish(token)
+                        if self.scheduled_options is options:
+                            self.schedule.disarm()
+                            self.scheduled_options = None
+                            self.status = "定时已停止：配置或授权已变化"
 
     def switch_manual(self, value):
         try:

@@ -338,6 +338,152 @@ class ControllerTests(unittest.TestCase):
             release.set()
             app.close()
 
+    def test_outcome_unknown_locks_writes_and_refresh_groups_while_allowing_pure_speedtest(self):
+        worker = self.root / "fixture.exe"
+        worker.touch()
+        app = Desktop(worker, root=self.root)
+        runs = []
+
+        class InstantRunner:
+            def __init__(self, _exe, jobs, parallel, **_kwargs):
+                self.jobs = tuple(jobs)
+                self.parallel = parallel
+                self.cancelled = threading.Event()
+                runs.append((parallel, [j.name for j in self.jobs]))
+
+            def run(self, callback):
+                for job in self.jobs:
+                    m = VerifiedMeasurement(job.name, "Synthetic", 6, 6, 10, 0,
+                                            job.download_bytes, job.download_bytes, True, 2_000_000)
+                    callback(job, "ok", m)
+
+            def cancel(self):
+                self.cancelled.set()
+
+        def wait_idle():
+            deadline = time.monotonic() + 3
+            while app.get_state()["running"] and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertFalse(app.get_state()["running"])
+
+        try:
+            self.assertTrue(app.refresh()["ok"])
+            self.assertTrue(app.refresh_groups()["ok"])
+            self.bad_put_status = True
+            switch_res = app.switch_manual({"uid": "uid1", "name": "B", "group": "Test"})
+            self.assertFalse(switch_res["ok"])
+            self.assertTrue(app.get_state()["outcome_unknown"])
+            self.assertEqual(self.puts, 1)
+
+            self.bad_put_status = False
+            self.assertFalse(app.refresh_groups()["ok"])
+            self.assertFalse(app.switch_manual({"uid": "uid1", "name": "B", "group": "Test"})["ok"])
+            self.assertFalse(app.undo_switch()["ok"])
+            self.assertFalse(app.continue_pending({"group": "Test"})["ok"])
+            self.assertFalse(app.set_schedule({
+                "minutes": 15,
+                "options": {"parallel": 2, "download_bytes": 262144, "mode": "fast", "auto_switch": True, "group": "Test"},
+            })["ok"])
+            self.assertFalse(app.start({
+                "parallel": 2, "download_bytes": 262144, "mode": "fast", "auto_switch": True, "group": "Test",
+            })["ok"])
+            self.assertFalse(app.start_funnel({
+                "parallel": 2, "download_bytes": 262144, "mode": "fast", "auto_switch": True, "group": "Test", "top_count": 1,
+            })["ok"])
+            self.assertFalse(app.retest_node({"uid": "uid1", "name": "B", "auto_switch": False, "group": "Test"})["ok"])
+            self.assertEqual(self.puts, 1)
+
+            with patch("Windows.desktop.MultiBatchRunner", InstantRunner):
+                self.assertTrue(app.start({
+                    "parallel": 2, "download_bytes": 262144, "mode": "fast", "auto_switch": False, "group": "",
+                })["ok"])
+                wait_idle()
+                self.assertTrue(app.start_funnel({
+                    "parallel": 2, "download_bytes": 262144, "mode": "fast", "auto_switch": False, "group": "", "top_count": 1,
+                })["ok"])
+                wait_idle()
+                self.assertTrue(app.retest_node({
+                    "uid": "uid1", "name": "B", "auto_switch": False, "group": "",
+                })["ok"])
+                wait_idle()
+            self.assertTrue(app.set_schedule({
+                "minutes": 15,
+                "options": {"parallel": 2, "download_bytes": 262144, "mode": "fast", "auto_switch": False, "group": ""},
+            })["ok"])
+            self.assertEqual(self.puts, 1)
+            self.assertGreaterEqual(len(runs), 4)
+        finally:
+            app.close()
+
+    def test_pending_only_gates_continue_pending_and_clears_on_new_launch(self):
+        worker = self.root / "fixture.exe"
+        worker.touch()
+        registry = self.root / "profiles.yaml"
+        entries = ("items:\n- {uid: uid1, name: Test, type: local, file: test.yaml}\n"
+                   "- {uid: uid2, name: Other, type: local, file: other.yaml}\n")
+        (self.root / "profiles" / "other.yaml").write_text("proxies:\n- {name: other}\n", encoding="utf-8")
+        registry.write_text("current: uid1\n" + entries, encoding="utf-8")
+        app = Desktop(worker, root=self.root)
+
+        class InstantRunner:
+            def __init__(self, _exe, jobs, _parallel, **_kwargs):
+                self.jobs = tuple(jobs)
+                self.cancelled = threading.Event()
+
+            def run(self, callback):
+                for job in self.jobs:
+                    m = VerifiedMeasurement(job.name, "Synthetic", 6, 6, 10, 0,
+                                            job.download_bytes, job.download_bytes, True, 1_000_000)
+                    callback(job, "ok", m)
+
+            def cancel(self):
+                self.cancelled.set()
+
+        try:
+            self.assertTrue(app.refresh()["ok"])
+            measurement = VerifiedMeasurement("other", "Synthetic", 6, 6, 10, 0, 100, 100, True, 200)
+            app.pending = ("uid2", "other", measurement, app.registry, dict(app.snapshots))
+            self.assertFalse(app.get_state()["pending"]["ready"])
+            self.assertTrue(app.refresh_groups()["ok"])
+            self.assertFalse(app.continue_pending({"group": "Test"})["ok"])
+            self.assertEqual(self.puts, 0)
+
+            self.assertTrue(app.switch_manual({"uid": "uid1", "name": "B", "group": "Test"})["ok"])
+            self.assertEqual((self.now, self.puts), ("B", 1))
+            self.assertIsNotNone(app.get_state()["pending"])
+
+            with patch("Windows.desktop.MultiBatchRunner", InstantRunner):
+                self.assertTrue(app.start({
+                    "parallel": 2, "download_bytes": 262144, "mode": "fast", "auto_switch": False, "group": "",
+                })["ok"])
+                deadline = time.monotonic() + 3
+                while app.get_state()["running"] and time.monotonic() < deadline:
+                    time.sleep(.01)
+            self.assertIsNone(app.get_state()["pending"])
+        finally:
+            app.close()
+
+    def test_refresh_groups_preserves_tun_enabled_on_offline_pipe_and_resets_on_profile_error(self):
+        verge_cfg = self.root / "clash-verge.yaml"
+        offline_pipe = r"\\.\pipe\clash-helper-offline-" + uuid.uuid4().hex
+        verge_cfg.write_text(
+            f"external-controller-pipe: '{offline_pipe}'\nsecret: synthetic-secret\ntun:\n  enable: true\n",
+            encoding="utf-8",
+        )
+        app = Desktop(self.root / "not-used.exe", root=self.root)
+        try:
+            self.assertTrue(app.refresh()["ok"])
+            self.assertIs(app.get_state()["tun_enabled"], True)
+            self.assertFalse(app.refresh_groups()["ok"])
+            self.assertIs(app.get_state()["tun_enabled"], True)
+
+            verge_cfg.unlink()
+            verge_cfg.mkdir()
+            self.assertFalse(app.refresh_groups()["ok"])
+            self.assertIsNone(app.get_state()["tun_enabled"])
+        finally:
+            app.close()
+
 
 if __name__ == "__main__":
     unittest.main()

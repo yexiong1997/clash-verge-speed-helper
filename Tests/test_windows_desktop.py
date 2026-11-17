@@ -13,9 +13,10 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 if os.name == "nt":
+    from Windows import run as windows_run
     from Windows.desktop import Desktop
     from Windows.measurement import VerifiedMeasurement
-    from Windows.run import PublicApi
+    from Windows.run import PublicApi, resolve_worker
 
 
 @unittest.skipUnless(os.name == "nt", "Windows desktop implementation")
@@ -60,6 +61,224 @@ class DesktopTests(unittest.TestCase):
         self.assertFalse(hasattr(bridge, "window"))
         self.assertFalse(hasattr(bridge, "registry"))
         self.assertTrue(callable(bridge.get_state))
+        public_names = {name for name in dir(bridge) if not name.startswith("_")}
+        self.assertEqual(public_names, {
+            "get_state", "refresh", "set_selection", "start", "retest_node",
+            "start_funnel", "stop", "refresh_groups", "switch_manual",
+            "undo_switch", "continue_pending", "set_schedule", "export_tsv",
+            "copy_node_name",
+        })
+
+    def test_resolve_worker_and_headless_smoke_do_not_require_webview(self):
+        base = self.root / "bundle"
+        (base / "Windows" / "ui").mkdir(parents=True)
+        (base / "Windows" / "ui" / "index.html").write_text("<!doctype html>", encoding="utf-8")
+        localapp = self.root / "localapp"
+        fallback = localapp / "ClashSpeedHelper" / "verified-worker" / "clash-speedtest.exe"
+        fallback.parent.mkdir(parents=True)
+        fallback.write_bytes(b"fallback")
+        primary = base / "build" / "verified-worker" / "clash-speedtest.exe"
+        override = self.root / "override-worker.exe"
+        override.write_bytes(b"override")
+        frozen_dir = self.root / "frozen"
+        frozen_dir.mkdir()
+        frozen_exe = frozen_dir / "ClashSpeedHelper.exe"
+
+        with patch.dict(os.environ, {"LOCALAPPDATA": str(localapp), "CLASH_SPEED_HELPER_WORKER": ""}, clear=False):
+            self.assertEqual(resolve_worker(base=base, frozen=False), fallback)
+            primary.parent.mkdir(parents=True)
+            primary.write_bytes(b"primary")
+            self.assertEqual(resolve_worker(base=base, frozen=False), primary)
+            with patch.object(sys, "executable", str(frozen_exe)):
+                self.assertEqual(resolve_worker(base=base, frozen=True), frozen_dir / "clash-speedtest.exe")
+
+        with patch.dict(os.environ, {"CLASH_SPEED_HELPER_WORKER": str(override)}, clear=False):
+            self.assertEqual(resolve_worker(base=base, frozen=True), override)
+
+        with patch.dict(sys.modules, {"webview": None}):
+            with patch.dict(os.environ, {"CLASH_SPEED_HELPER_WORKER": str(override)}, clear=False), \
+                 patch.object(windows_run, "Path", wraps=Path), \
+                 patch.object(sys, "argv", ["run.py", "--smoke-test"]):
+                self.assertEqual(windows_run.main(), 0)
+            with patch.dict(os.environ, {"CLASH_SPEED_HELPER_WORKER": str(self.root / "missing.exe")}, clear=False), \
+                 patch.object(sys, "argv", ["run.py", "--smoke-test"]):
+                self.assertEqual(windows_run.main(), 1)
+            with patch.object(sys, "argv", ["run.py", "--profile-root"]):
+                self.assertEqual(windows_run.main(), 2)
+
+    def test_tun_enabled_tristate_pure_memory_read_and_security_reset(self):
+        self.assertIsNone(self.app.get_state()["tun_enabled"])
+        self.assertTrue(self.app.refresh()["ok"])
+        self.assertIsNone(self.app.get_state()["tun_enabled"])
+
+        verge_cfg = self.root / "clash-verge.yaml"
+        verge_cfg.write_text(
+            "external-controller-pipe: '\\\\.\\pipe\\private-pipe-name'\n"
+            "secret: super-secret-controller-token\n"
+            "tun:\n  enable: true\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(self.app.refresh()["ok"])
+        state = self.app.get_state()
+        self.assertIs(state["tun_enabled"], True)
+        self.assertNotIn("super-secret-controller-token", str(state))
+        self.assertNotIn("private-pipe-name", str(state))
+
+        with patch("Windows.desktop.read_tun_enabled", side_effect=AssertionError("disk read during get_state")):
+            self.assertIs(self.app.get_state()["tun_enabled"], True)
+
+        verge_cfg.write_text("tun:\n  enable: false\n", encoding="utf-8")
+        self.assertTrue(self.app.refresh()["ok"])
+        self.assertIs(self.app.get_state()["tun_enabled"], False)
+
+        for non_bool_payload in (
+            "tun:\n  enable: 'true'\n",
+            "tun:\n  enable: 1\n",
+            "tun: [1, 2]\n",
+            "- item1\n- item2\n",
+            "tun: &anchor\n  enable: true\nalias: *anchor\n",
+            "::: invalid yaml :::\n",
+        ):
+            with self.subTest(payload=non_bool_payload):
+                verge_cfg.write_text(non_bool_payload, encoding="utf-8")
+                self.assertTrue(self.app.refresh()["ok"])
+                self.assertIsNone(self.app.get_state()["tun_enabled"])
+
+        verge_cfg.write_text("tun:\n  enable: true\n", encoding="utf-8")
+        self.assertTrue(self.app.refresh()["ok"])
+        self.assertIs(self.app.get_state()["tun_enabled"], True)
+
+        verge_cfg.unlink()
+        verge_cfg.mkdir()
+        failed = self.app.refresh()
+        self.assertFalse(failed["ok"])
+        self.assertIsNone(self.app.get_state()["tun_enabled"])
+        self.assertNotIn(str(verge_cfg), failed["error"])
+
+    def test_rejected_starts_preserve_generation_schedule_undo_and_pending(self):
+        self.assertTrue(self.app.refresh()["ok"])
+        base_opts = {"parallel": 2, "download_bytes": 262144, "mode": "fast", "auto_switch": False, "group": ""}
+        self.assertTrue(self.app.set_schedule({"minutes": 15, "options": base_opts})["ok"])
+        measurement = VerifiedMeasurement("alpha", "Synthetic", 6, 6, 10, 0, 262144, 262144, True, 1_000_000)
+        self.app.undo = ("u1", "alpha", "Proxy", "beta", self.app.registry, self.app.snapshots["u1"], None, None)
+        self.app.pending = ("u1", "beta", measurement, self.app.registry, dict(self.app.snapshots))
+        gen_before = self.app.generation
+
+        other_opts = {"parallel": 4, "download_bytes": 524288, "mode": "fast", "auto_switch": False, "group": ""}
+        self.assertFalse(self.app.start(other_opts)["ok"])
+        self.assertFalse(self.app.start({"parallel": 0, "download_bytes": 262144, "mode": "fast"})["ok"])
+        self.assertFalse(self.app.start_funnel({**other_opts, "top_count": 2})["ok"])
+
+        executable = self.root / "fixture.exe"
+        executable.touch()
+        self.app.executable = executable
+        self.assertFalse(self.app.start({**other_opts, "auto_switch": True, "group": "Missing"})["ok"])
+        self.assertFalse(self.app.start_funnel({**other_opts, "auto_switch": True, "group": "Missing", "top_count": 2})["ok"])
+
+        self.assertEqual(self.app.generation, gen_before)
+        self.assertEqual(self.app.get_state()["schedule_minutes"], 15)
+        self.assertIsNotNone(self.app.get_state()["undo"])
+        self.assertIsNotNone(self.app.get_state()["pending"])
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingRunner:
+            def __init__(self, _exe, jobs, _parallel, **_kwargs):
+                self.jobs = tuple(jobs)
+                self.cancelled = threading.Event()
+
+            def run(self, _callback):
+                entered.set()
+                release.wait(3)
+
+            def cancel(self):
+                self.cancelled.set()
+                release.set()
+
+        with patch("Windows.desktop.MultiBatchRunner", BlockingRunner):
+            self.assertTrue(self.app.start(base_opts)["ok"])
+            self.assertTrue(entered.wait(3))
+            running_gen = self.app.generation
+            self.assertFalse(self.app.start(other_opts)["ok"])
+            self.assertFalse(self.app.start_funnel({**other_opts, "top_count": 1})["ok"])
+            self.assertFalse(self.app.retest_node({"uid": "u1", "name": "alpha", "auto_switch": False, "group": ""})["ok"])
+            self.assertEqual(self.app.generation, running_gen)
+            self.assertEqual(self.app.get_state()["schedule_minutes"], 15)
+            self.assertIsNotNone(self.app.get_state()["undo"])
+            self.assertFalse(self.app.runner.cancelled.is_set())
+            release.set()
+            deadline = time.monotonic() + 3
+            while self.app.get_state()["running"] and time.monotonic() < deadline:
+                time.sleep(.01)
+
+    def test_set_schedule_boolean_rejected_and_concurrent_disarm_is_atomic(self):
+        executable = self.root / "fixture.exe"
+        executable.touch()
+        self.app.executable = executable
+        self.assertTrue(self.app.refresh()["ok"])
+        opts = {"parallel": 2, "download_bytes": 262144, "mode": "fast", "auto_switch": False, "group": ""}
+        self.assertTrue(self.app.set_schedule({"minutes": 15, "options": opts})["ok"])
+        self.assertFalse(self.app.set_schedule({"minutes": False})["ok"])
+        self.assertEqual(self.app.get_state()["schedule_minutes"], 15)
+        self.assertTrue(self.app.set_schedule({"minutes": 0})["ok"])
+        self.assertIsNone(self.app.get_state()["schedule_minutes"])
+        self.assertIsNone(self.app.scheduled_options)
+
+        class InstantRunner:
+            def __init__(self, _exe, jobs, _parallel, **_kwargs):
+                self.jobs = tuple(jobs)
+                self.cancelled = threading.Event()
+
+            def run(self, callback):
+                for job in self.jobs:
+                    m = VerifiedMeasurement(job.name, "Synthetic", 6, 6, 10, 0, job.download_bytes, job.download_bytes, True, 1_000_000)
+                    callback(job, "ok", m)
+
+            def cancel(self):
+                self.cancelled.set()
+
+        with patch("Windows.desktop.MultiBatchRunner", InstantRunner):
+            for _ in range(20):
+                self.assertTrue(self.app.set_schedule({"minutes": 15, "options": opts})["ok"])
+                with self.app.lock:
+                    now = time.monotonic()
+                    self.app.schedule.last = now - 10
+                    self.app.schedule.deadline = now - 1
+                barrier = threading.Barrier(2)
+
+                def poll_once():
+                    barrier.wait()
+                    with self.app.lock:
+                        state, token = self.app.schedule.poll(
+                            external_busy=self.app.running or self.app.refreshing or self.app.closed.is_set()
+                        )
+                        options = self.app.scheduled_options
+                    if state == "started":
+                        try:
+                            if not options:
+                                raise ValueError()
+                            with self.app.lock:
+                                chosen, snapshots, capture = self.app._validate_launch(options, True)
+                                self.app._start_validated_launch(options, token, True, chosen, snapshots, capture)
+                        except Exception:
+                            with self.app.lock:
+                                self.app.schedule.finish(token)
+                                if self.app.scheduled_options is options:
+                                    self.app.schedule.disarm()
+                                    self.app.scheduled_options = None
+
+                t = threading.Thread(target=poll_once)
+                t.start()
+                barrier.wait()
+                self.assertTrue(self.app.set_schedule({"minutes": 0})["ok"])
+                t.join(3)
+                deadline = time.monotonic() + 3
+                while self.app.get_state()["running"] and time.monotonic() < deadline:
+                    time.sleep(.01)
+                self.assertIsNone(self.app.get_state()["schedule_minutes"])
+                self.assertIsNone(self.app.scheduled_options)
+                self.assertIsNone(self.app.schedule.active)
 
     def test_copy_node_name_accepts_only_a_known_catalogue_identity(self):
         self.assertTrue(self.app.refresh()["ok"])
