@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """Synthetic Unix-socket-only tests; never read or contact a live controller."""
+import sys
+if sys.platform == "win32":
+    if __name__ == "__main__": print("SKIP: Unix-socket test; see test_windows_controller.py"); sys.exit(0)
+    import unittest; raise unittest.SkipTest("Unix-socket test; see test_windows_controller.py")
 import json
 import os
 import pathlib

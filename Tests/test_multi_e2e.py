@@ -4,6 +4,10 @@
 Run: python3 -B Tests/test_multi_e2e.py. The app and all descendants are
 sandboxed after mandatory confinement canaries; all test output is sanitized.
 """
+import sys
+if sys.platform == "win32":
+    if __name__ == "__main__": print("SKIP: macOS sandbox integration"); sys.exit(0)
+    import unittest; raise unittest.SkipTest("macOS sandbox integration")
 import hashlib
 import json
 import os

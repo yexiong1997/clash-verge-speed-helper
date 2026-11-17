@@ -1,8 +1,8 @@
 # Clash 节点测速助手
 
-一个面向 macOS 的本地桌面助手：读取 Clash Verge Rev 当前配置或用户选定的 YAML，用 [faceair/clash-speedtest](https://github.com/faceair/clash-speedtest) 逐节点进行**真实下载测速**，展示并复制结果；也可在用户确认后，将指定 Clash 策略组切到测速最快的合格直接成员。启动时会尝试向已安装的官方 Clash Verge Rev 注入运行时桥接，不修改 `.app`、不重新签名、不重装。
+本地桌面助手：读取 Clash Verge Rev 配置，用 [faceair/clash-speedtest](https://github.com/faceair/clash-speedtest) 逐节点进行**真实下载测速**。原单订阅版支持 macOS；多订阅 V4 版另提供 Windows x64 实现。只有用户开启并确认相应操作后才可能切换指定策略组。macOS 版可尝试向官方 Clash Verge 注入运行时桥接；Windows 版不注入该桥接。
 
-> 本页主要描述原来的单订阅版本。独立的多订阅版本（V4 Clear Prism Glass 透明底毛玻璃胶囊界面 + 全量交互动效）支持跨订阅直接勾选节点、一键选择当前列表前 N 项节点、智能两段式漏斗优选（快速初筛自动晋级前 N 名进行 20 MiB 加压复测）、实时动态榜单重排、内联吞吐能量条与延迟分级胶囊、表头点击排序与状态筛选、最优路由卡片一键直切/单节点复测、双击行/右键菜单操作、跨订阅切换就绪自动感知、一键安全切回原节点及应用内定时实时倒计时；其开关默认值、测速组件和切换流程不同。多订阅版本启动时会尝试自动注入官方 Clash Verge 的运行时补丁，具体状态以窗口底部提示为准。请阅读[多订阅版本使用指南](docs/MULTI_SUBSCRIPTION.md)，并以该版本的构建与验证状态为准。
+> 本页主要描述原来的单订阅版本。多订阅版本支持跨订阅勾选测速、Top-N 和两阶段优选；macOS 与 Windows 的切换方式和界面功能并不完全相同。macOS 版尝试通过运行时桥接自动切换订阅；Windows 版需先手动切换订阅并再次确认，不能自动注入或热切换。请阅读[多订阅版本使用指南](docs/MULTI_SUBSCRIPTION.md)，并以对应平台的构建和验证状态为准。
 
 > **开始前请注意（以下为原单订阅版本）**
 >
@@ -11,7 +11,23 @@
 > - 自动切换包含多次检查，但并非原子操作，也不能保证完全安全。不要在关键业务、不可容忍切换或流量消耗的环境中贸然使用。
 > - 本项目的许可证尚未指定；公开查看不自动授予一般性的使用、修改和再分发权限（GitHub 服务条款可能允许查看和 fork）。上游组件的许可另见[第三方说明](docs/THIRD_PARTY.md)。
 
-## 环境与构建
+## Windows 多订阅版
+
+需要 Windows x64、Microsoft Edge WebView2 Runtime、Python 3.12、PowerShell 5.1、Git、`curl.exe`、`tar.exe` 和 GNU `patch.exe`。构建过程联网下载固定版本 Go、上游源码、Go 模块及 Python 依赖；运行打包后的应用不需要安装 Python 或 Go，但仍需要 WebView2 Runtime。工作区及依赖必须可信，切勿跳过校验。
+
+在项目根目录运行（首次构建可能需要数分钟）：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Scripts\build-verified-worker.ps1
+python -B .\Worker\self-test.py "$env:LOCALAPPDATA\ClashSpeedHelper\verified-worker\clash-speedtest.exe"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Scripts\build-multi.ps1
+```
+
+第二个构建脚本打印新生成的 `build\windows-<时间戳>\ClashSpeedHelper\ClashSpeedHelper.exe` 路径；请保留其同目录的 `clash-speedtest.exe` 和 `_internal` 目录。已有其他可信 worker 时可通过 `-WorkerPath <绝对路径>` 指定。Windows 版不是已签名的安装包，也未做所有系统版本兼容性验证。
+
+运行后点击“刷新”加载订阅。默认目录为 `%APPDATA%\io.github.clash-verge-rev.clash-verge-rev`；`CLASH_SPEED_HELPER_ROOT` 环境变量可供测试时指定隔离目录。仅在测速时连接所选节点和 Cloudflare；切换可通过配置中的本地 Named Pipe 或 Windows AF_UNIX socket 与 Bearer secret 进行，默认关闭自动切换。测试仅使用合成节点和模拟控制器，**未验证真实节点测速或对真实控制器写入**。详细的使用、安全边界及测试见[多订阅指南](docs/MULTI_SUBSCRIPTION.md#windows-x64-多订阅版)。
+
+## macOS 原单订阅版：环境与构建
 
 当前构建设计面向 **macOS Apple Silicon（arm64）**。需要 Xcode Command Line Tools（包括 `swiftc`）、系统 AppKit、`/usr/bin/ruby`（带 YAML/JSON 支持）、`/usr/bin/curl`；运行本地测试另需 Python 3，端到端测试还需要 `/usr/bin/sandbox-exec`。自动切换需要正在运行、配置和本机 Unix 控制接口可被当前用户访问的 Clash Verge Rev / 兼容内核；仅测速不要求它正在运行。
 

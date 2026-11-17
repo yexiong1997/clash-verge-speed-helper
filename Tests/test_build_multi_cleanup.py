@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """Exercise the builder's private scratch cleanup with disposable fixtures only."""
+import sys
+if sys.platform == "win32":
+    if __name__ == "__main__": print("SKIP: POSIX builder test"); sys.exit(0)
+    import unittest; raise unittest.SkipTest("POSIX builder test")
 import os
 from pathlib import Path
 import subprocess

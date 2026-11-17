@@ -10,6 +10,10 @@ proxy only inside a deny-by-default sandbox-exec profile. A separate Unix
 socket and denied TCP/Unix/file canaries verify the active sandbox policy
 before the worker is run. All fixture files are private and under build/.
 """
+import sys
+if sys.platform == "win32":
+    if __name__ == "__main__": print("SKIP: macOS sandbox test; see Worker/self-test.py"); sys.exit(0)
+    import unittest; raise unittest.SkipTest("macOS sandbox test; see Worker/self-test.py")
 import base64
 import json
 import math

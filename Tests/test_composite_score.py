@@ -49,6 +49,11 @@ while let line = readLine() {
 class CompositeScoreTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        if sys.platform == "win32":
+            sys.path.insert(0, str(PROJECT))
+            from Windows.measurement import composite_score
+            cls.scorer = staticmethod(composite_score)
+            return
         compiler = shutil.which("swiftc")
         if compiler is None:
             raise RuntimeError("swiftc is required to run the composite score tests")
@@ -73,6 +78,8 @@ class CompositeScoreTests(unittest.TestCase):
 
     def scores(self, rows):
         rows = list(rows)
+        if sys.platform == "win32":
+            return [self.scorer(*row) for row in rows]
         data = "".join(" ".join(repr(float(value)) for value in row) + "\n"
                        for row in rows)
         result = subprocess.run([str(self.executable)], input=data,

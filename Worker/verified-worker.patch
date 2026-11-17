@@ -11,7 +11,7 @@
  	PacketLoss    float64        `json:"packet_loss"`
 --- /dev/null
 +++ b/cmd/verified-worker/main.go
-@@ -0,0 +1,541 @@
+@@ -0,0 +1,524 @@
 +// Verified JSON worker, derived from faceair/clash-speedtest v1.8.6
 +// (GPL-3.0); see the accompanying source patch and provenance notice.
 +package main
@@ -37,7 +37,6 @@
 +	"github.com/metacubex/mihomo/adapter"
 +	"github.com/metacubex/mihomo/constant"
 +	mihomolog "github.com/metacubex/mihomo/log"
-+	"golang.org/x/sys/unix"
 +	"gopkg.in/yaml.v2"
 +)
 +
@@ -85,7 +84,7 @@
 +	fs.DurationVar(&o.latency, "max-latency", 0, "")
 +	fs.BoolVar(&o.rename, "rename", true, "")
 +	fs.BoolVar(&o.json, "json-v1", false, "")
-+	if fs.Parse(os.Args[1:]) != nil || fs.NArg() != 0 || o.config != "/dev/stdin" ||
++	if fs.Parse(os.Args[1:]) != nil || fs.NArg() != 0 || (o.config != "/dev/stdin" && o.config != "-") ||
 +		o.filter == "" || o.server == "" || !o.json || o.rename || o.streams < 1 ||
 +		o.streams > maxStreams || o.size < int64(o.streams) ||
 +		o.size > math.MaxInt64-maxStreams || o.timeout <= 0 || o.latency <= 0 {
@@ -94,37 +93,21 @@
 +	return o, true
 +}
 +
-+// Inherited descriptors are silenced before parsing any private data; only
-+// the explicitly constructed result is written to the saved stdout descriptor.
-+func resultOutput() (*os.File, bool) {
-+	fd, err := unix.Dup(1)
-+	if err != nil {
-+		return nil, false
-+	}
-+	result := os.NewFile(uintptr(fd), "result")
-+	null, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
-+	if err != nil {
-+		result.Close()
-+		return nil, false
-+	}
-+	defer null.Close()
-+	if unix.Dup2(int(null.Fd()), 1) != nil || unix.Dup2(int(null.Fd()), 2) != nil {
-+		result.Close()
-+		return nil, false
-+	}
-+	return result, true
++func main() {
++	os.Exit(execute())
 +}
 +
-+func main() {
-+	out, ok := resultOutput()
++func execute() int {
++	out, _, ok := resultOutput()
 +	if !ok {
-+		os.Exit(1)
++		return 1
 +	}
 +	defer out.Close()
++	// Keep the process handles silenced until exit: background library logs
++	// must never regain the inherited pipes after private input is processed.
++	// The parent process and its standard handles are never modified.
 +	mihomolog.SetLevel(mihomolog.SILENT)
-+	if run(out) != 0 {
-+		os.Exit(1)
-+	}
++	return run(out)
 +}
 +
 +func run(out io.Writer) (status int) {
@@ -554,17 +537,223 @@
 +	return transfer{bytes: n, ok: readErr == nil && n == size && r.N > 0}
 +}
 --- /dev/null
++++ b/cmd/verified-worker/output_unix.go
+@@ -0,0 +1,49 @@
++//go:build darwin || linux
++
++package main
++
++import (
++	"os"
++
++	"golang.org/x/sys/unix"
++)
++
++// Keep a private result descriptor and silence both inherited descriptors
++// before any input is read. Restore both even if only one redirection succeeds.
++func resultOutput() (*os.File, func(), bool) {
++	stdout, err := unix.Dup(1)
++	if err != nil {
++		return nil, nil, false
++	}
++	stderr, err := unix.Dup(2)
++	if err != nil {
++		unix.Close(stdout)
++		return nil, nil, false
++	}
++	result := os.NewFile(uintptr(stdout), "result")
++	null, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
++	if err != nil {
++		result.Close()
++		unix.Close(stderr)
++		return nil, nil, false
++	}
++	if unix.Dup2(int(null.Fd()), 1) != nil {
++		null.Close()
++		result.Close()
++		unix.Close(stderr)
++		return nil, nil, false
++	}
++	if unix.Dup2(int(null.Fd()), 2) != nil {
++		unix.Dup2(stdout, 1)
++		null.Close()
++		result.Close()
++		unix.Close(stderr)
++		return nil, nil, false
++	}
++	null.Close()
++	return result, func() {
++		unix.Dup2(stdout, 1)
++		unix.Dup2(stderr, 2)
++		unix.Close(stderr)
++	}, true
++}
+--- /dev/null
++++ b/cmd/verified-worker/output_windows.go
+@@ -0,0 +1,72 @@
++package main
++
++import (
++	"os"
++
++	"golang.org/x/sys/windows"
++)
++
++// Windows has process standard handles, not Unix descriptors. A duplicated
++// stdout is the only result channel; Go's os.Stdout/os.Stderr and native
++// GetStdHandle users are switched to NUL before private input is read.
++func resultOutput() (*os.File, func(), bool) {
++	process := windows.CurrentProcess()
++	oldOut, oldErr := os.Stdout, os.Stderr
++	duplicate := func(src windows.Handle) (windows.Handle, error) {
++		var dst windows.Handle
++		err := windows.DuplicateHandle(process, src, process, &dst, 0, false, windows.DUPLICATE_SAME_ACCESS)
++		return dst, err
++	}
++	savedOut, err := duplicate(windows.Handle(oldOut.Fd()))
++	if err != nil {
++		return nil, nil, false
++	}
++	savedErr, err := duplicate(windows.Handle(oldErr.Fd()))
++	if err != nil {
++		windows.CloseHandle(savedOut)
++		return nil, nil, false
++	}
++	resultHandle, err := duplicate(savedOut)
++	if err != nil {
++		windows.CloseHandle(savedOut)
++		windows.CloseHandle(savedErr)
++		return nil, nil, false
++	}
++	result := os.NewFile(uintptr(resultHandle), "result")
++	null, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
++	if err != nil {
++		result.Close()
++		windows.CloseHandle(savedOut)
++		windows.CloseHandle(savedErr)
++		return nil, nil, false
++	}
++	if windows.SetStdHandle(windows.STD_OUTPUT_HANDLE, windows.Handle(null.Fd())) != nil {
++		null.Close()
++		result.Close()
++		windows.CloseHandle(savedOut)
++		windows.CloseHandle(savedErr)
++		return nil, nil, false
++	}
++	if windows.SetStdHandle(windows.STD_ERROR_HANDLE, windows.Handle(null.Fd())) != nil {
++		windows.SetStdHandle(windows.STD_OUTPUT_HANDLE, windows.Handle(oldOut.Fd()))
++		null.Close()
++		result.Close()
++		windows.CloseHandle(savedOut)
++		windows.CloseHandle(savedErr)
++		return nil, nil, false
++	}
++	os.Stdout, os.Stderr = null, null
++	// Packages initialized earlier may have retained *os.File references. Closing
++	// them prevents those references from writing to the inherited pipe.
++	oldOut.Close()
++	if oldErr != oldOut {
++		oldErr.Close()
++	}
++	return result, func() {
++		windows.SetStdHandle(windows.STD_OUTPUT_HANDLE, savedOut)
++		windows.SetStdHandle(windows.STD_ERROR_HANDLE, savedErr)
++		os.Stdout = os.NewFile(uintptr(savedOut), "stdout")
++		os.Stderr = os.NewFile(uintptr(savedErr), "stderr")
++		null.Close()
++	}, true
++}
+--- /dev/null
++++ b/cmd/verified-worker/output_windows_test.go
+@@ -0,0 +1,69 @@
++package main
++
++import (
++	"bytes"
++	"os"
++	"os/exec"
++	"testing"
++
++	"golang.org/x/sys/windows"
++)
++
++func TestWindowsResultOutput(t *testing.T) {
++	if os.Getenv("WORKER_OUTPUT_CHILD") == "1" {
++		oldOut, oldErr := os.Stdout, os.Stderr
++		out, restore, ok := resultOutput()
++		if !ok {
++			os.Exit(31)
++		}
++		if _, err := oldOut.WriteString("cached stdout leak"); err == nil {
++			os.Exit(32)
++		}
++		if _, err := oldErr.WriteString("cached stderr leak"); err == nil {
++			os.Exit(33)
++		}
++		os.Stdout.WriteString("Go stdout leak")
++		os.Stderr.WriteString("Go stderr leak")
++		for _, id := range []uint32{windows.STD_OUTPUT_HANDLE, windows.STD_ERROR_HANDLE} {
++			h, err := windows.GetStdHandle(id)
++			if err != nil {
++				os.Exit(34)
++			}
++			var written uint32
++			if windows.WriteFile(h, []byte("native handle leak"), &written, nil) != nil {
++				os.Exit(35)
++			}
++		}
++		if _, err := out.WriteString("result\n"); err != nil {
++			os.Exit(36)
++		}
++		restore()
++		out.Close()
++		os.Stdout.WriteString("restored-out\n")
++		os.Stderr.WriteString("restored-err\n")
++		os.Exit(0)
++	}
++	cmd := exec.Command(os.Args[0], "-test.run=^TestWindowsResultOutput$")
++	cmd.Env = append(os.Environ(), "WORKER_OUTPUT_CHILD=1")
++	var stdout, stderr bytes.Buffer
++	cmd.Stdout, cmd.Stderr = &stdout, &stderr
++	if err := cmd.Run(); err != nil {
++		t.Fatalf("output isolation child failed: %v", err)
++	}
++	if stdout.String() != "result\nrestored-out\n" || stderr.String() != "restored-err\n" {
++		t.Fatal("output isolation or handle restoration failed")
++	}
++}
++
++func TestWindowsEnvironmentIsolation(t *testing.T) {
++	for _, key := range []string{"HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME"} {
++		if os.Getenv(key) != os.DevNull {
++			t.Fatalf("%s was not isolated", key)
++		}
++	}
++	for _, key := range []string{"SAFE_PATHS", "SKIP_SAFE_PATH_CHECK", "SSL_CERT_FILE", "SSL_CERT_DIR"} {
++		if _, ok := os.LookupEnv(key); ok {
++			t.Fatalf("%s was not cleared", key)
++		}
++	}
++}
+--- /dev/null
 +++ b/cmd/verified-worker/safeinit/safeinit.go
-@@ -0,0 +1,15 @@
+@@ -0,0 +1,22 @@
 +// Package safeinit runs before the mihomo packages in Go's package-init order.
 +// A non-directory home prevents mihomo's path initializer from even stat'ing
 +// an existing user's ~/.config/mihomo. No user settings are changed on disk.
 +package safeinit
 +
-+import "os"
++import (
++	"os"
++	"runtime"
++)
 +
 +func init() {
-+	for _, key := range []string{"HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME"} {
++	keys := []string{"HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME"}
++	if runtime.GOOS == "windows" {
++		keys = append(keys, "USERPROFILE", "APPDATA", "LOCALAPPDATA")
++	}
++	for _, key := range keys {
 +		_ = os.Setenv(key, os.DevNull)
 +	}
 +	for _, key := range []string{"SAFE_PATHS", "SKIP_SAFE_PATH_CHECK", "SSL_CERT_FILE", "SSL_CERT_DIR"} {

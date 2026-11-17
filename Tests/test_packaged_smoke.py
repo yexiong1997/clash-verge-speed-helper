@@ -5,6 +5,10 @@ This deliberately does not exercise real subscriptions, proxies, or PUTs.
 The app opens its real window briefly and is then terminated by this test.
 Only a privately staged /private/tmp/*.app is accepted; no installed app is run.
 """
+import sys
+if sys.platform == "win32":
+    if __name__ == "__main__": print("SKIP: macOS packaged-app test"); sys.exit(0)
+    import unittest; raise unittest.SkipTest("macOS packaged-app test")
 import ctypes
 import errno
 import os

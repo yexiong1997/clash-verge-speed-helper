@@ -1,6 +1,35 @@
-# macOS 多订阅测速助手使用指南
+# 多订阅测速助手使用指南
 
-> **验证范围。** 当前脚本标记应用为 **0.1.0（build 1）**，构建目标为 **Apple Silicon（arm64）、macOS 12 或更新版本**；编译目标不代表已在所有 macOS 版本上运行验证。开发验证使用合成订阅、节点和本地模拟控制器；开发者没有使用真实节点测速、切换真实订阅或向真实控制器写入。测试覆盖的场景不代表所有环境都可用，请以具体构建和发布说明为准。
+## Windows x64 多订阅版
+
+Windows 版与下面的 macOS 版分别实现；两者均为本地桌面应用，保留原有 macOS 源码和构建方式。需要 Windows x64、Microsoft Edge WebView2 Runtime；从源码构建还需要 Python 3.12、PowerShell 5.1、Git、`curl.exe`、`tar.exe`、GNU `patch.exe` 和网络。Python、Go 及库在构建时准备，打包后的应用无需系统安装 Python/Go。源码与依赖须来自可信位置；未签名产物的系统安全提示不能通过关闭系统保护来绕过。
+
+从项目根目录运行：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Scripts\build-verified-worker.ps1
+python -B .\Worker\self-test.py "$env:LOCALAPPDATA\ClashSpeedHelper\verified-worker\clash-speedtest.exe"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Scripts\build-multi.ps1
+.\build\windows-env\Scripts\python.exe -B -m unittest discover -s Tests -p 'test_*.py' -v
+```
+
+`build-multi.ps1` 打印新的 `build\windows-<时间戳>\ClashSpeedHelper\ClashSpeedHelper.exe`；整个文件夹是应用，不能只复制 EXE。可用 `-WorkerPath` 指定其他已核验的 Windows worker。worker 构建脚本支持 `-OfflineCache <目录>`，但这不是操作系统级网络隔离；Windows 构建还假定项目及缓存目录可信。构建和运行条件详见 `Scripts/build-verified-worker.ps1` 与 [worker 契约](../Worker/CONTRACT.md)。
+
+首次打开点击“刷新”，再勾选订阅和节点。默认读取 `%APPDATA%\io.github.clash-verge-rev.clash-verge-rev`；测试可用 `CLASH_SPEED_HELPER_ROOT` 或命令行 `--profile-root <隔离目录>` 覆盖。只读取直接 `proxies`，拒绝 YAML 重复键、别名、显式标签、提供者以及不安全路径；拒绝重解析点并检查文件身份与快照。Windows 版当前最多加载 32 个订阅、总计 2000 个节点；某个登记的订阅不符合要求时整次刷新会失败。
+
+开始或“加压验证 · 20M”会发起真实测速并消耗流量；20M 按每个已勾选节点、全局并发 2、精确模式执行。“智能两段优选”先按每节点 1 MiB、最多 10 个节点并发初筛，再将可评分前 N（最多 10）名按每节点 20 MiB、并发 2、4 流复测；停止或校验失败时不进入下一阶段。流量估计不是上限。搜索及状态筛选只过滤显示；表头可排序，“勾选”按当前可见顺序选择前 N 项并取消其他勾选。节点右键菜单可切换、复测或复制名称；也可聚焦行内复选框后用菜单键或 Shift+F10 打开。定时需手动启用、应用保持运行，界面显示下次运行倒计时，改变节点、参数或授权会解除；不会在启动后自动恢复。
+
+自动切换默认关闭。刷新策略组后，Windows 版从 `clash-verge.yaml` 取得 `secret` 及本机控制器：可选 `external-controller-pipe`（Named Pipe）或 `external-controller-unix`（Windows AF_UNIX），携带 Bearer 认证发送 HTTP；两项同时非空时拒绝猜测，不降级到 TCP，不输出 secret。Named Pipe 要求服务端进程属于当前用户且进程身份不变；AF_UNIX 要求系统支持该功能、路径为本机盘符绝对路径且 UTF-8 不超过 107 字节、父目录没有重解析点，socket 对象必须是当前用户拥有的 AF_UNIX 专用重解析点，且连接前、发送前和响应后的文件身份一致。其他重解析点不作为 socket 接受。
+
+只有当前订阅和直接 `Selector` 成员可参与切换；写前重新核对配置快照、组当前选择及授权，HTTP 204 后必须再次 GET 验证。若 PUT 结果未知，整个应用会话锁定切换且不自动重试；请先在 Clash 中人工核验实际状态。Windows 允许 AF_UNIX 文件在句柄仍打开时被重命名，故这些检查只能降低替换风险，**不是原子比较并交换**，仍有并发竞态；同一用户身份和文件检查也不能证明进程来源可信。切换停止后无法撤回已发请求。
+
+最高分来自非当前订阅时，助手不会代替用户切换订阅。需要继续时，先在 Clash Verge 手动切换到该订阅，在助手点击“刷新”并刷新策略组，然后明确点击“继续应用最优”并确认；订阅文件、身份或配置列表变动时不会保留该候选。Windows 暂不支持 macOS 的自动运行时注入和跨订阅热切换，也不运行 macOS 安装清理脚本。复测时如已选择策略组或开启自动切换，会重新核验原控制器及策略组；发生变化时不启动复测。已确认成功的当前订阅直接节点切换可尝试“切回原节点”；再次写入前会重新核对订阅、控制器、组当前选择和直接成员，条件变化或结果未知时不会盲目重试。Windows UI 不含 macOS 全部动画。
+
+Windows 测试使用合成 YAML、回环地址、模拟 Named Pipe 与 AF_UNIX socket 和合成子进程，不读取真实配置或写入真实控制器。旧有 macOS/Unix 专用测试在 Windows 上明确跳过，并不因此代表已经通过 macOS 测试；Windows 专属覆盖见 `Tests/test_windows_*.py`。Windows 上无法创建符号链接时相应用例跳过，目录联接（junction）检查仍单独测试；系统不支持 AF_UNIX 时相关合成测试会跳过。Worker 自测在缺少已验证的 Windows 网络沙箱时跳过若干禁止联网用例，不能视为沙箱验证。
+
+## 以下为 macOS 版说明
+
+> **以下为 macOS 版说明。** 当前脚本标记应用为 **0.1.0（build 1）**，构建目标为 **Apple Silicon（arm64）、macOS 12 或更新版本**；编译目标不代表已在所有 macOS 版本上运行验证。开发验证使用合成订阅、节点和本地模拟控制器；开发者没有使用真实节点测速、切换真实订阅或向真实控制器写入。测试覆盖的场景不代表所有环境都可用，请以具体构建和发布说明为准。
 >
 > 当前 worker 不支持 SSH、WireGuard 节点或使用自定义 `headers` 的 HTTP 节点；具体限制见 [worker 契约](../Worker/CONTRACT.md)。应用不是不可信订阅的网络沙箱，不保证阻止对局域网或其他内部地址的连接；请仅在信任订阅、了解流量费用及切换风险后使用。
 

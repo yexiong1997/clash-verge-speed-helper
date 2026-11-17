@@ -1,0 +1,455 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Clash 节点测速助手 · 5 岁小孩也能看懂的使用说明</title>
+  <style>
+    :root {
+      --bg: radial-gradient(circle at 9% 5%, #cbd2fd99, transparent 36%),
+            radial-gradient(circle at 92% 10%, #b9f0f477, transparent 34%),
+            linear-gradient(125deg, #f5f7fb, #eef2f9 55%, #e6ecf7);
+      --ink: #222d44;
+      --muted: #5d6b86;
+      --card: linear-gradient(145deg, #ffffffd6, #ffffff94);
+      --border: #ffffffeb;
+      --line: #dfe6f4;
+      --primary: #5e70f0;
+      --primary-deep: #4657d6;
+      --good-bg: #eafaf3;
+      --good-ink: #176b4c;
+      --warn-bg: #fff5e8;
+      --warn-ink: #8c4b0c;
+      --danger-bg: #fdecef;
+      --danger-ink: #a12334;
+      --shadow: 0 12px 30px #0f172a0f, inset 0 1px #ffffffc9;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei UI", sans-serif;
+      color: var(--ink);
+      background: var(--bg);
+      line-height: 1.68;
+      padding: 28px 18px 64px;
+    }
+    .wrap { max-width: 980px; margin: 0 auto; display: flex; flex-direction: column; gap: 22px; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      box-shadow: var(--shadow);
+      padding: 24px 26px;
+      backdrop-filter: blur(12px);
+    }
+    .hero {
+      display: grid;
+      grid-template-columns: 1.25fr 0.95fr;
+      gap: 20px;
+      align-items: stretch;
+    }
+    .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+    .brand-icon {
+      width: 40px; height: 40px; border-radius: 12px;
+      display: grid; place-items: center;
+      background: linear-gradient(145deg, #8492fd, #5d70ed);
+      color: #fff; font-size: 24px; font-weight: 700;
+    }
+    .tag {
+      display: inline-block; font-size: 12px; font-weight: 600;
+      padding: 3px 10px; border-radius: 999px;
+      background: #edf0ff; color: #4357ca; border: 1px solid #cdd6ff;
+    }
+    h1 { margin: 6px 0 10px; font-size: 28px; line-height: 1.28; }
+    h2 { margin: 0 0 12px; font-size: 20px; display: flex; align-items: center; gap: 8px; }
+    h3 { margin: 0 0 8px; font-size: 16px; }
+    p { margin: 0 0 10px; color: var(--muted); }
+    .lead { font-size: 16px; color: #2f3c57; }
+    .champion {
+      border-radius: 18px;
+      padding: 22px;
+      color: #fff;
+      background: radial-gradient(circle at 90% 5%, #6170da88, transparent 44%),
+                  linear-gradient(145deg, #222535, #12141c);
+      box-shadow: 0 14px 30px #161b3233;
+      display: flex; flex-direction: column; justify-content: space-between;
+    }
+    .champion .eyebrow { font-size: 12px; color: #b6c0e3; letter-spacing: .06em; }
+    .champion .big { font-size: 20px; font-weight: 700; margin: 10px 0 6px; }
+    .champion ul { margin: 8px 0 0; padding-left: 18px; color: #cfd7ee; font-size: 13.5px; }
+    .champion li { margin: 4px 0; }
+    .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    .grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+    .box {
+      border-radius: 14px; padding: 16px 18px;
+      border: 1px solid var(--line); background: #ffffffb8;
+    }
+    .box.good { background: var(--good-bg); border-color: #bfead8; color: var(--good-ink); }
+    .box.warn { background: var(--warn-bg); border-color: #f6dcb8; color: var(--warn-ink); }
+    .box.danger { background: var(--danger-bg); border-color: #f4c6ce; color: var(--danger-ink); }
+    .box p, .box li { color: inherit; font-size: 14px; }
+    .box ul { margin: 6px 0 0; padding-left: 18px; }
+    .step-num {
+      display: inline-grid; place-items: center;
+      width: 28px; height: 28px; border-radius: 50%;
+      background: var(--primary); color: #fff; font-weight: 700; font-size: 14px;
+      margin-bottom: 10px;
+    }
+    .kbd {
+      display: inline-block; padding: 1px 8px; border-radius: 7px;
+      background: #edf0ff; border: 1px solid #cbd5ff; color: #3647b8;
+      font-weight: 600; font-size: 13px; white-space: nowrap;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { text-align: left; padding: 11px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+    th { color: #52607d; font-weight: 700; background: #f3f6fc; }
+    tr:last-child td { border-bottom: none; }
+    .badge {
+      display: inline-block; font-size: 11.5px; padding: 2px 8px; border-radius: 999px; font-weight: 600;
+    }
+    .b-free { background: #e8f7ef; color: #196b4d; }
+    .b-cost { background: #fff3df; color: #92520b; }
+    .b-switch { background: #eef0ff; color: #4357ca; }
+    .tabs { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
+    .tab-btn {
+      border: 1px solid #cfd8ed; background: #ffffffba; color: #455472;
+      padding: 7px 14px; border-radius: 999px; font-weight: 600; cursor: pointer; font-size: 13.5px;
+    }
+    .tab-btn.active { background: var(--primary); color: #fff; border-color: var(--primary); }
+    .tab-panel[hidden] { display: none; }
+    .sim {
+      display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px;
+      background: #f5f7fd; border: 1px solid #dce3f5; border-radius: 14px; padding: 14px 16px; margin-top: 10px;
+    }
+    .sim label { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; color: var(--muted); font-weight: 600; }
+    .sim select, .sim input {
+      padding: 7px 10px; border-radius: 9px; border: 1px solid #ccd5eb; background: #fff; font: inherit; color: var(--ink);
+    }
+    .sim-out {
+      margin-top: 12px; padding: 12px 14px; border-radius: 12px;
+      background: #edf1ff; color: #2b3868; font-size: 14px;
+    }
+    details {
+      border: 1px solid var(--line); border-radius: 14px; background: #ffffffc7;
+      padding: 12px 16px; margin-top: 10px;
+    }
+    summary { cursor: pointer; font-weight: 700; color: #2d3b59; list-style: none; display: flex; justify-content: space-between; align-items: center; }
+    summary::after { content: "展开 ▾"; font-size: 12.5px; color: var(--primary); }
+    details[open] summary::after { content: "收起 ▴"; }
+    details .inner { margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--line); font-size: 13.5px; color: var(--muted); }
+    pre {
+      margin: 8px 0 0; padding: 12px 14px; border-radius: 10px;
+      background: #1a2030; color: #e6ecff; overflow-x: auto; font-size: 12.5px; line-height: 1.5;
+    }
+    @media (max-width: 820px) {
+      .hero, .grid-2, .grid-3, .sim { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="card hero">
+      <div>
+        <div class="brand">
+          <span class="brand-icon" aria-hidden="true">ϟ</span>
+          <div><span class="tag">ELI5 极简使用说明 · Windows &amp; macOS</span></div>
+        </div>
+        <h1>Clash 节点测速助手：30 秒看懂它是干嘛的</h1>
+        <p class="lead">
+          平时找节点就像逛菜市场挑西瓜，光看名字（“高速/低延迟”）根本不知道哪个真甜。
+          这个助手就像帮你请了个<strong>“跑腿试吃员”</strong>：你不用自己一个个切节点打开网页试，它会同时派出几个小分队，拿着小本子去 Cloudflare 真实下载一小块文件，测完直接给你排出 <strong>0–100 分的红黑榜</strong>。
+        </p>
+        <p style="font-size:13.5px;margin-bottom:0">
+          核心原则：<strong>只读你本机 Clash Verge 的订阅，绝不篡改软件本身；你不点开始，它一丁点流量都不会跑。</strong>
+        </p>
+      </div>
+      <aside class="champion">
+        <div>
+          <div class="eyebrow">✧ 一句话记住它的脾气</div>
+          <div class="big">先用“真实下载”排榜<br>再按“你的允许”切换</div>
+          <ul>
+            <li><strong>不是</strong>测个 Ping 值就完事：它会算速度 + 延迟 + 失败率 + 抖动。</li>
+            <li><strong>不会</strong>偷偷切节点：自动切换默认<strong>关闭</strong>。</li>
+            <li><strong>不是</strong>免费白嫖测速：真实下载会扣你的节点流量。</li>
+          </ul>
+        </div>
+        <div style="font-size:12px;color:#9aa7c9;margin-top:14px">适用：Windows x64 多订阅工作台 / macOS 版</div>
+      </aside>
+    </section>
+
+    <section class="grid-2">
+      <div class="box good">
+        <h3>✅ 它能帮你省哪些事？</h3>
+        <ul>
+          <li>把多个订阅里的几百上千个节点放进一张表里同台 PK。</li>
+          <li>用 <strong>“智能两段优选”</strong> 先小流量海选、再大流量复测前几名，省钱又省时间。</li>
+          <li>觉得哪个最稳，一键切到你指定的 Clash 策略组里（切错了还能点 <span class="kbd">切回原节点</span>）。</li>
+        </ul>
+      </div>
+      <div class="box warn">
+        <h3>⚠️ 它故意不替你做什么？</h3>
+        <ul>
+          <li><strong>不碰陌生订阅黑盒</strong>：只认规范的内联 <code>proxies</code>，带复杂 <code>proxy-providers</code> 的会直接拒测，防踩坑。</li>
+          <li><strong>不当流量保镖</strong>：预计流量只是下载正文估算，实际扣费可能更高，按量计费套餐请悠着点测。</li>
+          <li><strong>不做无声自动后台</strong>：定时测速只在窗口开着时工作，关掉程序就自动失效。</li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>🚀 第一次用：照这 3 步闭眼跑通</h2>
+      <div class="grid-3">
+        <div class="box">
+          <div class="step-num">1</div>
+          <h3>把节点拉进名单</h3>
+          <p>打开工作台，点订阅区右上角的 <span class="kbd">刷新</span>，勾上你想测的订阅（会默认全选里面的节点）。</p>
+          <p style="font-size:13px">节点太多怕费流量？用表格上方的 <span class="kbd">搜索</span> 或输入“前 10”点 <span class="kbd">勾选</span>，只留下要测的。</p>
+        </div>
+        <div class="box">
+          <div class="step-num">2</div>
+          <h3>选最省心的“两段优选”</h3>
+          <p>新手别纠结参数，直接点顶栏的 <span class="kbd">智能两段优选</span>（确认弹窗会告诉你大概耗多少流量）。</p>
+          <p style="font-size:13px">它会先用 <strong>1 MiB</strong> 给所有人摸底海选，再挑出前 10 名用 <strong>20 MiB</strong> 认真复测一遍。</p>
+        </div>
+        <div class="box">
+          <div class="step-num">3</div>
+          <h3>看榜换线，不满意可退</h3>
+          <p>跑完后，左上角黑卡 <strong>“最佳路由”</strong> 会亮出第一名。</p>
+          <p style="font-size:13px">先在底栏点 <span class="kbd">刷新策略组</span> 选好要改的组，再点 <span class="kbd">切换最优</span>。想反悔点 <span class="kbd">切回原节点</span> 即可。</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>🧭 界面上这么多按钮，分别什么意思？</h2>
+      <p>怕点错扣流量或切乱网络？看下面这三类标记就够了：</p>
+      <table>
+        <thead>
+          <tr>
+            <th style="width:22%">按钮 / 选项</th>
+            <th style="width:14%">动作性质</th>
+            <th>5 岁小孩也能懂的解释</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><span class="kbd">刷新</span> / <span class="kbd">刷新策略组</span></td>
+            <td><span class="badge b-free">零流量</span></td>
+            <td>只看一眼你电脑里 Clash Verge 现在有哪些订阅和策略组，<strong>不会联网测速</strong>。</td>
+          </tr>
+          <tr>
+            <td><span class="kbd">开始测速</span></td>
+            <td><span class="badge b-cost">消耗流量</span></td>
+            <td>按下面参数条选好的“并发数 / 每节点多少 MiB / 模式”，对所有打勾的节点跑一遍。</td>
+          </tr>
+          <tr>
+            <td><span class="kbd">智能两段优选</span></td>
+            <td><span class="badge b-cost">消耗流量</span></td>
+            <td><strong>最推荐</strong>：先派 10 个兵用 1 MiB 粗测，再挑前 N 名（最多 10 个）用 20 MiB 精测，省流量又准。</td>
+          </tr>
+          <tr>
+            <td><span class="kbd">加压验证 · 20M</span></td>
+            <td><span class="badge b-cost">较耗流量</span></td>
+            <td>严考模式：对<strong>每一个打勾的节点</strong>都下载 20 MiB（2 个节点并行、4 条线程）。节点多时小心流量！</td>
+          </tr>
+          <tr>
+            <td><span class="kbd">并发</span> 与 <span class="kbd">模式(快速/精确)</span></td>
+            <td><span class="badge b-free">参数设定</span></td>
+            <td><strong>并发</strong> = 同时派几个人出去跑；<strong>快速(2流)/精确(4流)</strong> = 每个人同时用几根吸管喝水。<strong>注意：同时喝水的吸管总数 = 并发 × 流数</strong>，开太大节点会互相抢带宽，测不准！</td>
+          </tr>
+          <tr>
+            <td><span class="kbd">启用定时</span></td>
+            <td><span class="badge b-cost">周期耗流量</span></td>
+            <td>软件开着的时候每隔 N 分钟自动跑一次。如果同时打开了“自动切换最高分”，每轮跑完会自己帮你换最快节点。</td>
+          </tr>
+          <tr>
+            <td><span class="kbd">切换最优</span> / <span class="kbd">切换选中节点</span></td>
+            <td><span class="badge b-switch">改动策略组</span></td>
+            <td>把底栏选中的 Clash 策略组切到指定节点。<strong>不会自己换订阅</strong>；想恢复原样点旁边的 <span class="kbd">切回原节点</span>。</td>
+          </tr>
+          <tr>
+            <td>表格行 <span class="kbd">右键菜单</span></td>
+            <td><span class="badge b-free">快捷操作</span></td>
+            <td>在某一行节点上点鼠标右键（或按 Shift+F10），可以单独对这一个节点「复测 20M」「直接切换」或「复制名字」。</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div style="margin-top:18px">
+        <h3>🧮 测速压力与流量小算盘（不花真流量，先感受一下）</h3>
+        <div class="sim">
+          <label>勾选了几个节点
+            <input id="sim-nodes" type="number" min="1" max="500" value="15">
+          </label>
+          <label>每个节点测多少
+            <select id="sim-size">
+              <option value="1">1 MiB</option>
+              <option value="3" selected>3 MiB（默认）</option>
+              <option value="5">5 MiB</option>
+              <option value="20">20 MiB（复测）</option>
+            </select>
+          </label>
+          <label>并发几个节点
+            <select id="sim-par">
+              <option value="1">1（最准不抢网）</option>
+              <option value="2">2</option>
+              <option value="4" selected>4</option>
+              <option value="10">10（最快）</option>
+            </select>
+          </label>
+          <label>单节点模式
+            <select id="sim-streams">
+              <option value="2" selected>快速（2 流）</option>
+              <option value="4">精确（4 流）</option>
+            </select>
+          </label>
+        </div>
+        <div class="sim-out" id="sim-result"></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>💻 Windows 版和 macOS 版有什么不一样？</h2>
+      <div class="tabs" role="tablist">
+        <button class="tab-btn active" data-tab="win" role="tab" aria-selected="true">Windows x64 多订阅版</button>
+        <button class="tab-btn" data-tab="mac" role="tab" aria-selected="false">macOS 版（单订阅 / 多订阅）</button>
+      </div>
+      <div id="tab-win" class="tab-panel">
+        <div class="grid-2">
+          <div class="box">
+            <h3>能直接做到的</h3>
+            <ul>
+              <li>同时加载最多 32 个订阅、2000 个节点做横向对比。</li>
+              <li>通过本机安全管道（Named Pipe 或 AF_UNIX）读取和切换<strong>当前正在使用的那份订阅</strong>里的策略组。</li>
+              <li>支持 <span class="kbd">切回原节点</span>（针对刚刚确认成功的直接切换）。</li>
+            </ul>
+          </div>
+          <div class="box warn">
+            <h3>跨订阅第一名时的操作（重要）</h3>
+            <p>Windows 版<strong>不会偷偷替你换 Clash Verge 里的订阅</strong>。</p>
+            <p>如果最高分来自另一个订阅：请先打开 Clash Verge 手动切到那份订阅 → 回到助手点 <span class="kbd">刷新</span> 和 <span class="kbd">刷新策略组</span> → 再点底栏亮起来的 <span class="kbd">继续应用最优</span>。</p>
+          </div>
+        </div>
+      </div>
+      <div id="tab-mac" class="tab-panel" hidden>
+        <div class="grid-2">
+          <div class="box">
+            <h3>macOS 专属能力</h3>
+            <ul>
+              <li><strong>运行时桥接</strong>：授予辅助功能权限后，可直接调起官方 Clash Verge 的内部接口，最高分在其他订阅时能尝试自动帮你跨订阅切换并应用。</li>
+              <li>仅修改运行时内存，不改动官方 <code>Clash Verge.app</code> 文件或签名。</li>
+            </ul>
+          </div>
+          <div class="box warn">
+            <h3>macOS 版注意事项</h3>
+            <ul>
+              <li>当前构建面向 Apple Silicon（arm64）macOS 12+，使用本地 ad-hoc 签名。</li>
+              <li>自动切换通过本机唯一确定的 Unix socket 进行，不需要把外部控制器开到公网。</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>🛟 遇到这几个状况先别慌（人话排错）</h2>
+      <div class="grid-2">
+        <div class="box">
+          <h3>1. 刷新后找不到某个订阅，或整次刷新失败？</h3>
+          <p><strong>原因：</strong>为了不触发隐藏联网或读错配置，助手只认老老实实把节点写在 <code>proxies</code> 列表里的配置。</p>
+          <p><strong>怎么办：</strong>如果订阅里用了 <code>proxy-providers</code>、<code>rule-providers</code>、重名节点或特殊别名，请先在订阅侧转成展开的普通 YAML 再刷新。</p>
+        </div>
+        <div class="box">
+          <h3>2. 提示“切换结果未知”且切换按钮全变灰锁死？</h3>
+          <p><strong>原因：</strong>切换指令发出去了，但没等到确定回执（可能成功了也可能中途断了）。助手为了防止你连点把网络切乱，主动把切换功能锁住。</p>
+          <p><strong>怎么办：</strong><strong>千万别反复重试</strong>，直接打开 Clash Verge 看一眼当前策略组到底在哪个节点上。</p>
+        </div>
+        <div class="box">
+          <h3>3. 为什么测出来的速度和我平时看视频体感不一致？</h3>
+          <p><strong>原因：</strong>一是因为开了 <strong>TUN 模式</strong>可能让测速流量被二次路由；二是因为只测了连到 Cloudflare 的下载，不代表所有网站（或上传）一样快；三是并发太高互相抢网。</p>
+          <p><strong>怎么办：</strong>想测准一点，可暂时手动关掉 Clash TUN、把并发设为 <strong>1</strong>、模式选 <strong>精确</strong> 再重测。</p>
+        </div>
+        <div class="box danger">
+          <h3>4. 切节点后发现原来“自动选择/测速组”没了？</h3>
+          <p><strong>原因：</strong>助手切的是具体某个节点名字。如果策略组原本选的是“自动选择”子策略组，切换后会变成固定节点。</p>
+          <p><strong>怎么办：</strong>点 <span class="kbd">切回原节点</span>（Windows），或直接在 Clash Verge 里把策略组手动点回原来的“自动选择”即可。</p>
+        </div>
+      </div>
+
+      <h2 style="margin-top:22px">🔧 进阶原理与硬性安全边界（按需展开）</h2>
+
+      <details>
+        <summary>综合分（0–100）到底是怎么算出来的？</summary>
+        <div class="inner">
+          <p>只有同时满足“完成 6 次 HTTP HEAD 请求且至少 3 次拿到 2xx 响应 + 下载正文完整达到目标字节数”，节点才算有效并参与算分。公式如下（<code>S</code>=MiB/s，<code>L</code>=延迟 ms，<code>F</code>=HEAD 失败率 %，<code>J</code>=抖动 ms）：</p>
+          <pre>综合分 = 40 × min(1, ln(1 + S) / ln(26))   # 速度权重 40 分（25 MiB/s 拿满）
+       + 30 × clamp(1 - L / 500, 0, 1)      # 延迟权重 30 分（500 ms 及以上归 0）
+       + 20 × clamp(1 - F / 100, 0, 1)      # 稳定性权重 20 分（6 次 HEAD 成功率）
+       + 10 × clamp(1 - J / 100, 0, 1)      # 抖动权重 10 分（100 ms 及以上归 0）</pre>
+        </div>
+      </details>
+
+      <details>
+        <summary>流量估算、非原子切换与隐私边界</summary>
+        <div class="inner">
+          <ul>
+            <li><strong>流量不是硬上限：</strong>界面显示的预计 MiB 只算“节点数 × 单节点下载目标字节数”，不含 6 次 HEAD 探测、TLS 握手、重传或代理协议额外开销；若服务器/节点异常，实际流量可能明显更高。</li>
+            <li><strong>非原子切换风险：</strong>写前/写后会核对配置快照、控制器身份和策略组当前选择，但本质上不是原子 CAS 操作，其他客户端同时改动仍可能覆盖结果；请以 Clash Verge 界面最终状态为准。</li>
+            <li><strong>本地隐私：</strong>测速时节点名称会作为过滤参数传给本机 <code>clash-speedtest</code> 子进程命令行（本机有权限查看进程列表的程序可见）；分享截图或导出的 TSV 前注意脱敏。</li>
+          </ul>
+        </div>
+      </details>
+
+      <details>
+        <summary>开发者：Windows / macOS 本地构建与自测命令</summary>
+        <div class="inner">
+          <p><strong>Windows x64 多订阅版构建与验证：</strong></p>
+          <pre>powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Scripts\build-verified-worker.ps1
+python -B .\Worker\self-test.py "$env:LOCALAPPDATA\ClashSpeedHelper\verified-worker\clash-speedtest.exe"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Scripts\build-multi.ps1
+.\build\windows-env\Scripts\python.exe -B -m unittest discover -s Tests -p 'test_*.py' -v</pre>
+          <p style="margin-top:10px"><strong>macOS 多订阅版安装：</strong></p>
+          <pre>/bin/bash Scripts/install-multi.sh</pre>
+        </div>
+      </details>
+    </section>
+  </main>
+
+  <script>
+    const nodes = document.getElementById("sim-nodes");
+    const size = document.getElementById("sim-size");
+    const par = document.getElementById("sim-par");
+    const streams = document.getElementById("sim-streams");
+    const out = document.getElementById("sim-result");
+
+    function updateSim() {
+      const n = Math.max(1, Math.min(500, Number(nodes.value) || 1));
+      const mb = Number(size.value);
+      const p = Number(par.value);
+      const s = Number(streams.value);
+      const total = n * mb;
+      const pipes = p * s;
+      let tip = "压力适中，适合日常排榜。";
+      if (pipes >= 20) tip = "⚠️ 同时有 " + pipes + " 条下载流在抢你家宽带，排序容易失真，建议调低并发或改用「智能两段优选」。";
+      else if (p === 1) tip = "✅ 单节点依次跑最不互相抢网，测出来的结果最接近真实上限，只是耗时久一点。";
+      out.innerHTML =
+        "预计纯下载正文约 <strong>" + total + " MiB</strong>（含额外握手/探测开销实际会略高），最多同时开启 <strong>" +
+        pipes + " 条下载连接</strong>（" + p + " 个节点 × " + s + " 流）。<br>" + tip;
+    }
+    [nodes, size, par, streams].forEach(el => el.addEventListener("input", updateSim));
+    updateSim();
+
+    document.querySelectorAll(".tab-btn").forEach(btn => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll(".tab-btn").forEach(b => {
+          b.classList.toggle("active", b === btn);
+          b.setAttribute("aria-selected", String(b === btn));
+        });
+        document.getElementById("tab-win").hidden = btn.dataset.tab !== "win";
+        document.getElementById("tab-mac").hidden = btn.dataset.tab !== "mac";
+      });
+    });
+  </script>
+</body>
+</html>
+

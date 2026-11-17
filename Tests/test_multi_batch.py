@@ -6,6 +6,10 @@ The compiler cache, synthetic Swift driver, fake worker, fixtures and event log
 are all under one temporary directory. The fake worker never uses networking.
 JSON snapshots are also valid YAML 1.2, and contain only synthetic data.
 """
+import sys
+if sys.platform == "win32":
+    if __name__ == "__main__": print("SKIP: POSIX Swift runner test"); sys.exit(0)
+    import unittest; raise unittest.SkipTest("POSIX Swift runner test")
 import base64
 import json
 import os

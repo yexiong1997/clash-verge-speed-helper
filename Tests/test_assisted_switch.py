@@ -4,6 +4,10 @@
 Run on macOS: python3 -B Tests/test_assisted_switch.py
 No user profile, real controller, remote server, or user node traffic is used.
 """
+import sys
+if sys.platform == "win32":
+    if __name__ == "__main__": print("SKIP: macOS Swift test; see test_windows_controller.py"); sys.exit(0)
+    import unittest; raise unittest.SkipTest("macOS Swift test; see test_windows_controller.py")
 import base64
 import hashlib
 import json
