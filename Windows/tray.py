@@ -20,6 +20,7 @@ def build_tray_menu_model(snapshot: dict) -> dict:
     """Build deterministic tray menu items and tooltip text from desktop tray snapshot."""
     primary = snapshot.get("primary_status") or "待命就绪"
     detail = snapshot.get("detail_summary") or "● 活跃探测 待命"
+    best_summary = (snapshot.get("best_summary") or "").strip()
     tooltip = snapshot.get("tooltip") or f"Clash 测速工作台 · {primary}"
     if len(tooltip) > 120:
         tooltip = tooltip[:119] + "…"
@@ -32,6 +33,10 @@ def build_tray_menu_model(snapshot: dict) -> dict:
     items = [
         {"id": None, "label": f"状态：{primary}", "enabled": False, "checked": False, "separator": False},
         {"id": None, "label": detail, "enabled": False, "checked": False, "separator": False},
+    ]
+    if best_summary:
+        items.append({"id": None, "label": best_summary, "enabled": False, "checked": False, "separator": False})
+    items.extend([
         {"id": None, "label": "", "enabled": False, "checked": False, "separator": True},
         {
             "id": CMD_SHOW_HIDE,
@@ -71,7 +76,7 @@ def build_tray_menu_model(snapshot: dict) -> dict:
         },
         {"id": None, "label": "", "enabled": False, "checked": False, "separator": True},
         {"id": CMD_EXIT, "label": "退出应用", "enabled": True, "checked": False, "separator": False},
-    ]
+    ])
     return {"tooltip": tooltip, "items": items}
 
 

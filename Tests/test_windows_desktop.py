@@ -1,5 +1,6 @@
 """Exercise the desktop bridge with temporary synthetic files, not the user's data."""
 
+import json
 import os
 from pathlib import Path
 import sys
@@ -98,6 +99,7 @@ class DesktopTests(unittest.TestCase):
             "start_funnel", "stop", "refresh_groups", "switch_manual",
             "undo_switch", "continue_pending", "set_schedule", "set_patrol",
             "get_history", "clear_history", "export_tsv", "copy_node_name",
+            "copy_node_summary", "probe_active_node", "save_preferences",
             "hide_to_tray", "set_minimize_to_tray",
         })
 
@@ -567,7 +569,205 @@ class DesktopTests(unittest.TestCase):
                 time.sleep(.01)
         st = self.app.get_state()
         self.assertEqual([(r["name"], r["selected"], r["score"] is not None) for r in st["rows"]],
-                         [("alpha", False, False), ("beta", True, True)])
+                         [("alpha", False, False), ("beta", False, True)])
+        self.assertTrue(any(p["uid"] == "u1" and p["selected"] for p in st["profiles"]))
+
+    def test_lossless_retest_preserves_other_scores_selection_and_scopes_auto_switch(self):
+        self.assertTrue(self.app.refresh()["ok"])
+        executable = self.root / "fixture.exe"
+        executable.touch()
+        self.app.executable = executable
+
+        from Windows.batch import ProgressUpdate
+        from Windows.controller import ProxyGroup, Settings
+
+        class InitialRunner:
+            def __init__(self, _exe, jobs, _parallel, **_kwargs):
+                self.jobs = tuple(jobs)
+                self.cancelled = threading.Event()
+
+            def run(self, callback, on_progress=None):
+                for job in self.jobs:
+                    bps = 20 * 1_048_576 if job.name == "alpha" else 4 * 1_048_576
+                    if on_progress:
+                        on_progress(job, ProgressUpdate("download", 524_288, job.download_bytes, bps * 0.8))
+                        on_progress(job, ProgressUpdate("download", job.download_bytes, job.download_bytes, bps))
+                    m = VerifiedMeasurement(job.name, "ss", 6, 6, 20, 1, job.download_bytes, job.download_bytes, True, bps)
+                    callback(job, "ok", m)
+
+            def cancel(self):
+                self.cancelled.set()
+
+        with patch("Windows.desktop.MultiBatchRunner", InitialRunner):
+            self.assertTrue(self.app.start({"parallel": 2, "download_bytes": 1_048_576, "mode": "fast", "auto_switch": False, "group": ""})["ok"])
+            deadline = time.monotonic() + 3
+            while self.app.get_state()["running"] and time.monotonic() < deadline:
+                time.sleep(.01)
+
+        st1 = self.app.get_state()
+        alpha1 = next(r for r in st1["rows"] if r["name"] == "alpha")
+        beta1 = next(r for r in st1["rows"] if r["name"] == "beta")
+        self.assertGreater(alpha1["score"], beta1["score"])
+        self.assertGreaterEqual(len(alpha1["samples"]), 2)
+
+        # Retest only beta at 20MiB with auto_switch=True; alpha must keep its higher score and selection,
+        # and auto_switch must strictly target beta (never untouched alpha).
+        auto_targets = []
+        fake_group = ProxyGroup("Proxy", "alpha", ("alpha", "beta"))
+        fake_settings = Settings("pipe", r"\\.\pipe\synthetic", "", ("v", 1, 1))
+        with self.app.lock:
+            self.app.capture = (self.app.registry, self.app.snapshots["u1"], fake_settings, "id-1", [fake_group])
+            self.app.groups = [{"name": "Proxy", "now": "alpha"}]
+
+        class RetestRunner:
+            def __init__(self, _exe, jobs, _parallel, **_kwargs):
+                self.jobs = tuple(jobs)
+                self.cancelled = threading.Event()
+
+            def run(self, callback, on_progress=None):
+                for job in self.jobs:
+                    if on_progress:
+                        on_progress(job, ProgressUpdate("download", 10 * 1_048_576, job.download_bytes, 6 * 1_048_576))
+                        on_progress(job, ProgressUpdate("download", 20 * 1_048_576, job.download_bytes, 8 * 1_048_576))
+                    m = VerifiedMeasurement(job.name, "ss", 6, 6, 30, 2, job.download_bytes, job.download_bytes, True, 8 * 1_048_576)
+                    callback(job, "ok", m)
+
+            def cancel(self):
+                self.cancelled.set()
+
+        with patch("Windows.desktop.MultiBatchRunner", RetestRunner), \
+             patch.object(self.app, "refresh_groups", return_value={"ok": True}), \
+             patch.object(self.app, "_automatic", side_effect=lambda w, g, c, gen: auto_targets.append((w.name, g))):
+            self.assertTrue(self.app.retest_node({"uid": "u1", "name": "beta", "auto_switch": True, "group": "Proxy"})["ok"])
+            deadline = time.monotonic() + 3
+            while self.app.get_state()["running"] and time.monotonic() < deadline:
+                time.sleep(.01)
+
+        st2 = self.app.get_state()
+        alpha2 = next(r for r in st2["rows"] if r["name"] == "alpha")
+        beta2 = next(r for r in st2["rows"] if r["name"] == "beta")
+        self.assertTrue(alpha2["selected"] and beta2["selected"])
+        self.assertEqual(alpha2["score"], alpha1["score"])
+        self.assertEqual(alpha2["samples"], alpha1["samples"])
+        self.assertGreater(beta2["score"], beta1["score"])
+        self.assertEqual(beta2["samples"], [6.0, 8.0])
+        self.assertEqual(auto_targets, [("beta", "Proxy")])
+
+    def test_safe_preferences_persistence_isolation_and_forbids_auto_switch(self):
+        settings_file = self.root / ".telemetry" / "settings.json"
+        res = self.app.save_preferences({
+            "parallel": 4,
+            "download_bytes": 5 * 1_048_576,
+            "mode": "accurate",
+            "interval": 30,
+            "patrol_quota": 150 * 1_048_576,
+            "top_n": 15,
+        })
+        self.assertTrue(res["ok"])
+        self.assertTrue(settings_file.is_file())
+        # Disallowed or invalid keys must be refused
+        self.assertFalse(self.app.save_preferences({"auto_switch": True})["ok"])
+        self.assertFalse(self.app.save_preferences({"schedule_armed": True})["ok"])
+        self.assertFalse(self.app.save_preferences({"patrol_armed": True})["ok"])
+        self.assertFalse(self.app.save_preferences({"parallel": True})["ok"])
+        self.assertFalse(self.app.save_preferences({"parallel": 99})["ok"])
+        self.assertFalse(self.app.save_preferences({"top_n": 0})["ok"])
+
+        # Even if someone tampers auto_switch into settings.json, reopen ignores it and never arms schedule/patrol
+        raw = json.loads(settings_file.read_text(encoding="utf-8"))
+        raw["auto_switch"] = True
+        raw["preferences"]["auto_switch"] = True
+        settings_file.write_text(json.dumps(raw), encoding="utf-8")
+
+        reopened = Desktop(self.root / "missing.exe", root=self.root)
+        try:
+            st = reopened.get_state()
+            self.assertEqual(st["preferences"], {
+                "parallel": 4,
+                "download_bytes": 5 * 1_048_576,
+                "mode": "accurate",
+                "interval": 30,
+                "patrol_quota": 150 * 1_048_576,
+                "top_n": 15,
+            })
+            self.assertNotIn("auto_switch", st["preferences"])
+            self.assertIsNone(st["schedule_minutes"])
+            self.assertFalse(st["patrol"]["armed"])
+            self.assertEqual(st["patrol"]["quota_bytes"], 150 * 1_048_576)
+        finally:
+            reopened.close()
+
+    def test_manual_probe_active_node_and_tray_progress_best_summary(self):
+        self.assertTrue(self.app.refresh()["ok"])
+        # Without capture, manual probe fails cleanly
+        self.assertFalse(self.app.probe_active_node({"group": "Proxy"})["ok"])
+
+        from Windows.controller import ProxyGroup, Settings
+        fake_group = ProxyGroup("Proxy", "alpha", ("alpha", "beta"))
+        fake_settings = Settings("pipe", r"\\.\pipe\synthetic", "", ("v", 1, 1))
+        with self.app.lock:
+            self.app.capture = (self.app.registry, self.app.snapshots["u1"], fake_settings, "id-1", [fake_group])
+            self.app.groups = [{"name": "Proxy", "now": "alpha"}]
+            self.app.rows[0].measurement = VerifiedMeasurement("alpha", "ss", 6, 6, 35, 2, 1_048_576, 1_048_576, True, 12 * 1_048_576)
+
+        started = threading.Event()
+        release = threading.Event()
+
+        class FakeCtrl:
+            def __init__(self, _s): pass
+            def group(self, _name): return fake_group
+            def probe_node_delay(self, _node, timeout_ms=3500):
+                started.set()
+                release.wait(2)
+                return 42.0
+
+        with patch("Windows.desktop.PipeController", FakeCtrl):
+            res = self.app.probe_active_node({"group": "Proxy"})
+            self.assertTrue(res["ok"])
+            self.assertTrue(started.wait(2))
+            st_probing = self.app.get_state()
+            self.assertEqual(st_probing["health_probe"]["level"], "probing")
+            self.assertIn("探测中", st_probing["health_probe"]["text"])
+            release.set()
+            deadline = time.monotonic() + 2
+            while self.app.get_state()["health_probe"]["level"] == "probing" and time.monotonic() < deadline:
+                time.sleep(.01)
+        st_done = self.app.get_state()
+        self.assertEqual(st_done["health_probe"]["level"], "ok")
+        self.assertIn("42ms", st_done["health_probe"]["text"])
+
+        # Tray snapshot carries best route summary and running progress pct
+        with self.app.lock:
+            self.app.running = True
+            self.app.run_targets = {("u1", "alpha"), ("u1", "beta")}
+            self.app.run_total = 2
+            self.app.run_done = 1
+            self.app.live_progress[("u1", "beta")] = {"phase": "download", "received_bytes": 524_288, "expected_bytes": 1_048_576, "bps": 4_000_000, "samples": [4.0]}
+        snap = self.app.get_tray_snapshot()
+        self.assertIn("测速中 (1/2 · 75%)", snap["primary_status"])
+        self.assertIn("最优：alpha · 12.00 MiB/s", snap["best_summary"])
+        model = build_tray_menu_model(snap)
+        labels = [it["label"] for it in model["items"] if not it["separator"]]
+        self.assertIn(snap["best_summary"], labels)
+        with self.app.lock:
+            self.app.running = False
+
+    def test_copy_node_summary_validates_catalogue_and_formats_live_and_history(self):
+        self.assertTrue(self.app.refresh()["ok"])
+        with self.app.lock:
+            self.app.rows[0].node_type = "vless"
+            self.app.rows[0].measurement = VerifiedMeasurement("alpha", "vless", 6, 6, 38, 3, 3_145_728, 3_145_728, True, 15 * 1_048_576)
+        copied = []
+        with patch("Windows.desktop.win32clipboard.OpenClipboard"), \
+             patch("Windows.desktop.win32clipboard.EmptyClipboard"), \
+             patch("Windows.desktop.win32clipboard.SetClipboardText", side_effect=lambda txt, _fmt: copied.append(txt)), \
+             patch("Windows.desktop.win32clipboard.CloseClipboard"):
+            res = self.app.copy_node_summary({"uid": "u1", "name": "alpha", "view": "live"})
+            self.assertTrue(res["ok"])
+            self.assertIn("[demo] alpha (VLESS)", res["text"])
+            self.assertIn("15.00 MiB/s", res["text"])
+            self.assertEqual(copied[-1], res["text"])
+            self.assertFalse(self.app.copy_node_summary({"uid": "u1", "name": "ghost", "view": "live"})["ok"])
 
     def test_tray_settings_persistence_and_isolation(self):
         settings_file = self.root / ".telemetry" / "settings.json"

@@ -9,6 +9,26 @@ const RowModel = (() => {
     "availability_rate", "total_count"
   ]);
 
+  const isValid = row => row.eligible && row.score != null;
+  const isTesting = row => row.state === "等待" || row.state === "测速中" || Boolean(row.live);
+  const isFailed = row => ["失败", "超时", "已停止", "配置已变更", "下载未完成", "初筛无效"].includes(row.state) ||
+                          (row.score != null && !row.eligible) || (row.speed != null && row.score == null);
+
+  function bucketCounts(rows, profiles, queryText = "") {
+    const selectedProfiles = new Set((profiles || []).filter(p => p.selected).map(p => p.uid));
+    const query = (queryText || "").trim().toLocaleLowerCase();
+    const counts = {all: 0, valid: 0, testing: 0, failed: 0};
+    for (const row of (rows || [])) {
+      if (!selectedProfiles.has(row.uid)) continue;
+      if (query && !`${row.name} ${row.profile} ${row.uid}`.toLocaleLowerCase().includes(query)) continue;
+      counts.all += 1;
+      if (isValid(row)) counts.valid += 1;
+      if (isTesting(row)) counts.testing += 1;
+      if (isFailed(row)) counts.failed += 1;
+    }
+    return counts;
+  }
+
   function visibleRows(rows, profiles, options = {}) {
     const selectedProfiles = new Set(profiles.filter(p => p.selected).map(p => p.uid));
     const query = (options.query || "").trim().toLocaleLowerCase();
@@ -16,10 +36,6 @@ const RowModel = (() => {
     const column = columns.has(options.sort) ? options.sort : "score";
     const ascending = options.ascending === true;
     const freezeOrder = options.freezeOrder === true && column === "score" && !ascending;
-    const isValid = row => row.eligible && row.score != null;
-    const isTesting = row => row.state === "等待" || row.state === "测速中" || Boolean(row.live);
-    const isFailed = row => ["失败", "超时", "已停止", "配置已变更", "下载未完成", "初筛无效"].includes(row.state) ||
-                            (row.score != null && !row.eligible) || (row.speed != null && row.score == null);
     const filtered = rows.map((row, index) => ({row, index})).filter(({row}) => {
       if (!selectedProfiles.has(row.uid)) return false;
       if (query && !`${row.name} ${row.profile} ${row.uid}`.toLocaleLowerCase().includes(query)) return false;
@@ -81,7 +97,7 @@ const RowModel = (() => {
     }).map(x => x.item);
   }
 
-  return Object.freeze({visibleRows, historyRows});
+  return Object.freeze({visibleRows, historyRows, bucketCounts});
 })();
 
 if (typeof module !== "undefined" && module.exports) module.exports = RowModel;

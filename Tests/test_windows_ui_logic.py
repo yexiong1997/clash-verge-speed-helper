@@ -25,7 +25,7 @@ class Element {
     this.id = id; this.tagName = tag.toUpperCase(); this.value = ''; this.checked = false;
     this.disabled = false; this.textContent = ''; this.isConnected = true;
     this.hidden = ['confirm-dialog', 'tun-notice', 'row-menu'].includes(id);
-    this.classList = { set: new Set(), toggle(c, f) { f === undefined ? (this.set.has(c) ? this.set.delete(c) : this.set.add(c)) : (f ? this.set.add(c) : this.set.delete(c)); }, add(c) { this.set.add(c); } };
+    this.classList = { set: new Set(), toggle(c, f) { f === undefined ? (this.set.has(c) ? this.set.delete(c) : this.set.add(c)) : (f ? this.set.add(c) : this.set.delete(c)); }, add(c) { this.set.add(c); }, contains(c) { return this.set.has(c); } };
     this.dataset = {}; this.attributes = {}; this.parentElement = null; this.style = {}; this.children = []; this.listeners = {};
   }
   replaceChildren(...nodes) {
@@ -91,7 +91,17 @@ class Element {
 }
 const elements = new Map();
 const get = id => {if (!elements.has(id)) elements.set(id, new Element(id)); return elements.get(id);};
-get('row-menu').append(get('menu-switch'), get('menu-retest'), get('menu-copy'));
+get('row-menu').append(
+  get('menu-switch'), get('menu-retest'), get('menu-locate'),
+  get('menu-only-node'), get('menu-filter-profile'),
+  get('menu-copy'), get('menu-copy-summary')
+);
+const statusBtns = ['all', 'valid', 'testing', 'failed'].map(st => {
+  const b = new Element('fp-' + st, 'button');
+  b.dataset.status = st;
+  if (st === 'all') b.classList.add('active');
+  return b;
+});
 const hwinBtns = ['24h', '7d', '30d', 'peak'].map(w => {
   const b = new Element('hwin-' + w, 'button');
   b.dataset.hwin = w;
@@ -102,7 +112,7 @@ const docListeners = {};
 const doc = {
   getElementById: get,
   createElement: tag => new Element('', tag),
-  querySelectorAll: sel => sel === 'button[data-hwin]' ? hwinBtns : [],
+  querySelectorAll: sel => sel === 'button[data-hwin]' ? hwinBtns : (sel === 'button[data-status]' ? statusBtns : []),
   querySelector: () => null,
   addEventListener(type, handler) { (docListeners[type] ||= []).push(handler); },
   dispatch(type, event) { for (const h of (docListeners[type] || [])) h(event); },
@@ -137,6 +147,11 @@ const api = {
   set_schedule: async value => { calls.push({fn:'set_schedule', value}); return {ok:true}; },
   set_selection: async value => { calls.push({fn:'set_selection', value}); return {ok:true}; },
   copy_node_name: async value => { calls.push({fn:'copy_node_name', value}); return {ok:true}; },
+  copy_node_summary: async value => { calls.push({fn:'copy_node_summary', value}); return {ok:true, text:'[Fixture] node'}; },
+  probe_active_node: async value => { calls.push({fn:'probe_active_node', value}); return {ok:true}; },
+  save_preferences: async value => { calls.push({fn:'save_preferences', value}); return {ok:true}; },
+  export_tsv: async () => { calls.push({fn:'export_tsv'}); return {ok:true, cancelled:false}; },
+  stop: async () => { calls.push({fn:'stop'}); return {ok:true}; },
   set_patrol: async value => {
     calls.push({fn:'set_patrol', value});
     initial.patrol = {armed: Boolean(value.enabled), quota_bytes: value.quota_bytes, remaining: value.enabled ? 1800 : null, used_bytes_today: 0};
@@ -436,6 +451,86 @@ function cancelDialog() { snapDialog(); get('confirm-cancel').onclick(); }
     for (const fn of (context.window.listeners['pywebviewready'] || [])) await fn();
     process.stdout.write(JSON.stringify({calls, group: get('group').value}));
     return;
+  } else if (scenario === 'active-node-and-group') {
+    initial.groups = [{name:'Test', now:'node'}, {name:'Alt', now:'other'}];
+    initial.rows[0].samples = [10.0, 14.5, 18.2];
+    await vm.runInContext('refreshState()', context);
+    get('group').value = 'Test';
+    get('rows').children[1].onclick(); // select 'other'
+    const activeBefore = vm.runInContext('active', context);
+    const firstIsCurrent = get('rows').children[0].classList.contains('is-current-node');
+    const heroReadyUsing = get('best-ready').textContent;
+    const heroSubUsing = get('best-profile').textContent;
+    const sparkReal = !get('best-sparkline').classList.contains('indicative');
+    const sparkTip = get('best-sparkline-title').textContent;
+    // Switching group preserves selected row ('other') and moves current badge to 'other'
+    get('group').value = 'Alt';
+    await get('group').onchange();
+    const activeAfter = vm.runInContext('active', context);
+    const secondIsCurrentAfter = get('rows').children[1].classList.contains('is-current-node');
+    process.stdout.write(JSON.stringify({
+      activeBefore, activeAfter, firstIsCurrent, secondIsCurrentAfter,
+      heroReadyUsing, heroSubUsing, sparkReal, sparkTip
+    }));
+    return;
+  } else if (scenario === 'prefs-and-lossless-retest') {
+    initial.preferences = {parallel: 5, download_bytes: 5242880, mode: 'accurate', interval: 30, patrol_quota: 157286400, top_n: 12};
+    await vm.runInContext('refreshState()', context);
+    const hydrated = {
+      parallel: get('parallel').value, size: get('size').value, mode: get('mode').value,
+      interval: get('interval').value, quota: get('patrol-quota').value, topn: get('topn').value
+    };
+    get('parallel').value = '3'; await get('parallel').onchange();
+    get('auto').checked = false; await get('auto').onchange(); // must NOT call save_preferences
+    // Retest must NOT overwrite parallel/size/mode dropdowns
+    get('group').value = 'Test';
+    get('retest-best').onclick();
+    await acceptDialog();
+    const afterRetest = {parallel: get('parallel').value, size: get('size').value, mode: get('mode').value};
+    process.stdout.write(JSON.stringify({hydrated, afterRetest, calls}));
+    return;
+  } else if (scenario === 'menu-shortcuts-health-export') {
+    initial.groups = [{name:'Test', now:'node'}];
+    initial.rows.push({uid:'p', profile:'Fixture', name:'queued', selected:true, state:'等待', eligible:true, score:null, speed:null, latency:null, jitter:null, successes:null});
+    await vm.runInContext('refreshState()', context);
+    get('group').value = 'Test';
+    vm.runInContext('render()', context);
+    const waitingRowCells = get('rows').children[2].children.map(td => td.textContent);
+    const counts = {all: get('fc-all').textContent, valid: get('fc-valid').textContent, testing: get('fc-testing').textContent, failed: get('fc-failed').textContent};
+    // Click health pill -> immediate probing text + probe_active_node call
+    await get('health-pill').onclick();
+    const healthText = get('health-pill').textContent;
+    // Export -> ✓ 已复制 feedback
+    await get('export').onclick();
+    const exportText = get('export').textContent;
+    // Live context menu -> copy summary & filter profile
+    const firstTr = get('rows').children[0];
+    get('rows').listeners.contextmenu({target:{closest:()=>firstTr}, clientX:10, clientY:10, preventDefault(){}});
+    const liveLocateHidden = get('menu-locate').hidden;
+    await get('menu-copy-summary').onclick();
+    // Keyboard shortcut Ctrl+2 -> history view, then menu-locate returns to live view
+    doc.dispatch('keydown', {ctrlKey:true, key:'2', target:get('rows'), preventDefault(){}});
+    const modeAfterCtrl2 = vm.runInContext('viewMode', context);
+    await vm.runInContext('fetchHistory()', context);
+    const histTr = get('rows').children[0];
+    get('rows').listeners.contextmenu({target:{closest:()=>histTr}, clientX:10, clientY:10, preventDefault(){}});
+    const histLocateHidden = get('menu-locate').hidden;
+    get('menu-locate').onclick();
+    const modeAfterLocate = vm.runInContext('viewMode', context);
+    // Space toggles checkbox on active row; Ctrl+Shift+C exports
+    doc.dispatch('keydown', {key:' ', target:get('rows'), preventDefault(){}});
+    doc.dispatch('keydown', {ctrlKey:true, shiftKey:true, key:'C', target:get('rows'), preventDefault(){}});
+    // Empty state when 0 profiles selected -> 0 / 0 & 预计流量 — & quick action button
+    initial.profiles[0].selected = false;
+    await vm.runInContext('refreshState()', context);
+    const zeroCount = get('count').textContent;
+    const zeroTraffic = get('traffic').textContent;
+    const emptyActions = get('empty-actions').children.map(b => b.textContent);
+    process.stdout.write(JSON.stringify({
+      waitingRowCells, counts, healthText, exportText, liveLocateHidden,
+      modeAfterCtrl2, histLocateHidden, modeAfterLocate, zeroCount, zeroTraffic, emptyActions, calls
+    }));
+    return;
   }
   process.stdout.write(JSON.stringify({
     calls,
@@ -602,7 +697,7 @@ class WindowsRowModelTests(unittest.TestCase):
         value = json.loads(result.stdout)
         self.assertTrue(value["funnelStayedOpenOnTopn"])
         self.assertEqual(value["results"], [True, True, True, True])
-        self.assertEqual(value["calls"], [])
+        self.assertEqual([c for c in value["calls"] if c["fn"] != "save_preferences"], [])
 
     def test_tun_notice_renders_strictly_for_boolean_true_without_blocking(self):
         result = subprocess.run([NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "tun-notice"],
@@ -732,7 +827,7 @@ process.stdin.on('end', () => {
         value = json.loads(result.stdout)
         self.assertFalse(value["histToolsHidden"])
         self.assertTrue(value["liveToolsHidden"])
-        self.assertEqual(value["firstRowTexts"][0:3], ["1", "扣分", "node"])
+        self.assertEqual(value["firstRowTexts"][0:3], ["#1", "扣分", "node"])
         self.assertEqual(value["armedLabel"], "确认清空?")
         self.assertEqual(value["resetLabel"], "清空记录")
         self.assertEqual(value["patrolToggle"], "停止巡检")
@@ -759,6 +854,53 @@ process.stdin.on('end', () => {
             {"fn": "set_minimize_to_tray", "value": {"enabled": True}},
             {"fn": "hide_to_tray"},
         ])
+
+    def test_active_node_highlighting_real_sparkline_and_group_switch_preserves_selection(self):
+        result = subprocess.run([NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "active-node-and-group"],
+                                capture_output=True, timeout=5, check=True)
+        value = json.loads(result.stdout)
+        self.assertTrue(value["firstIsCurrent"])
+        self.assertEqual(value["heroReadyUsing"], "● 当前使用中")
+        self.assertIn("· 使用中", value["heroSubUsing"])
+        self.assertTrue(value["sparkReal"])
+        self.assertIn("真实下载吞吐采样", value["sparkTip"])
+        self.assertEqual(value["activeBefore"], value["activeAfter"])
+        self.assertTrue(value["secondIsCurrentAfter"])
+
+    def test_preferences_hydration_safe_persistence_and_lossless_retest_ui(self):
+        result = subprocess.run([NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "prefs-and-lossless-retest"],
+                                capture_output=True, timeout=5, check=True)
+        value = json.loads(result.stdout)
+        self.assertEqual(value["hydrated"], {
+            "parallel": "5", "size": "5242880", "mode": "accurate",
+            "interval": "30", "quota": "157286400", "topn": "12",
+        })
+        self.assertEqual(value["afterRetest"], {"parallel": "3", "size": "5242880", "mode": "accurate"})
+        pref_calls = [c for c in value["calls"] if c["fn"] == "save_preferences"]
+        self.assertEqual(pref_calls, [{"fn": "save_preferences", "value": {"parallel": 3}}])
+        self.assertFalse(any("auto_switch" in c.get("value", {}) for c in pref_calls))
+
+    def test_dynamic_menu_shortcuts_waiting_copy_bucket_counts_health_click_and_empty_state(self):
+        result = subprocess.run([NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "menu-shortcuts-health-export"],
+                                capture_output=True, timeout=5, check=True)
+        value = json.loads(result.stdout)
+        self.assertEqual(value["waitingRowCells"][3:6], ["等待", "队列中", "排队等待"])
+        self.assertEqual(value["counts"], {"all": "3", "valid": "2", "testing": "1", "failed": "0"})
+        self.assertEqual(value["healthText"], "● 探测中…")
+        self.assertEqual(value["exportText"], "✓ 已复制")
+        self.assertTrue(value["liveLocateHidden"])
+        self.assertEqual(value["modeAfterCtrl2"], "history")
+        self.assertFalse(value["histLocateHidden"])
+        self.assertEqual(value["modeAfterLocate"], "live")
+        self.assertEqual(value["zeroCount"], "0 / 0")
+        self.assertEqual(value["zeroTraffic"], "预计流量 —")
+        self.assertIn("勾选当前订阅", value["emptyActions"])
+        self.assertIn("全选全部订阅", value["emptyActions"])
+        fns = [c["fn"] for c in value["calls"]]
+        self.assertIn("probe_active_node", fns)
+        self.assertIn("copy_node_summary", fns)
+        self.assertEqual(fns.count("export_tsv"), 2)
+        self.assertIn("set_selection", fns)
 
 
 if __name__ == "__main__":

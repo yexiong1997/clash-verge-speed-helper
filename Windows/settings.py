@@ -10,6 +10,95 @@ if os.name == "nt":
     import win32con
     import win32file
 
+ALLOWED_DOWNLOAD_BYTES = frozenset((
+    262_144,
+    524_288,
+    1_048_576,
+    2_097_152,
+    3_145_728,
+    5_242_880,
+    20_971_520,
+    52_428_800,
+))
+ALLOWED_MODES = frozenset(("fast", "accurate"))
+ALLOWED_INTERVALS = frozenset((0, 15, 30, 60, 120, 360, 720, 1440))
+ALLOWED_PATROL_QUOTAS = frozenset((
+    50 * 1_048_576,
+    80 * 1_048_576,
+    150 * 1_048_576,
+    300 * 1_048_576,
+))
+
+DEFAULT_PREFERENCES = {
+    "parallel": 10,
+    "download_bytes": 3_145_728,
+    "mode": "fast",
+    "interval": 0,
+    "patrol_quota": 80 * 1_048_576,
+    "top_n": 10,
+}
+ALLOWED_PREFERENCE_KEYS = frozenset(DEFAULT_PREFERENCES.keys())
+
+
+def _is_strict_int(value) -> bool:
+    return type(value) is int
+
+
+def validate_preference_patch(patch: dict) -> dict:
+    """Strictly validate a user preference update; rejects auto_switch or unknown keys."""
+    if not isinstance(patch, dict) or not patch:
+        raise ValueError("偏好参数无效")
+    unknown = set(patch.keys()) - ALLOWED_PREFERENCE_KEYS
+    if unknown:
+        raise ValueError("包含不允许持久化的参数")
+    validated = {}
+    if "parallel" in patch:
+        val = patch["parallel"]
+        if not _is_strict_int(val) or not (1 <= val <= 10):
+            raise ValueError("并发数须为 1 至 10 的整数")
+        validated["parallel"] = val
+    if "download_bytes" in patch:
+        val = patch["download_bytes"]
+        if not _is_strict_int(val) or val not in ALLOWED_DOWNLOAD_BYTES:
+            raise ValueError("下载包大小无效")
+        validated["download_bytes"] = val
+    if "mode" in patch:
+        val = patch["mode"]
+        if not isinstance(val, str) or val not in ALLOWED_MODES:
+            raise ValueError("测速模式无效")
+        validated["mode"] = val
+    if "interval" in patch:
+        val = patch["interval"]
+        if not _is_strict_int(val) or val not in ALLOWED_INTERVALS:
+            raise ValueError("定时间隔选项无效")
+        validated["interval"] = val
+    if "patrol_quota" in patch:
+        val = patch["patrol_quota"]
+        if not _is_strict_int(val) or val not in ALLOWED_PATROL_QUOTAS:
+            raise ValueError("巡检日配额无效")
+        validated["patrol_quota"] = val
+    if "top_n" in patch:
+        val = patch["top_n"]
+        if not _is_strict_int(val) or not (1 <= val <= 2000):
+            raise ValueError("前 N 项须为 1 至 2000 的整数")
+        validated["top_n"] = val
+    return validated
+
+
+def sanitize_preferences(raw) -> dict:
+    """Extract only safe ergonomic preferences from persisted JSON, dropping disallowed fields."""
+    result = dict(DEFAULT_PREFERENCES)
+    if not isinstance(raw, dict):
+        return result
+    for key in ALLOWED_PREFERENCE_KEYS:
+        if key not in raw:
+            continue
+        try:
+            result.update(validate_preference_patch({key: raw[key]}))
+        except ValueError:
+            pass
+    return result
+
 
 class SettingsSecurityError(Exception):
     pass
@@ -111,6 +200,39 @@ class AppSettingsStore:
         data = json.loads(raw)
         return data if isinstance(data, dict) else {}
 
+    def _write_dict_locked(self, updater) -> bool:
+        cfg_path = self._validated_target(create_dir=True)
+        if cfg_path is None:
+            return False
+        try:
+            existing = self._read_dict_locked()
+        except SettingsSecurityError:
+            raise
+        except Exception:
+            existing = {}
+        # Strip any disallowed keys that could have been written manually.
+        for forbidden in ("auto_switch", "schedule_armed", "patrol_armed", "running", "group"):
+            existing.pop(forbidden, None)
+        updater(existing)
+        payload = json.dumps(existing, ensure_ascii=False, indent=2) + "\n"
+        fd, tmp_name = tempfile.mkstemp(prefix=".settings-", suffix=".tmp", dir=str(cfg_path.parent))
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(payload)
+            if _is_reparse(tmp_path):
+                raise SettingsSecurityError("Temporary settings file is unsafe.")
+            if cfg_path.exists() and (_is_reparse(cfg_path) or cfg_path.is_dir()):
+                raise SettingsSecurityError("Target settings.json became unsafe.")
+            os.replace(str(tmp_path), str(cfg_path))
+        finally:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
+        return True
+
     def load_minimize_to_tray(self, default: bool = True) -> bool:
         with self._lock:
             try:
@@ -126,31 +248,28 @@ class AppSettingsStore:
         if type(enabled) is not bool:
             raise ValueError("minimize_to_tray must be a boolean")
         with self._lock:
-            cfg_path = self._validated_target(create_dir=True)
-            if cfg_path is None:
-                return False
+            return self._write_dict_locked(lambda existing: existing.__setitem__("minimize_to_tray", enabled))
+
+    def load_preferences(self) -> dict:
+        with self._lock:
             try:
-                existing = self._read_dict_locked()
+                data = self._read_dict_locked()
             except SettingsSecurityError:
-                raise
+                return dict(DEFAULT_PREFERENCES)
             except Exception:
-                existing = {}
-            existing["minimize_to_tray"] = enabled
-            payload = json.dumps(existing, ensure_ascii=False, indent=2) + "\n"
-            fd, tmp_name = tempfile.mkstemp(prefix=".settings-", suffix=".tmp", dir=str(cfg_path.parent))
-            tmp_path = Path(tmp_name)
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-                    handle.write(payload)
-                if _is_reparse(tmp_path):
-                    raise SettingsSecurityError("Temporary settings file is unsafe.")
-                if cfg_path.exists() and (_is_reparse(cfg_path) or cfg_path.is_dir()):
-                    raise SettingsSecurityError("Target settings.json became unsafe.")
-                os.replace(str(tmp_path), str(cfg_path))
-            finally:
-                if tmp_path.exists():
-                    try:
-                        tmp_path.unlink()
-                    except Exception:
-                        pass
-            return True
+                return dict(DEFAULT_PREFERENCES)
+            return sanitize_preferences(data.get("preferences"))
+
+    def save_preferences(self, patch: dict) -> dict:
+        validated = validate_preference_patch(patch)
+        with self._lock:
+            merged = [dict(DEFAULT_PREFERENCES)]
+
+            def _apply(existing: dict):
+                current = sanitize_preferences(existing.get("preferences"))
+                current.update(validated)
+                existing["preferences"] = current
+                merged[0] = current
+
+            self._write_dict_locked(_apply)
+            return dict(merged[0])

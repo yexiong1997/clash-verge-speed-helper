@@ -1,6 +1,6 @@
 """Desktop application state and explicit, validated webview bridge."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import csv
 import inspect
@@ -33,6 +33,7 @@ class Row:
     measurement: object = None
     stage1_score: object = None
     node_type: str = ""
+    samples: list = field(default_factory=list)
 
 
 def _registry_signature(registry):
@@ -61,6 +62,7 @@ class Desktop:
         self.telemetry_store = TelemetryHistoryStore(directory=telemetry_dir)
         self.settings_store = AppSettingsStore(directory=settings_dir)
         self.minimize_to_tray = self.settings_store.load_minimize_to_tray(default=True)
+        self.preferences = self.settings_store.load_preferences()
         self.window_visible = True
         self.quit_requested = False
         self._switching_count = 0
@@ -90,10 +92,13 @@ class Desktop:
         self.live_progress = {}
         self.recently_scored = {}
         self.cascade_highlighted = {}
+        self.run_targets = set()
+        self.run_total = 0
+        self.run_done = 0
         self.schedule = TestSchedule()
         self.scheduled_options = None
         self.patrol_schedule = TestSchedule()
-        self.patrol_quota_bytes = 80 * 1_048_576
+        self.patrol_quota_bytes = self.preferences["patrol_quota"]
         self.patrol_snapshots = None
         self.patrol_last_summary = ""
         self.cached_patrol_bytes_today = self.telemetry_store.patrol_bytes_used_today()
@@ -124,6 +129,41 @@ class Desktop:
         if was_armed and reason:
             self.status = reason
 
+    def _run_progress_locked(self):
+        if not self.running:
+            return None
+        total = self.run_total or len(self.run_targets)
+        if total <= 0:
+            return {"done": 0, "total": 0, "pct": 0}
+        done = min(total, self.run_done)
+        partial = 0.0
+        for ident, live in self.live_progress.items():
+            if self.run_targets and ident not in self.run_targets:
+                continue
+            expected = live.get("expected_bytes") or 0
+            received = live.get("received_bytes") or 0
+            if expected > 0 and received > 0:
+                partial += min(0.95, received / expected)
+            else:
+                partial += 0.08
+        frac = min(1.0, max(0.0, (done + partial) / total))
+        pct = min(99 if done < total else 100, int(round(frac * 100)))
+        return {"done": done, "total": total, "pct": pct}
+
+    def _best_summary_locked(self):
+        candidates = [
+            r for r in self.rows
+            if r.uid in self.selected_profiles and _eligible_name(r.name)
+            and r.measurement and r.measurement.score is not None
+        ]
+        if not candidates:
+            return ""
+        best = max(candidates, key=lambda r: r.measurement.score)
+        m = best.measurement
+        name = best.name if len(best.name) <= 28 else best.name[:27] + "…"
+        speed_mib = m.download_bytes_per_second / 1_048_576
+        return f"最优：{name} · {speed_mib:.2f} MiB/s ({m.score:.1f})"
+
     def get_state(self):
         with self.lock:
             now_mono = time.monotonic()
@@ -148,6 +188,7 @@ class Desktop:
                              "latency": m.latency_ms if m else None,
                              "jitter": m.jitter_ms if m else None,
                              "successes": m.head_successes if m else None,
+                             "samples": list(row.samples) if row.samples else [],
                              "live": dict(live) if live else None,
                              "recently_scored": ident in self.recently_scored,
                              "cascade_highlighted": ident in self.cascade_highlighted})
@@ -179,6 +220,8 @@ class Desktop:
                     },
                     "minimize_to_tray": self.minimize_to_tray,
                     "window_visible": self.window_visible,
+                    "preferences": dict(self.preferences),
+                    "run_progress": self._run_progress_locked(),
                     "status": self.status, "outcome_unknown": self.latch.outcome_unknown}
 
     def _notify_tray(self):
@@ -207,6 +250,22 @@ class Desktop:
             return {"ok": False, "error": "设置路径安全校验失败，无法保存托盘设置"}
         except Exception:
             return {"ok": False, "error": "托盘设置参数无效"}
+
+    def save_preferences(self, value):
+        try:
+            saved = self.settings_store.save_preferences(value)
+            with self.lock:
+                self.preferences = saved
+                if self.patrol_schedule.minutes is None:
+                    self.patrol_quota_bytes = saved["patrol_quota"]
+            self._notify_tray()
+            return {"ok": True, "preferences": dict(saved)}
+        except SettingsSecurityError:
+            return {"ok": False, "error": "设置路径安全校验失败，无法保存参数偏好"}
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc) or "参数偏好无效"}
+        except Exception:
+            return {"ok": False, "error": "保存参数偏好失败"}
 
     def hide_to_tray(self):
         with self.lock:
@@ -245,10 +304,17 @@ class Desktop:
             refreshing = bool(self.refreshing)
             switching = self._switching_count > 0
             busy = running or refreshing or switching
+            prog = self._run_progress_locked()
             if running and self.active_run_kind == "patrol":
-                primary = "智能巡检中"
+                primary = (
+                    f"智能巡检中 ({prog['done']}/{prog['total']} · {prog['pct']}%)"
+                    if prog and prog["total"] > 0 else "智能巡检中"
+                )
             elif running:
-                primary = "测速中"
+                primary = (
+                    f"测速中 ({prog['done']}/{prog['total']} · {prog['pct']}%)"
+                    if prog and prog["total"] > 0 else "测速中"
+                )
             elif switching:
                 primary = "切换处理中"
             elif refreshing:
@@ -268,9 +334,14 @@ class Desktop:
             if patrol_armed or self.cached_patrol_bytes_today > 0:
                 parts.append(f"今日巡检 {used_mib}/{quota_mib} MiB")
             detail = " · ".join(parts)
+            best_summary = self._best_summary_locked()
             tooltip = f"Clash 测速工作台 · {primary}"
-            if self.health_probe_level != "idle":
+            if best_summary:
+                tooltip += f" · {best_summary}"
+            elif self.health_probe_level != "idle":
                 tooltip += f"（{self.health_probe_status.replace('● ', '')}）"
+            if len(tooltip) > 120:
+                tooltip = tooltip[:119] + "…"
             return {
                 "window_visible": self.window_visible,
                 "minimize_to_tray": self.minimize_to_tray,
@@ -283,6 +354,8 @@ class Desktop:
                 "outcome_unknown": self.latch.outcome_unknown,
                 "primary_status": primary,
                 "detail_summary": detail,
+                "best_summary": best_summary,
+                "run_progress": prog,
                 "tooltip": tooltip,
             }
 
@@ -568,17 +641,22 @@ class Desktop:
                    prelaunch=lambda _job: self._prelaunch(generation, snapshots.values()))
         chosen_set = {(r.uid, r.name) for r in chosen}
         for row in self.rows:
-            if run_kind == "patrol":
+            if run_kind in ("patrol", "retest"):
                 if (row.uid, row.name) in chosen_set:
                     row.measurement = None
                     row.stage1_score = None
+                    row.samples = []
                     row.state = "等待"
             else:
                 row.measurement = None
                 row.stage1_score = None
+                row.samples = []
                 row.state = "等待" if row in chosen else "未勾选"
         self.running = True
         self.active_run_kind = run_kind
+        self.run_targets = set(chosen_set)
+        self.run_total = len(chosen)
+        self.run_done = 0
         self.live_progress.clear()
         self.recently_scored.clear()
         self.cascade_highlighted.clear()
@@ -586,8 +664,14 @@ class Desktop:
         self.pending = None
         if options.get("group"):
             self.probe_group = options["group"]
-        self.status = "智能巡检中…" if run_kind == "patrol" else "测速中"
+        if run_kind == "patrol":
+            self.status = "智能巡检中…"
+        elif run_kind == "retest":
+            self.status = f"单节点复测中（{chosen[0].name} · 20 MiB）…"
+        else:
+            self.status = "测速中"
         self.runner = runner
+        self._notify_tray()
         threading.Thread(target=self._run, args=(runner, options, capture, snapshots,
                                                  generation, token, scheduled, run_kind, source), daemon=True).start()
 
@@ -629,7 +713,7 @@ class Desktop:
             return {"ok": False, "error": message}
 
     def retest_node(self, value):
-        """Narrow the selection, revalidate the original group, then start 20 MiB."""
+        """Losslessly retest a single node at 20 MiB without wiping other scores or selections."""
         token = None
         try:
             uid, node = value["uid"], value["name"]
@@ -653,11 +737,6 @@ class Desktop:
                     if len(matches) != 1:
                         raise ValueError("原策略组不可用，请重新选择")
                     original_group = matches[0]
-                selected_profiles = list(self.selected_profiles | {uid})
-                result = self.set_selection({"profiles": selected_profiles,
-                                             "nodes": [{"uid": uid, "name": node}]})
-                if not result["ok"]:
-                    raise ValueError("节点选择已变化")
                 if self.schedule.minutes is not None:
                     self._invalidate()
                 generation = self.generation
@@ -673,12 +752,22 @@ class Desktop:
                     if not refreshed or refreshed[:4] != previous[:4] or matches != [original_group]:
                         self.capture, self.groups = None, []
                         raise ValueError("策略组或控制器已变化，请刷新并重新确认")
-                chosen, snapshots, capture = self._validate_launch(options, False)
+                if not self.executable.is_file():
+                    raise ValueError("找不到测速核心 clash-speedtest.exe")
+                target_row = next((r for r in self.rows if r.uid == uid and r.name == node), None)
+                if target_row is None or uid not in self.snapshots:
+                    raise ValueError("节点或订阅已变化，请重新选择")
+                capture = self.capture
+                if auto:
+                    if not group or not capture or self.latch.outcome_unknown or not any(g.name == group for g in capture[4]):
+                        raise ValueError("请先刷新并选择可用策略组")
+                if uid not in self.selected_profiles:
+                    self.selected_profiles.add(uid)
                 token = self.schedule.begin_manual()
                 if token is None:
                     raise ValueError("已有测速任务进行中")
-                self._start_validated_launch(options, token, False, chosen, snapshots, capture,
-                                             run_kind="normal", source="retest")
+                self._start_validated_launch(options, token, False, [target_row], {uid: self.snapshots[uid]}, capture,
+                                             run_kind="retest", source="retest")
                 return {"ok": True}
         except (KeyError, TypeError, ValueError) as exc:
             if token is not None:
@@ -769,10 +858,19 @@ class Desktop:
                 received_results.add(identity)
                 sample_to_record = None
                 with self.lock:
-                    self.live_progress.pop(identity, None)
+                    prev_live = self.live_progress.pop(identity, None)
+                    samples = list(prev_live.get("samples", [])) if prev_live else []
+                    if measurement and measurement.download_bytes_per_second > 0:
+                        final_mib = round(measurement.download_bytes_per_second / 1_048_576, 3)
+                        if len(samples) == 1:
+                            samples.append(final_mib)
+                    if len(samples) > 24:
+                        samples = samples[-24:]
+                    self.run_done += 1
                     row = next((r for r in self.rows if r.uid == job.uid and r.name == job.name), None)
                     if row:
                         row.measurement = measurement
+                        row.samples = samples
                         if measurement and measurement.node_type:
                             row.node_type = measurement.node_type
                         row.state = {"ok": "完成" if measurement and measurement.download_complete else "下载未完成", "cancelled": "已停止", "timeout": "超时",
@@ -835,11 +933,13 @@ class Desktop:
                         if row.selected:
                             row.stage1_score = None
                             row.measurement = None
+                            row.samples = []
                             row.state = "等待"
                             self.cascade_highlighted[(row.uid, row.name)] = cascade_exp
                         else:
                             prev_score = row.measurement.score if row.measurement and _eligible_name(row.name) else None
                             row.measurement = None
+                            row.samples = []
                             if prev_score is not None:
                                 row.stage1_score = prev_score
                                 row.state = f"初筛 {prev_score:.1f}分"
@@ -847,6 +947,9 @@ class Desktop:
                                 row.stage1_score = None
                                 row.state = "未晋级"
                     self.live_progress.clear()
+                    self.run_targets = set(selected)
+                    self.run_total = len(promoted)
+                    self.run_done = 0
                     self.score_revision += 1
                     self.status = f"初筛完成，{len(promoted)} 个节点进行 20 MiB 加压复测"
                     self.funnel_stage = 2
@@ -876,8 +979,13 @@ class Desktop:
                         self.status = f"智能巡检完成：已更新 {count} 个节点（今日 {used_mib}/{quota_mib} MiB，不改变节点勾选）"
                 return
             with self.lock:
-                candidates = [r for r in self.rows if r.measurement and r.measurement.score is not None
-                              and _eligible_name(r.name)]
+                if run_kind == "retest":
+                    candidates = [r for r in self.rows if (r.uid, r.name) in expected_results
+                                  and r.measurement and r.measurement.score is not None
+                                  and _eligible_name(r.name)]
+                else:
+                    candidates = [r for r in self.rows if r.measurement and r.measurement.score is not None
+                                  and _eligible_name(r.name)]
                 winner = max(candidates, key=lambda r: r.measurement.score) if candidates else None
                 allowed = generation == self.generation and not runner.cancelled.is_set() and not self.closed.is_set()
                 self.score_revision += 1
@@ -885,7 +993,10 @@ class Desktop:
                 self._automatic(winner, options["group"], capture, generation)
             elif allowed:
                 with self.lock:
-                    self.status = "测速完成" if winner else "测速完成，无可评分节点"
+                    if run_kind == "retest":
+                        self.status = f"单节点复测完成（{winner.name}）" if winner else "单节点复测完成，未能取得有效评分"
+                    else:
+                        self.status = "测速完成" if winner else "测速完成，无可评分节点"
         except Exception:
             with self.lock:
                 self.status = "测速失败或配置已变更"
@@ -894,6 +1005,9 @@ class Desktop:
             with self.lock:
                 self.running, self.runner = False, None
                 self.live_progress.clear()
+                self.run_targets.clear()
+                self.run_total = 0
+                self.run_done = 0
                 self.funnel_stage = None
                 self.active_run_kind = "normal"
                 if run_kind == "patrol":
@@ -901,6 +1015,7 @@ class Desktop:
                     self.cached_patrol_bytes_today = self.telemetry_store.patrol_bytes_used_today()
                 else:
                     self.schedule.finish(token)
+            self._notify_tray()
 
     def _automatic(self, winner, group_name, capture, generation):
         registry, snapshot, settings, identity, groups = capture
@@ -926,6 +1041,11 @@ class Desktop:
                         expected.now in expected.all and expected.now != winner.name):
                     self.undo = (snapshot.profile.uid, expected.now, group_name, winner.name,
                                  registry, snapshot, settings, identity)
+                if outcome == "switched":
+                    self.groups = [
+                        {"name": g["name"], "now": winner.name if g["name"] == group_name else g["now"]}
+                        for g in self.groups
+                    ]
                 self.status = {"switched": "已切换并复核", "confirmed_noop": "当前已是最优节点",
                                "outcome_unknown": "切换结果未知，请到 Clash Verge 手动核验；自动切换已锁定"}.get(outcome, "切换条件已变化，未自动切换")
                 if outcome == "outcome_unknown":
@@ -1087,6 +1207,43 @@ class Desktop:
             self._health_probe_thread = thread
         thread.start()
 
+    def probe_active_node(self, value=None):
+        try:
+            requested_group = None
+            if value is not None:
+                if not isinstance(value, dict):
+                    raise ValueError("探测参数无效")
+                g = value.get("group")
+                if g is not None:
+                    if not isinstance(g, str):
+                        raise ValueError("策略组参数无效")
+                    requested_group = g.strip() or None
+            with self.lock:
+                if self.closed.is_set() or self.running or self.refreshing or self._switching_count > 0:
+                    return {"ok": False, "error": "当前任务进行中，请稍后再探测"}
+                if not self.capture:
+                    return {"ok": False, "error": "请先刷新策略组后再探测"}
+                groups = self.capture[4]
+                if requested_group is not None:
+                    if not any(g.name == requested_group for g in groups):
+                        return {"ok": False, "error": "所选策略组不可用，请刷新策略组"}
+                    self.probe_group = requested_group
+                if self.health_probe_inflight:
+                    return {"ok": True, "inflight": True}
+                self.health_probe_status = "● 探测中…"
+                self.health_probe_level = "probing"
+                self.health_probe_inflight = True
+                self._last_health_probe_at = time.monotonic()
+                thread = threading.Thread(target=self._run_health_probe, daemon=True)
+                self._health_probe_thread = thread
+            self._notify_tray()
+            thread.start()
+            return {"ok": True}
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc) or "探测参数无效"}
+        except Exception:
+            return {"ok": False, "error": "触发活跃探测失败"}
+
     def _run_health_probe(self):
         with self._health_probe_lock:
             self._run_health_probe_locked()
@@ -1155,6 +1312,7 @@ class Desktop:
         finally:
             with self.lock:
                 self.health_probe_inflight = False
+            self._notify_tray()
 
     def _poll_patrol(self):
         with self.lock:
@@ -1274,6 +1432,11 @@ class Desktop:
                 if (outcome == "switched" and expected.now in snapshot.names and
                         expected.now in expected.all and expected.now != node):
                     self.undo = (uid, expected.now, group, node, registry, snapshot, settings, identity)
+                if outcome == "switched":
+                    self.groups = [
+                        {"name": g["name"], "now": node if g["name"] == group else g["now"]}
+                        for g in self.groups
+                    ]
                 if outcome == "outcome_unknown":
                     self._invalidate()
                 self.status = {"switched": "已切换并复核", "confirmed_noop": "该节点已被选中",
@@ -1317,6 +1480,11 @@ class Desktop:
                     self._invalidate()
                 elif outcome in ("switched", "confirmed_noop"):
                     self.undo = None
+                    if outcome == "switched":
+                        self.groups = [
+                            {"name": g["name"], "now": node if g["name"] == group else g["now"]}
+                            for g in self.groups
+                        ]
                 self.status = {"switched": "已切回原节点并复核", "confirmed_noop": "当前已是原节点",
                                "outcome_unknown": "切换结果未知，请手动核验；切换已锁定"}.get(outcome, "未切回：条件已变化")
             return {"ok": outcome in ("switched", "confirmed_noop"), "error": self.status}
@@ -1357,6 +1525,11 @@ class Desktop:
                 if (outcome == "switched" and expected.now in snapshot.names and
                         expected.now in expected.all and expected.now != node):
                     self.undo = (uid, expected.now, group, node, registry, snapshot, settings, identity)
+                if outcome == "switched":
+                    self.groups = [
+                        {"name": g["name"], "now": node if g["name"] == group else g["now"]}
+                        for g in self.groups
+                    ]
                 if outcome == "outcome_unknown":
                     self._invalidate()
                 elif outcome in ("switched", "confirmed_noop"):
@@ -1377,7 +1550,7 @@ class Desktop:
             import webview
             paths = self.window.create_file_dialog(webview.FileDialog.SAVE, save_filename="clash-speed-results.tsv")
             if not paths:
-                return {"ok": True}
+                return {"ok": True, "cancelled": True}
             output = io.StringIO(newline="")
             writer = csv.writer(output, delimiter="\t", lineterminator="\n")
             writer.writerow(["订阅", "节点", "状态", "综合分", "速度 B/s", "延迟 ms", "抖动 ms"])
@@ -1387,8 +1560,20 @@ class Desktop:
                     writer.writerow([_cell(row.profile), _cell(row.name), _cell(row.state),
                                      m.score if m and m.score is not None else "", m.download_bytes_per_second if m else "",
                                      m.latency_ms if m else "", m.jitter_ms if m else ""])
-            Path(paths if isinstance(paths, str) else paths[0]).write_text(output.getvalue(), encoding="utf-8-sig")
-            return {"ok": True}
+            text = output.getvalue()
+            Path(paths if isinstance(paths, str) else paths[0]).write_text(text, encoding="utf-8-sig")
+            try:
+                win32clipboard.OpenClipboard()
+                try:
+                    win32clipboard.EmptyClipboard()
+                    win32clipboard.SetClipboardText(text, win32clipboard.CF_UNICODETEXT)
+                finally:
+                    win32clipboard.CloseClipboard()
+            except Exception:
+                pass
+            with self.lock:
+                self.status = "已导出 TSV 并复制到剪贴板"
+            return {"ok": True, "cancelled": False}
         except Exception:
             return {"ok": False, "error": "导出失败"}
 
@@ -1396,8 +1581,14 @@ class Desktop:
         try:
             with self.lock:
                 uid, name = value["uid"], value["name"]
-                if self.closed.is_set() or not any(row.uid == uid and row.name == name for row in self.rows):
+                if self.closed.is_set() or not isinstance(uid, str) or not isinstance(name, str):
                     raise ValueError("节点已变化")
+                known = any(row.uid == uid and row.name == name for row in self.rows)
+            if not known:
+                summaries = self.telemetry_store.summaries(window="30d")
+                known = any(s.profile_uid == uid and s.node_name == name for s in summaries)
+            if not known:
+                raise ValueError("节点已变化")
             win32clipboard.OpenClipboard()
             try:
                 win32clipboard.EmptyClipboard()
@@ -1407,6 +1598,63 @@ class Desktop:
             return {"ok": True}
         except Exception:
             return {"ok": False, "error": "复制失败，请重新选择节点"}
+
+    def copy_node_summary(self, value):
+        try:
+            if not isinstance(value, dict):
+                raise ValueError("参数无效")
+            uid, name = value["uid"], value["name"]
+            view = value.get("view", "live")
+            window = value.get("window", "7d")
+            if not isinstance(uid, str) or not isinstance(name, str) or view not in ("live", "history"):
+                raise ValueError("参数无效")
+            if view == "history":
+                if window not in WINDOW_SPECS:
+                    window = "7d"
+                with self.lock:
+                    if self.closed.is_set():
+                        raise ValueError("应用已关闭")
+                summaries = self.telemetry_store.summaries(window=window)
+                item = next((s for s in summaries if s.profile_uid == uid and s.node_name == name), None)
+                if item is None:
+                    raise ValueError("历史节点不存在")
+                proto = (item.node_type or "—").upper()
+                speed = f"{item.weighted_median_speed_bps / 1_048_576:.2f} MiB/s" if item.success_count > 0 else "—"
+                lat = f"{item.weighted_median_latency_ms:.0f} ms" if item.success_count > 0 else "—"
+                avail = f"{round(item.availability_rate * 100)}%"
+                penalty = f" · 扣分 -{item.health_penalty:.1f}" if item.health_penalty > 0 else ""
+                summary = (
+                    f"[{item.profile_name}] {item.node_name} ({proto}) · "
+                    f"稳健吞吐 {speed} · 典型延迟 {lat} · 可用率 {avail} · "
+                    f"样本 {item.success_count}/{item.total_count} · 长效分 {item.long_term_score:.1f}{penalty}"
+                )
+            else:
+                with self.lock:
+                    if self.closed.is_set():
+                        raise ValueError("应用已关闭")
+                    row = next((r for r in self.rows if r.uid == uid and r.name == name), None)
+                    if row is None:
+                        raise ValueError("节点已变化")
+                    m = row.measurement
+                    proto = (row.node_type or (m.node_type if m else "") or "—").upper()
+                    speed = f"{m.download_bytes_per_second / 1_048_576:.2f} MiB/s" if m else "—"
+                    lat = f"{m.latency_ms:.0f} ms" if m else "—"
+                    jitter = f"{m.jitter_ms:.0f} ms" if m else "—"
+                    loss = f"{round((6 - m.head_successes) * 100 / 6)}%" if m else "—"
+                    score = f"{m.score:.1f}" if m and m.score is not None else row.state
+                    summary = (
+                        f"[{row.profile}] {row.name} ({proto}) · "
+                        f"吞吐 {speed} · 延迟 {lat} · 抖动 {jitter} · 丢包 {loss} · 评分 {score}"
+                    )
+            win32clipboard.OpenClipboard()
+            try:
+                win32clipboard.EmptyClipboard()
+                win32clipboard.SetClipboardText(summary, win32clipboard.CF_UNICODETEXT)
+            finally:
+                win32clipboard.CloseClipboard()
+            return {"ok": True, "text": summary}
+        except Exception:
+            return {"ok": False, "error": "复制摘要失败，请重新选择节点"}
 
     def close(self):
         self.closed.set()

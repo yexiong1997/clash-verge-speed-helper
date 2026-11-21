@@ -27,7 +27,7 @@
 ## 2. 后端桥接与状态机契约（`Windows/*.py`）
 
 ### 2.1 `Windows/run.py` 与 `PublicApi`
-- `PublicApi` 仅暴露既有 14 个白名单方法：`get_state`、`refresh`、`set_selection`、`start`、`retest_node`、`start_funnel`、`stop`、`refresh_groups`、`switch_manual`、`undo_switch`、`continue_pending`、`set_schedule`、`export_tsv`、`copy_node_name`；严禁暴露 `window`、`registry`、`secret` 或底层管道/文件诊断信息。
+- `PublicApi` 仅暴露收口后的白名单方法：`get_state`、`refresh`、`set_selection`、`start`、`retest_node`、`start_funnel`、`stop`、`refresh_groups`、`switch_manual`、`undo_switch`、`continue_pending`、`set_schedule`、`set_patrol`、`get_history`、`clear_history`、`export_tsv`、`copy_node_name`、`copy_node_summary`、`probe_active_node`、`save_preferences`、`hide_to_tray`、`set_minimize_to_tray`；严禁暴露 `window`、`registry`、`secret` 或底层管道/文件诊断信息。其中 `probe_active_node` 仅触发只读延迟探测，`save_preferences` 仅允许持久化安全人体工学参数（`parallel`、`download_bytes`、`mode`、`interval`、`patrol_quota`、`top_n`），严禁持久化 `auto_switch` 或任何定时/巡检武装态。
 - `import webview` 下移至 `main()` 创建窗口分支（`--smoke-test` 返回之后），确保测试与离线检查无需 `pywebview` 即可导入 `PublicApi` 并运行 `--smoke-test`。
 - Worker 路径解析优先使用 `CLASH_SPEED_HELPER_WORKER`，其次使用打包同目录 `clash-speedtest.exe` 或源码构建产物/约定的安装回退路径，并保留 `--profile-root <隔离目录>` 参数支持。
 
