@@ -229,7 +229,7 @@ extension MultiAppDelegate {
         cancelled = false
         refreshAfterProfileSwitch()
         let switchDeadline = ProcessInfo.processInfo.systemUptime + 5
-        while (busy || registry.first(where: { $0.isCurrent })?.uid != "uidB") && ProcessInfo.processInfo.systemUptime < switchDeadline {
+        while (busy || groupRefreshInFlight || registry.first(where: { $0.isCurrent })?.uid != "uidB") && ProcessInfo.processInfo.systemUptime < switchDeadline {
             _ = RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02))
         }
         let freshReg = try ProfileRegistry.options(root: switchRoot)
@@ -284,6 +284,74 @@ extension MultiAppDelegate {
         check("hideToTrayPressed hides window while keeping app alive", isHiddenInTray && !window.isVisible && !closed)
         _ = applicationShouldHandleReopen(NSApp, hasVisibleWindows: false)
         check("applicationShouldHandleReopen restores main window", !isHiddenInTray && window.isVisible && trayToggleWindowItem.title == "隐藏到托盘")
+        // UX polish checks: crisp scheduleStatus, >4 subscription pills, actionable empty states, Cmd+F focus.
+        disarmActiveSchedule()
+        check("scheduleStatus is crisp and preserves tooltip", scheduleStatus.stringValue == "定时未启用 · 支持托盘后台" && (scheduleStatus.toolTip?.contains("退出应用后停止") == true))
+        let sixOptions = (1...6).map { idx in ProfileOption(uid: "u\(idx)", name: "订阅\(idx)", path: "/tmp/u\(idx).yaml", isCurrent: idx == 1) }
+        registry = sixOptions
+        selected = []
+        selectionPreview = nil
+        nodeSelection = nil
+        rows = []; visibleRows = []
+        resultTable.reloadData()
+        updateControls()
+        check("rebuildSubscriptionPills renders all 6 subscriptions", subPillsStack.arrangedSubviews.count == 6)
+        check("empty state shows actionable current & all buttons", !emptyStateStack.isHidden && !emptyStatePrimaryButton.isHidden && emptyStatePrimaryButton.title == "勾选当前订阅" && !emptyStateSecondaryButton.isHidden && emptyStateIconView.image != nil)
+        try save("native-empty-dark-1240.png", NSSize(width: 1240, height: 800), .darkAqua)
+        // Active Clash node indicator, live filter counts, context menu, Space toggle, copy summary, and retest restore checks.
+        registry = [option]; selected = [option.id]; selectionPreview = batch
+        rows = multiPreviewRows(batch); nodeSelection = Set(rows.map(\.identity))
+        for i in 0..<5 {
+            rows[i].measurement = VerifiedMeasurement(nodeName: names[i], nodeType: i % 2 == 0 ? "VLESS" : "Trojan", headAttempts: 6, headSuccesses: 6, latencyMilliseconds: Double(38 + i * 17), jitterMilliseconds: 4.2, expectedBytes: 1_048_576, receivedBytes: 1_048_576, downloadComplete: true, downloadBytesPerSecond: Double(20 - i * 2) * 1_048_576)
+            rows[i].state = "有效"
+        }
+        rows[8].state = "无效"; rows[9].state = "无效"
+        let fakeController = MultiControllerIdentity(path: "/tmp/synthetic.sock", device: 1, inode: 1)
+        let fakeGroup = ProxyGroup(name: "Proxy", now: names[0], all: names)
+        groupContext = MultiGroupContext(controller: fakeController, profile: profile, groups: [fakeGroup])
+        groupPopup.removeAllItems()
+        groupPopup.addItem(withTitle: "请选择当前订阅策略组")
+        groupPopup.addItem(withTitle: "Proxy  [当前: \(names[0])]")
+        groupPopup.selectItem(at: 1)
+        reloadVisibleRows(); updateControls()
+        try save("native-active-dark-1240.png", NSSize(width: 1240, height: 800), .darkAqua)
+        let activeRowView = resultTable.rowView(atRow: 0, makeIfNecessary: true) as? MultiResultRowView
+        check("active Clash node highlights table row and hero pill", activeClashNodeIdentity() == rows[0].identity && activeRowView?.isCurrentActiveNode == true && champReadyLabel.stringValue == "● 当前使用中")
+        check("hero uses localized title and telemetry strip", champTagLabel?.stringValue == "最优路由" && champTelemetryStrip.items.count == 3)
+        check("live filter pills display accurate counts", filterValidButton.title == "仅有效 5" && filterFailedButton.title == "失败 2")
+        check("window fitting width stays within 1080 minimum", rootView.fittingSize.width <= 1080.0, "fitting:\(rootView.fittingSize)")
+        // Context menu + Space toggle + copy summary
+        resultTable.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
+        menuNeedsUpdate(rowMenu)
+        check("context menu enables row actions in live mode", rowMenuSwitchItem.isEnabled && rowMenuCheckOnlyItem.isEnabled && !rowMenuCheckOnlyItem.isHidden && rowMenuJumpLiveItem.isHidden)
+        let spaceHandled = toggleSelectedRowWithSpace()
+        check("Space key toggles selected node check state", spaceHandled && nodeSelection?.contains(rows[1].identity) == false)
+        _ = toggleSelectedRowWithSpace()
+        contextCheckOnlyRow(nil)
+        check("contextCheckOnlyRow isolates single node selection", nodeSelection == [rows[1].identity])
+        contextCopyRowSummary(nil)
+        check("contextCopyRowSummary writes readable telemetry summary", (NSPasteboard.general.string(forType: .string)?.contains(names[1]) == true) && status.stringValue.contains("测速摘要"))
+        // Non-destructive 20M retest restores prior settings & selection on abort
+        nodeSelection = Set(rows.map(\.identity))
+        parallelBox.stringValue = "10"; modePopup.selectItem(at: 0); sizePopup.selectItem(at: 4)
+        pendingRetestRestore = (nodeSelection, "10", 0, 4)
+        nodeSelection = [rows[0].identity]; parallelBox.stringValue = "1"; modePopup.selectItem(at: 1); sizePopup.selectItem(at: sizeValues.firstIndex(of: 20 * 1_048_576)!)
+        if let prevTok = activeToken { _ = schedule.finishRun(prevTok, now: TestSchedule.monotonicNow()); activeToken = nil }
+        let restoreTok = schedule.beginManualRun()!
+        activeToken = restoreTok; busy = true
+        abort(restoreTok, "复测完成")
+        check("retest abort restores prior nodeSelection and settings", nodeSelection?.count == rows.count && parallelBox.stringValue == "10" && modePopup.indexOfSelectedItem == 0 && sizePopup.indexOfSelectedItem == 4)
+        // Filter empty state + resetFilters action
+        groupContext = nil; groupPopup.removeAllItems(); groupPopup.addItem(withTitle: "请选择当前订阅策略组")
+        registry = [optA, optB]; selected = [optA.id, optB.id]; selectionPreview = freshPrepare
+        rows = multiPreviewRows(freshPrepare); nodeSelection = Set(rows.map(\.identity))
+        nodeSearch.stringValue = "nonexistent-node-xyz"
+        reloadVisibleRows(); updateControls()
+        check("filter empty state shows reset button", !emptyStateStack.isHidden && emptyStatePrimaryButton.title == "重置筛选条件")
+        emptyStatePrimaryPressed(nil)
+        check("emptyStatePrimaryPressed resets search filter", nodeSearch.stringValue.isEmpty && !visibleRows.isEmpty && emptyStateStack.isHidden)
+        focusSearchField(nil)
+        check("focusSearchField focuses nodeSearch in live mode", window.firstResponder === nodeSearch || window.firstResponder === nodeSearch.currentEditor())
         let termWhileIdle = applicationShouldTerminate(NSApp)
         check("applicationShouldTerminate exits cleanly when idle", termWhileIdle == .terminateNow && closed)
         window.close()
