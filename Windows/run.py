@@ -33,13 +33,14 @@ class PublicApi:
     def set_patrol(self, value): return self._desktop.set_patrol(value)
     def get_history(self, value=None): return self._desktop.get_history(value)
     def clear_history(self): return self._desktop.clear_history()
-    def export_tsv(self): return self._desktop.export_tsv()
+    def export_tsv(self, value=None): return self._desktop.export_tsv(value)
     def copy_node_name(self, value): return self._desktop.copy_node_name(value)
     def copy_node_summary(self, value): return self._desktop.copy_node_summary(value)
     def probe_active_node(self, value=None): return self._desktop.probe_active_node(value)
     def save_preferences(self, value): return self._desktop.save_preferences(value)
     def hide_to_tray(self): return self._desktop.hide_to_tray()
     def set_minimize_to_tray(self, value): return self._desktop.set_minimize_to_tray(value)
+    def configure_runtime_bridge(self, value): return self._desktop.configure_runtime_bridge(value)
 
 
 def resolve_worker(base=None, frozen=None):

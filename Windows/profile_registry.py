@@ -4,6 +4,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import re
 import unicodedata
 
 import yaml
@@ -16,6 +17,9 @@ MAX_TEXT = 8192
 _REPARSE = win32con.FILE_ATTRIBUTE_REPARSE_POINT
 _DIRECTORY = win32con.FILE_ATTRIBUTE_DIRECTORY
 _OPEN_REPARSE_POINT = 0x00200000
+_YAML12_FLOW_SCALAR_RE = re.compile(
+    r'(?<=:\s)([^\s,{}\[\]"\'#&*!]+:[^\s,{}\[\]"\'#&*!]+)(?=\s*[,}])'
+)
 
 
 class ProfileError(Exception):
@@ -35,13 +39,35 @@ class _StrictLoader(yaml.SafeLoader):
         return result
 
 
+def _strict_parse_yaml_text(text):
+    for token in yaml.scan(text, Loader=_StrictLoader):
+        if isinstance(token, (yaml.AliasToken, yaml.AnchorToken, yaml.TagToken)):
+            raise ProfileError("invalid YAML")
+    return yaml.load(text, Loader=_StrictLoader)
+
+
+def _normalize_yaml12_flow_scalars(text):
+    def _quote(match):
+        val = match.group(1).replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{val}"'
+    return _YAML12_FLOW_SCALAR_RE.sub(_quote, text)
+
+
 def parse_yaml(raw):
     try:
         text = raw.decode("utf-8", "strict")
-        for token in yaml.scan(text, Loader=_StrictLoader):
-            if isinstance(token, (yaml.AliasToken, yaml.AnchorToken, yaml.TagToken)):
-                raise ProfileError("invalid YAML")
-        return yaml.load(text, Loader=_StrictLoader)
+        try:
+            return _strict_parse_yaml_text(text)
+        except yaml.YAMLError:
+            # YAML 1.2 (Go yaml.v3 / Mihomo) allows unquoted flow-mapping scalars
+            # containing non-spaced colons (e.g. SS2022 base64:base64 passwords
+            # or IPv6 literals), while PyYAML (YAML 1.1) rejects them. Quote only
+            # those plain values on fallback and enforce the exact same strict
+            # anchor/alias/tag/duplicate-key validation.
+            normalized = _normalize_yaml12_flow_scalars(text)
+            if normalized == text:
+                raise
+            return _strict_parse_yaml_text(normalized)
     except (yaml.YAMLError, UnicodeError, RecursionError, ValueError):
         raise ProfileError("invalid YAML") from None
 

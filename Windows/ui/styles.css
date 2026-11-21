@@ -488,6 +488,22 @@ h2{font-size:14.5px;margin:0;font-weight:700;white-space:nowrap}
   outline:none;
 }
 .strategy-row>button{padding:6px 11px;font-size:12px;border-radius:999px}
+.strategy-row>button.bridge-pill{
+  padding:4px 9px;
+  font-size:11px;
+  font-weight:600;
+  border-radius:999px;
+  background:#ffffffc7;
+  border:1px solid #cfd9ec;
+  color:#5b6782;
+  white-space:nowrap;
+  flex-shrink:0;
+  box-shadow:none;
+}
+.strategy-row>button.bridge-pill:hover:not(:disabled){background:#fff;border-color:#a5b4fc;color:#3b4cc0}
+.strategy-row>button.bridge-pill.ready{color:#0f766e;background:#ecfdf5;border-color:#a7f3d0}
+.strategy-row>button.bridge-pill.ready:hover:not(:disabled){background:#d1fae5;border-color:#6ee7b7}
+.strategy-row>button.bridge-pill.warn{color:#b45309;background:#fffbeb;border-color:#fde68a}
 .switch{
   display:inline-flex;
   align-items:center;
@@ -995,6 +1011,7 @@ tbody tr.is-located{animation:locateFlash 900ms ease-out}
   .topn-pill input{width:26px}
   .table-tools .quiet{padding:5px 6px;font-size:12px}
   .health-pill{font-size:10.5px;padding:2px 7px}
+  .strategy-row>button.bridge-pill{font-size:10.5px;padding:3px 7px}
   .count-pill{font-size:10.5px;padding:2px 7px}
   .param-pill{font-size:11.5px;padding:0 6px 0 8px;gap:4px}
   .param-pill select{font-size:12px}

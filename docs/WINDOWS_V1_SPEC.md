@@ -16,7 +16,7 @@
 4. **门禁与并发状态机收口**：严格区分 `SwitchLatch.outcome_unknown`（全局写锁，但放行纯测速）与 `pending`（跨订阅受控续接），修补并发重入与取消定时锁边界。
 
 ### 1.2 Non-goals（V1 明确不做）
-- **不做** Clash Verge 运行时注入或自动跨订阅热切换（跨订阅最优节点沿用 `pending` → 用户到 Clash Verge 手动切订阅 → 回助手「刷新」+「刷新策略组」→「继续应用最优」）。
+- **不做** 修改、重签名、替换或重装官方原版 Clash Verge（`clash-verge.exe` 及安装目录文件始终保持原封未动）；也不使用纯 UI 点击或模拟键鼠切换订阅。
 - **不做** TCP `external-controller` 降级（仅认 `clash-verge.yaml` 中 `external-controller-pipe` 或 `external-controller-unix`，两者同非空或缺失时直接拒绝）。
 - **不做** 后台常驻服务或开机自启定时任务（定时仅在应用运行期内存生效，关闭即停，选区/参数/策略组/授权变化即撤防）。
 - **不做** 节点列表自动改写、`proxy-providers` / `rule-providers` 远程拉取、不可信订阅网络沙箱，也不以关闭系统防护方式绕过未签名安全提示。
@@ -27,7 +27,7 @@
 ## 2. 后端桥接与状态机契约（`Windows/*.py`）
 
 ### 2.1 `Windows/run.py` 与 `PublicApi`
-- `PublicApi` 仅暴露收口后的白名单方法：`get_state`、`refresh`、`set_selection`、`start`、`retest_node`、`start_funnel`、`stop`、`refresh_groups`、`switch_manual`、`undo_switch`、`continue_pending`、`set_schedule`、`set_patrol`、`get_history`、`clear_history`、`export_tsv`、`copy_node_name`、`copy_node_summary`、`probe_active_node`、`save_preferences`、`hide_to_tray`、`set_minimize_to_tray`；严禁暴露 `window`、`registry`、`secret` 或底层管道/文件诊断信息。其中 `probe_active_node` 仅触发只读延迟探测，`save_preferences` 仅允许持久化安全人体工学参数（`parallel`、`download_bytes`、`mode`、`interval`、`patrol_quota`、`top_n`），严禁持久化 `auto_switch` 或任何定时/巡检武装态。
+- `PublicApi` 仅暴露收口后的白名单方法：`get_state`、`refresh`、`set_selection`、`start`、`retest_node`、`start_funnel`、`stop`、`refresh_groups`、`switch_manual`、`undo_switch`、`continue_pending`、`set_schedule`、`set_patrol`、`get_history`、`clear_history`、`export_tsv`、`copy_node_name`、`copy_node_summary`、`probe_active_node`、`save_preferences`、`hide_to_tray`、`set_minimize_to_tray`、`configure_runtime_bridge`；严禁暴露 `window`、`registry`、`secret`、bearer token、CDP 端口或底层管道/文件诊断信息。其中 `probe_active_node` 仅触发只读延迟探测，`save_preferences` 仅允许持久化安全人体工学参数（`parallel`、`download_bytes`、`mode`、`interval`、`patrol_quota`、`top_n`），`configure_runtime_bridge` 仅接受 `enable` / `disable` / `probe` 三种白名单动作。
 - `import webview` 下移至 `main()` 创建窗口分支（`--smoke-test` 返回之后），确保测试与离线检查无需 `pywebview` 即可导入 `PublicApi` 并运行 `--smoke-test`。
 - Worker 路径解析优先使用 `CLASH_SPEED_HELPER_WORKER`，其次使用打包同目录 `clash-speedtest.exe` 或源码构建产物/约定的安装回退路径，并保留 `--profile-root <隔离目录>` 参数支持。
 
@@ -147,3 +147,21 @@
    - **Given** 此前已选择目标策略组并开启 `#auto`，某次 `PUT` 切换发生超时/状态不明触发 `SwitchLatch.outcome_unknown = True`
    - **When** 尝试调用 `switch_manual`、`undo_switch`、`continue_pending`、`refresh_groups`、带 `auto_switch=True` 的任务，或点击 `#start` / `#stress` / `#funnel` / `#retest-best` / `#menu-retest` 进行纯测速
    - **Then** 全部控制器写路径与 `refresh_groups` 严格拒绝且不发起 `PUT`；前端自动将 `#auto.checked` 置 `false` 并禁用写控件与 `#group` / `#refresh-groups`，同时在 `options()` 与 `retestRow()` 兜底传出 `auto_switch: false, group: ""`，使全部纯测速（含单节点复测）仍可正常启动与完成。
+
+---
+
+## 6. Windows 跨订阅无感热切换与体验一致性增量（`Windows/runtime_broker.py`、`Windows/runtime_bridge.py`）
+
+### 6.1 架构与安全边界
+- **零二进制修改、零弹窗、跨越 UIPI**：经对官方原版 Clash Verge 2.5.10（Tauri + Edge WebView2）静态与运行态逆向确认，`clash-verge.exe` 常以 High IL（管理员计划任务）运行，其内置 `msedgewebview2.exe` 降权运行于 Medium IL，且原版单实例 HTTP（`127.0.0.1:1959`）、`clash://`、`startup_script` 与 `clash-verge-service` 均无订阅切换接口。采用 Edge WebView2 Runtime 原生支持的进程级策略 `HKLM\SOFTWARE\Policies\Microsoft\Edge\WebView2\AdditionalBrowserArguments`（值名严格限定 `clash-verge.exe`，值 `--remote-debugging-port=0`，不波及任何其他 WebView2 应用；或启动原版 `clash-verge.exe` 时以进程级环境变量传递 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=0`）。
+- **严格 Loopback 与高熵 Bearer Token 轻桥**：
+  - Edge WebView2 分配随机空闲本机端口，严格绑定 `127.0.0.1`（跨站 WebSocket 拒绝为 `403 Forbidden`），将端口写入当前用户 `%LOCALAPPDATA%\io.github.clash-verge-rev.clash-verge-rev\EBWebView\DevToolsActivePort`（读取时校验全路径无重解析点）。
+  - `Windows/runtime_broker.py` 仅监听 `127.0.0.1:0`，生成 256-bit 随机 bearer token，严格校验 `Origin`（仅允许官方 Tauri localhost origin，绝不用 `*`）和恒定时间 `Authorization: Bearer`；暴露的命令严格白名单为 `switch(uid)`（`get_profiles` + 官方 `patch_profiles_config` + 二次校验）和 `detach`，绝不提供通用 JS 执行或文件系统访问。
+  - `Windows/runtime_bridge.py` 经本机 RFC 6455 WebSocket CDP `Runtime.evaluate` 静默注入轻桥，零 DevTools 弹窗、零焦点抢占、即使 Clash Verge 隐藏到系统托盘仍可工作。
+- **门禁与优雅回退**：
+  - 当跨订阅热切桥就绪时，自动切换（手动/定时/两段优选/复测）与手动切换（实时表/冠军卡/右键/长效优选榜）均可直接触发官方 `patch_profiles_config` 完成内核热生效 + 前端 UI 同步刷新，待本地 Named Pipe / AF_UNIX 控制器收敛后经 `AssistedSwitch` 应用并复核目标策略组节点。
+  - 当命令尚未被轻桥取走或桥未就绪时，自动切换 100% 优雅回退至既有 `pending` + 「继续应用最优」流程；一旦命令已送达 Clash Verge 执行但超时、断连或无法核实结果，**必须**置 `SwitchLatch.outcome_unknown = True` 锁死写操作，绝不谎称“未应用”。
+- **体验一致性增量（对齐 macOS `5e2e3df`）**：
+  1. 首次刷新默认仅选中当前激活订阅（保留「全选」按钮与后续刷新选区记忆）。
+  2. 长效优选榜支持「导出 TSV」（默认 `clash-history-results.tsv`，UTF-8 BOM + 剪贴板同步 + 公式注入中和）。
+  3. `Windows/profile_registry.py` 的 `parse_yaml` 增加受限 YAML 1.2 fallback，兼容 SS2022（`password: <b64>:<b64>`）及 IPv6 无引号 flow scalar，并保持全部 anchor / alias / tag / 重复键严格拒绝。

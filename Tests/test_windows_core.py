@@ -136,6 +136,27 @@ class ProfileTests(unittest.TestCase):
             with self.subTest(raw=raw), self.assertRaises(ProfileError):
                 parse_yaml(raw)
 
+    def test_yaml12_ss2022_and_ipv6_flow_scalar_compat_preserves_strict_rejects(self):
+        valid_yaml = (
+            b"proxies:\n"
+            b"- {name: ss2022-node, type: ss, server: 1.2.3.4, port: 443, "
+            b"cipher: 2022-blake3-aes-128-gcm, password: aaaa/bbb=:cccc+ddd=}\n"
+            b"- {name: ipv6-node, type: vmess, server: 2001:db8::1, port: 443}\n"
+        )
+        parsed = parse_yaml(valid_yaml)
+        self.assertEqual(parsed["proxies"][0]["password"], "aaaa/bbb=:cccc+ddd=")
+        self.assertEqual(parsed["proxies"][1]["server"], "2001:db8::1")
+        self.assertEqual(inspect_nodes(valid_yaml), ("ss2022-node", "ipv6-node"))
+
+        for bad in (
+            b"proxies:\n- &a {name: ss2022, password: aaaa/bbb=:cccc+ddd=}\n- *a\n",
+            b"proxies:\n- {name: !!str ss2022, password: aaaa/bbb=:cccc+ddd=}\n",
+            b"proxies:\n- {name: ss2022, name: dup, password: aaaa/bbb=:cccc+ddd=}\n",
+            b"proxies:\n- {name: ss2022, password: aaaa/bbb=:cccc+ddd=}\nproxies:\n- {name: dup}\n",
+        ):
+            with self.subTest(bad=bad), self.assertRaises(ProfileError):
+                parse_yaml(bad)
+
     def test_reject_provider_and_duplicate_names(self):
         self.assertEqual(
             inspect_nodes(b"rule-providers: {ads: {type: http}}\nproxies:\n- {name: A}\n"),

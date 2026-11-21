@@ -13,6 +13,17 @@ from .batch import Job, MultiBatchRunner
 from .controller import (AssistedSwitch, ControllerError, PipeController, ProbeError,
                          SwitchLatch, read_settings, read_tun_enabled)
 from .profile_registry import ProfileError, default_root, load_registry, revalidate, snapshot_profile
+from .runtime_bridge import (
+    WindowsRuntimeBridge,
+    disable_webview2_cdp_policy,
+    enable_webview2_cdp_policy,
+)
+from .runtime_broker import (
+    RuntimeBridgeUnavailable,
+    RuntimeBrokerError,
+    RuntimeSwitchCancelled,
+    RuntimeSwitchOutcomeUnknown,
+)
 from .schedule import TestSchedule
 from .settings import AppSettingsStore, SettingsSecurityError
 from .telemetry_history import (TelemetryHealthEvent, TelemetryHistoryStore,
@@ -51,7 +62,8 @@ def _eligible_name(name):
 
 
 class Desktop:
-    def __init__(self, executable, root=None, telemetry_dir=None, settings_dir=None):
+    def __init__(self, executable, root=None, telemetry_dir=None, settings_dir=None,
+                 runtime_bridge=None):
         self.executable = Path(executable)
         self.root = Path(root) if root else default_root()
         self.lock = threading.RLock()
@@ -75,6 +87,7 @@ class Desktop:
         self.snapshots = {}
         self.rows = []
         self.selected_profiles = set()
+        self._has_applied_initial_selection = False
         self.groups = []
         self.suggested_group = None
         self.probe_group = None
@@ -110,9 +123,82 @@ class Desktop:
         self._health_probe_thread = None
         self._last_health_probe_at = 0.0
         self.latch = SwitchLatch()
+        if runtime_bridge is not None:
+            self.runtime_bridge = runtime_bridge
+        elif root is not None:
+            self.runtime_bridge = WindowsRuntimeBridge(
+                webview_dir=Path(root) / ".ebwebview",
+                policy_checker=lambda: False,
+            )
+        else:
+            self.runtime_bridge = WindowsRuntimeBridge()
+        self._runtime_bridge_status = {
+            "state": "not_configured",
+            "ready": False,
+            "attached": False,
+            "cdp_ready": False,
+            "policy_configured": False,
+            "label": "跨订阅热切 未启用",
+        }
         self.closed = threading.Event()
         self.window = None
         threading.Thread(target=self._timer, daemon=True).start()
+
+    def _refresh_runtime_bridge_status(self, force_probe=False):
+        try:
+            info = self.runtime_bridge.status(force_probe=force_probe)
+        except Exception:
+            info = {
+                "state": "not_configured",
+                "ready": False,
+                "attached": False,
+                "cdp_ready": False,
+                "policy_configured": False,
+                "label": "跨订阅热切 未启用",
+            }
+        with self.lock:
+            self._runtime_bridge_status = dict(info)
+        return info
+
+    def configure_runtime_bridge(self, value):
+        try:
+            if not isinstance(value, dict):
+                raise ValueError("参数无效")
+            action = value.get("action")
+            if action not in ("enable", "disable", "probe"):
+                raise ValueError("不支持的操作")
+            with self.lock:
+                if self.closed.is_set() or self.running or self.refreshing:
+                    return {"ok": False, "error": "测速或刷新进行中，请稍后再试"}
+            if action == "enable":
+                res = enable_webview2_cdp_policy()
+                info = self._refresh_runtime_bridge_status(force_probe=True)
+                with self.lock:
+                    self.status = res.get("message") or res.get("error") or self.status
+                return {"ok": bool(res.get("ok")), "error": res.get("error", ""), "runtime_bridge": info}
+            if action == "disable":
+                res = disable_webview2_cdp_policy()
+                info = self._refresh_runtime_bridge_status(force_probe=True)
+                with self.lock:
+                    self.status = res.get("message") or res.get("error") or self.status
+                return {"ok": bool(res.get("ok")), "error": res.get("error", ""), "runtime_bridge": info}
+            info = self._refresh_runtime_bridge_status(force_probe=True)
+            if info.get("cdp_ready") and not info.get("attached"):
+                try:
+                    self.runtime_bridge.ensure_attached(timeout=3.0)
+                    info = self._refresh_runtime_bridge_status(force_probe=True)
+                except Exception:
+                    info = self._refresh_runtime_bridge_status(force_probe=True)
+            with self.lock:
+                if info.get("ready"):
+                    self.status = "跨订阅无感热切已就绪，切换非当前订阅节点时将自动热切"
+                elif info.get("policy_configured"):
+                    self.status = "跨订阅热切策略已配置，请重启一次 Clash Verge 生效"
+                else:
+                    self.status = "跨订阅热切尚未启用；可点此启用或继续使用手动切换订阅流程"
+            return {"ok": True, "runtime_bridge": info}
+        except Exception:
+            return {"ok": False, "error": "跨订阅热切配置失败"}
 
     def _invalidate(self, clear_pending=True):
         self.generation += 1
@@ -222,6 +308,7 @@ class Desktop:
                     "window_visible": self.window_visible,
                     "preferences": dict(self.preferences),
                     "run_progress": self._run_progress_locked(),
+                    "runtime_bridge": dict(self._runtime_bridge_status),
                     "status": self.status, "outcome_unknown": self.latch.outcome_unknown}
 
     def _notify_tray(self):
@@ -457,8 +544,27 @@ class Desktop:
             with self.lock:
                 if generation != self.generation or self.closed.is_set():
                     raise ProfileError("cancelled")
+                prev_selected = set(self.selected_profiles)
                 self.registry, self.snapshots, self.rows = registry, snapshots, rows
-                self.selected_profiles = set(snapshots)
+                if not self._has_applied_initial_selection:
+                    self._has_applied_initial_selection = True
+                    current = next((p for p in registry.profiles if p.current and p.uid in snapshots), None)
+                    if current is not None:
+                        self.selected_profiles = {current.uid}
+                    elif snapshots:
+                        first_uid = next(p.uid for p in registry.profiles if p.uid in snapshots)
+                        self.selected_profiles = {first_uid}
+                    else:
+                        self.selected_profiles = set()
+                else:
+                    kept = prev_selected & set(snapshots)
+                    if kept:
+                        self.selected_profiles = kept
+                    elif prev_selected:
+                        current = next((p for p in registry.profiles if p.current and p.uid in snapshots), None)
+                        self.selected_profiles = {current.uid} if current is not None else set()
+                    else:
+                        self.selected_profiles = set()
                 self.tun_enabled = tun_enabled
                 if not registry.profiles:
                     self.status = "没有可用的本地订阅"
@@ -477,6 +583,7 @@ class Desktop:
                         row = next(r for r in rows if r.uid == uid and r.name == node)
                         row.measurement, row.state = measurement, "上轮最优"
                         self.status = "已保留上轮最优节点；确认当前订阅后刷新策略组并继续"
+            self._refresh_runtime_bridge_status(force_probe=True)
             return {"ok": True}
         except Exception:
             with self.lock:
@@ -595,6 +702,215 @@ class Desktop:
                 self.capture, self.groups, self.suggested_group = None, [], None
                 self.status = "无法读取当前订阅的策略组；请确认本地控制器可用"
             return {"ok": False, "error": self.status}
+
+    @staticmethod
+    def _compute_suggested_group(groups, snapshot_names):
+        names = set(snapshot_names)
+        full = [g.name for g in groups if g.name != "GLOBAL" and names <= set(g.all)]
+        if len(full) == 1:
+            return full[0]
+        non_global = [g.name for g in groups if g.name != "GLOBAL"]
+        return non_global[0] if len(non_global) == 1 else None
+
+    @staticmethod
+    def _group_core_name(name):
+        return "".join(ch for ch in str(name or "").lower() if ch.isalnum())
+
+    @staticmethod
+    def _resolve_target_group(groups, preferred_group, target_node, snapshot_names):
+        if preferred_group:
+            direct = next((g for g in groups if g.name == preferred_group and target_node in g.all), None)
+            if direct is not None:
+                return direct.name
+            pref_core = Desktop._group_core_name(preferred_group)
+            if pref_core:
+                core_matches = [
+                    g.name for g in groups
+                    if g.name != "GLOBAL" and target_node in g.all and Desktop._group_core_name(g.name) == pref_core
+                ]
+                if len(core_matches) == 1:
+                    return core_matches[0]
+        names = set(snapshot_names)
+        full = [g.name for g in groups if g.name != "GLOBAL" and target_node in g.all and names <= set(g.all)]
+        if len(full) == 1:
+            return full[0]
+        containing = [g.name for g in groups if g.name != "GLOBAL" and target_node in g.all]
+        if len(containing) == 1:
+            return containing[0]
+        return None
+
+    def _wait_controller_for_profile(self, target_uid, target_node, timeout=12.0, is_cancelled=None):
+        deadline = time.monotonic() + max(1.0, float(timeout))
+        while time.monotonic() < deadline:
+            if is_cancelled is not None and is_cancelled():
+                raise RuntimeSwitchCancelled("cancelled")
+            try:
+                fresh_registry = load_registry(self.root)
+                target_profile = next(
+                    (p for p in fresh_registry.profiles if p.uid == target_uid and p.current),
+                    None,
+                )
+                if target_profile is not None:
+                    fresh_snapshot = snapshot_profile(fresh_registry, target_profile)
+                    if target_node in fresh_snapshot.names:
+                        fresh_settings = read_settings(fresh_registry)
+                        ctrl = PipeController(fresh_settings)
+                        fresh_groups = ctrl.groups(fresh_snapshot.names)
+                        if any(target_node in g.all for g in fresh_groups):
+                            revalidate(fresh_registry, [fresh_snapshot])
+                            if read_settings(fresh_registry) == fresh_settings:
+                                return fresh_registry, fresh_snapshot, fresh_settings, ctrl.identity, tuple(fresh_groups)
+            except Exception:
+                pass
+            time.sleep(0.2)
+        raise RuntimeSwitchOutcomeUnknown("controller did not converge after profile switch")
+
+    def _hot_switch_cross_profile(self, target_uid, target_node, preferred_group, measurement,
+                                  generation, is_cancelled, allow_pending_fallback):
+        with self.lock:
+            if self.latch.outcome_unknown:
+                return "outcome_unknown", "切换结果未知，请手动核验；切换已锁定"
+            if not self.registry or target_uid not in self.snapshots:
+                return "not_attempted", "目标订阅不可用，请刷新订阅"
+            target_snapshot_old = self.snapshots[target_uid]
+            if target_node not in target_snapshot_old.names:
+                return "not_attempted", "目标节点不在该订阅中"
+            target_profile_name = target_snapshot_old.profile.name
+
+        bridge_info = self._refresh_runtime_bridge_status(force_probe=True)
+        if not bridge_info.get("ready"):
+            if allow_pending_fallback:
+                with self.lock:
+                    self.pending = (target_uid, target_node, measurement, self.registry, dict(self.snapshots))
+                    self.status = "最优节点不在当前订阅，请先在 Clash Verge 手动切换订阅（或启用跨订阅热切）"
+                return "pending_fallback", self.status
+            return "bridge_unavailable", "目标节点不在当前订阅；请先启用跨订阅热切或在 Clash Verge 手动切换订阅"
+
+        try:
+            self.runtime_bridge.switch_profile(target_uid, timeout=25.0, is_cancelled=is_cancelled)
+        except RuntimeBridgeUnavailable:
+            self._refresh_runtime_bridge_status(force_probe=True)
+            if allow_pending_fallback:
+                with self.lock:
+                    self.pending = (target_uid, target_node, measurement, self.registry, dict(self.snapshots))
+                    self.status = "跨订阅热切桥未就绪，请先在 Clash Verge 手动切换订阅"
+                return "pending_fallback", self.status
+            return "bridge_unavailable", "跨订阅热切桥未就绪，请检查 Clash Verge 或手动切换订阅"
+        except RuntimeSwitchCancelled:
+            return "not_attempted", "已取消跨订阅切换"
+        except RuntimeSwitchOutcomeUnknown:
+            with self.lock:
+                self.latch.outcome_unknown = True
+                self._invalidate()
+                self.status = "跨订阅切换结果未知，请到 Clash Verge 手动核验；切换已锁定"
+            self._refresh_runtime_bridge_status(force_probe=True)
+            return "outcome_unknown", self.status
+        except RuntimeBrokerError:
+            if allow_pending_fallback:
+                with self.lock:
+                    self.pending = (target_uid, target_node, measurement, self.registry, dict(self.snapshots))
+                    self.status = "未能在 Clash Verge 中定位目标订阅，请手动切换订阅"
+                return "pending_fallback", self.status
+            return "not_attempted", "未在 Clash Verge 中找到目标订阅，请刷新后重试"
+        except Exception:
+            with self.lock:
+                self.latch.outcome_unknown = True
+                self._invalidate()
+                self.status = "跨订阅切换结果未知，请到 Clash Verge 手动核验；切换已锁定"
+            self._refresh_runtime_bridge_status(force_probe=True)
+            return "outcome_unknown", self.status
+
+        # Profile switch transaction confirmed by official Clash Verge UI/core.
+        try:
+            fresh_registry, fresh_snapshot, fresh_settings, fresh_identity, fresh_groups = (
+                self._wait_controller_for_profile(target_uid, target_node, timeout=12.0, is_cancelled=is_cancelled)
+            )
+        except Exception:
+            with self.lock:
+                self.latch.outcome_unknown = True
+                self._invalidate()
+                self.status = "订阅已发起热切但控制器状态未能在时限内确认，请到 Clash Verge 手动核验；切换已锁定"
+            self._refresh_runtime_bridge_status(force_probe=True)
+            return "outcome_unknown", self.status
+
+        suggested = self._compute_suggested_group(fresh_groups, fresh_snapshot.names)
+        resolved_group = self._resolve_target_group(fresh_groups, preferred_group, target_node, fresh_snapshot.names)
+        tun_enabled = None
+        try:
+            tun_enabled = read_tun_enabled(fresh_registry)
+        except Exception:
+            tun_enabled = None
+
+        with self.lock:
+            self.registry = fresh_registry
+            self.snapshots[target_uid] = fresh_snapshot
+            if tun_enabled is not None:
+                self.tun_enabled = tun_enabled
+            self.capture = (fresh_registry, fresh_snapshot, fresh_settings, fresh_identity, fresh_groups)
+            self.groups = [{"name": g.name, "now": g.now} for g in fresh_groups]
+            self.suggested_group = suggested
+            if suggested:
+                self.probe_group = suggested
+            elif fresh_groups:
+                non_global = [g.name for g in fresh_groups if g.name != "GLOBAL"]
+                self.probe_group = non_global[0] if non_global else fresh_groups[0].name
+            self.undo = None
+
+        if resolved_group is None:
+            with self.lock:
+                self.pending = (target_uid, target_node, measurement, fresh_registry, dict(self.snapshots))
+                self.status = f"已自动热切订阅“{target_profile_name}”，请选择策略组后继续应用节点“{target_node}”"
+            self._refresh_runtime_bridge_status(force_probe=False)
+            return "group_select_required", self.status
+
+        try:
+            expected = next(g for g in fresh_groups if g.name == resolved_group)
+            switch = AssistedSwitch(fresh_registry, fresh_snapshot, target_node, measurement, self.latch)
+            groups_now = switch.prepare()
+            found = next(g for g in groups_now if g.name == resolved_group)
+            if switch.settings != fresh_settings or switch.controller.identity != fresh_identity or found.now != expected.now:
+                raise ControllerError("changed")
+
+            def authorized():
+                with self.lock:
+                    if generation != self.generation or self.closed.is_set():
+                        return False
+                    if is_cancelled is not None and is_cancelled():
+                        return False
+                    return True
+
+            outcome = switch.apply(resolved_group, authorized)
+            with self.lock:
+                if outcome == "outcome_unknown":
+                    self._invalidate()
+                    self.status = "订阅已热切但节点切换结果未知，请到 Clash Verge 手动核验；切换已锁定"
+                elif outcome in ("switched", "confirmed_noop"):
+                    self.pending = None
+                    if outcome == "switched":
+                        self.groups = [
+                            {"name": g["name"], "now": target_node if g["name"] == resolved_group else g["now"]}
+                            for g in self.groups
+                        ]
+                        if expected.now in fresh_snapshot.names and expected.now in expected.all and expected.now != target_node:
+                            self.undo = (target_uid, expected.now, resolved_group, target_node,
+                                         fresh_registry, fresh_snapshot, fresh_settings, fresh_identity)
+                        self.status = f"已自动热切订阅“{target_profile_name}”并切换到“{target_node}”"
+                    else:
+                        self.status = f"已自动热切订阅“{target_profile_name}”，策略组当前已是“{target_node}”"
+                else:
+                    self.pending = (target_uid, target_node, measurement, fresh_registry, dict(self.snapshots))
+                    self.status = f"已自动热切订阅“{target_profile_name}”，但节点条件已变化，请确认后继续应用"
+            self._refresh_runtime_bridge_status(force_probe=False)
+            return outcome, self.status
+        except Exception:
+            with self.lock:
+                if self.latch.outcome_unknown:
+                    self._invalidate()
+                    self.status = "订阅已热切但节点切换结果未知，请到 Clash Verge 手动核验；切换已锁定"
+                    return "outcome_unknown", self.status
+                self.pending = (target_uid, target_node, measurement, fresh_registry, dict(self.snapshots))
+                self.status = f"已自动热切订阅“{target_profile_name}”，请确认策略组后继续应用节点"
+            return "not_attempted", self.status
 
     def _validate_launch(self, options, scheduled):
         if scheduled and (self.schedule.minutes is None or self.scheduled_options is not options):
@@ -1020,10 +1336,20 @@ class Desktop:
     def _automatic(self, winner, group_name, capture, generation):
         registry, snapshot, settings, identity, groups = capture
         if winner.uid != snapshot.profile.uid:
-            with self.lock:
-                self.pending = (winner.uid, winner.name, winner.measurement, self.registry,
-                                dict(self.snapshots))
-                self.status = "最优节点不在当前订阅，请先在 Clash Verge 手动切换订阅"
+            def _is_cancelled():
+                with self.lock:
+                    return generation != self.generation or self.closed.is_set() or (
+                        self.runner is not None and self.runner.cancelled.is_set()
+                    )
+            self._hot_switch_cross_profile(
+                winner.uid,
+                winner.name,
+                group_name,
+                winner.measurement,
+                generation,
+                is_cancelled=_is_cancelled,
+                allow_pending_fallback=True,
+            )
             return
         try:
             expected = next(g for g in groups if g.name == group_name)
@@ -1407,18 +1733,36 @@ class Desktop:
     def switch_manual(self, value):
         switching_entered = False
         try:
-            uid, node, group = value["uid"], value["name"], value["group"]
+            uid, node = value["uid"], value["name"]
+            group = value.get("group", "")
             with self.lock:
-                if self.running or self.refreshing or not self.capture or self.latch.outcome_unknown:
+                if self.running or self.refreshing or self.latch.outcome_unknown:
                     raise ControllerError("unavailable")
                 self._switching_count += 1
                 switching_entered = True
                 if self.schedule.minutes is not None:
                     self._invalidate()
-                registry, snapshot, settings, identity, groups = self.capture
                 generation = self.generation
-                if snapshot.profile.uid != uid:
-                    raise ControllerError("profile")
+                capture = self.capture
+                current_uid = capture[1].profile.uid if capture else (
+                    next((p.uid for p in self.registry.profiles if p.current), None) if self.registry else None
+                )
+            if current_uid != uid:
+                outcome, message = self._hot_switch_cross_profile(
+                    uid,
+                    node,
+                    group,
+                    measurement=None,
+                    generation=generation,
+                    is_cancelled=lambda: self.closed.is_set(),
+                    allow_pending_fallback=False,
+                )
+                with self.lock:
+                    self.status = message
+                return {"ok": outcome in ("switched", "confirmed_noop"), "error": message}
+            if not capture:
+                raise ControllerError("unavailable")
+            registry, snapshot, settings, identity, groups = capture
             expected = next(g for g in groups if g.name == group)
             switch = AssistedSwitch(registry, snapshot, node, latch=self.latch)
             found = next(g for g in switch.prepare() if g.name == group)
@@ -1545,22 +1889,79 @@ class Desktop:
                     self._switching_count = max(0, self._switching_count - 1)
                 self._notify_tray()
 
-    def export_tsv(self):
-        try:
-            import webview
-            paths = self.window.create_file_dialog(webview.FileDialog.SAVE, save_filename="clash-speed-results.tsv")
-            if not paths:
-                return {"ok": True, "cancelled": True}
+    def _build_tsv_export(self, value=None):
+        req = value if isinstance(value, dict) else {}
+        view = req.get("view", "live")
+        if view == "history":
+            window = req.get("window", "7d")
+            if window not in WINDOW_SPECS:
+                window = "7d"
+            selected_only = bool(req.get("selected_only", False))
+            query = str(req.get("query") or "").strip().lower()
+            with self.lock:
+                selected_profiles = set(self.selected_profiles)
+                known_nodes = {(r.uid, r.name) for r in self.rows}
+            summaries = self.telemetry_store.compute_summaries(window=window)
+            filtered = []
+            for item in summaries:
+                if selected_only and selected_profiles and item.profile_uid not in selected_profiles:
+                    continue
+                if query and query not in item.node_name.lower() and query not in item.profile_name.lower():
+                    continue
+                filtered.append(item)
             output = io.StringIO(newline="")
             writer = csv.writer(output, delimiter="\t", lineterminator="\n")
-            writer.writerow(["订阅", "节点", "状态", "综合分", "速度 B/s", "延迟 ms", "抖动 ms"])
-            with self.lock:
-                for row in self.rows:
-                    m = row.measurement
-                    writer.writerow([_cell(row.profile), _cell(row.name), _cell(row.state),
-                                     m.score if m and m.score is not None else "", m.download_bytes_per_second if m else "",
-                                     m.latency_ms if m else "", m.jitter_ms if m else ""])
-            text = output.getvalue()
+            writer.writerow([
+                "排名", "状态", "订阅", "节点", "类型",
+                "稳健吞吐", "典型延迟", "可用率", "样本",
+                "长效稳健分", "基础分", "健康扣分",
+            ])
+            for idx, s in enumerate(filtered, 1):
+                available = (s.profile_uid, s.node_name) in known_nodes
+                if not available:
+                    status_label = "已移除"
+                elif s.is_qualified:
+                    status_label = "已认证"
+                else:
+                    status_label = f"样本不足({s.total_count}/3)"
+                speed = f"{s.weighted_median_speed_bps / 1_048_576:.2f} MiB/s" if s.success_count > 0 else "—"
+                latency = f"{s.weighted_median_latency_ms:.0f} ms" if s.success_count > 0 else "—"
+                avail = f"{round(s.availability_rate * 100)}%"
+                samples = f"{s.success_count}/{s.total_count}"
+                writer.writerow([
+                    idx,
+                    _cell(status_label),
+                    _cell(s.profile_name),
+                    _cell(s.node_name),
+                    _cell((s.node_type or "—").upper()),
+                    _cell(speed),
+                    _cell(latency),
+                    _cell(avail),
+                    _cell(samples),
+                    f"{s.long_term_score:.1f}",
+                    f"{s.base_score:.1f}",
+                    f"{s.health_penalty:.1f}",
+                ])
+            return output.getvalue(), "clash-history-results.tsv", True
+
+        output = io.StringIO(newline="")
+        writer = csv.writer(output, delimiter="\t", lineterminator="\n")
+        writer.writerow(["订阅", "节点", "状态", "综合分", "速度 B/s", "延迟 ms", "抖动 ms"])
+        with self.lock:
+            for row in self.rows:
+                m = row.measurement
+                writer.writerow([_cell(row.profile), _cell(row.name), _cell(row.state),
+                                 m.score if m and m.score is not None else "", m.download_bytes_per_second if m else "",
+                                 m.latency_ms if m else "", m.jitter_ms if m else ""])
+        return output.getvalue(), "clash-speed-results.tsv", False
+
+    def export_tsv(self, value=None):
+        try:
+            import webview
+            text, filename, is_history = self._build_tsv_export(value)
+            paths = self.window.create_file_dialog(webview.FileDialog.SAVE, save_filename=filename)
+            if not paths:
+                return {"ok": True, "cancelled": True}
             Path(paths if isinstance(paths, str) else paths[0]).write_text(text, encoding="utf-8-sig")
             try:
                 win32clipboard.OpenClipboard()
@@ -1572,7 +1973,7 @@ class Desktop:
             except Exception:
                 pass
             with self.lock:
-                self.status = "已导出 TSV 并复制到剪贴板"
+                self.status = "已导出长效优选 TSV 并复制到剪贴板" if is_history else "已导出 TSV 并复制到剪贴板"
             return {"ok": True, "cancelled": False}
         except Exception:
             return {"ok": False, "error": "导出失败"}
@@ -1585,7 +1986,7 @@ class Desktop:
                     raise ValueError("节点已变化")
                 known = any(row.uid == uid and row.name == name for row in self.rows)
             if not known:
-                summaries = self.telemetry_store.summaries(window="30d")
+                summaries = self.telemetry_store.compute_summaries(window="30d")
                 known = any(s.profile_uid == uid and s.node_name == name for s in summaries)
             if not known:
                 raise ValueError("节点已变化")
@@ -1614,7 +2015,7 @@ class Desktop:
                 with self.lock:
                     if self.closed.is_set():
                         raise ValueError("应用已关闭")
-                summaries = self.telemetry_store.summaries(window=window)
+                summaries = self.telemetry_store.compute_summaries(window=window)
                 item = next((s for s in summaries if s.profile_uid == uid and s.node_name == name), None)
                 if item is None:
                     raise ValueError("历史节点不存在")
@@ -1669,4 +2070,8 @@ class Desktop:
         probe_thread = self._health_probe_thread
         if probe_thread is not None and probe_thread.is_alive() and probe_thread is not threading.current_thread():
             probe_thread.join(timeout=0.5)
+        try:
+            self.runtime_bridge.close()
+        except Exception:
+            pass
         self.telemetry_store.close()

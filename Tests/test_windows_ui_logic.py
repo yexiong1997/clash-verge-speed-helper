@@ -150,7 +150,8 @@ const api = {
   copy_node_summary: async value => { calls.push({fn:'copy_node_summary', value}); return {ok:true, text:'[Fixture] node'}; },
   probe_active_node: async value => { calls.push({fn:'probe_active_node', value}); return {ok:true}; },
   save_preferences: async value => { calls.push({fn:'save_preferences', value}); return {ok:true}; },
-  export_tsv: async () => { calls.push({fn:'export_tsv'}); return {ok:true, cancelled:false}; },
+  export_tsv: async value => { calls.push(value === undefined ? {fn:'export_tsv'} : {fn:'export_tsv', value}); return {ok:true, cancelled:false}; },
+  configure_runtime_bridge: async value => { calls.push({fn:'configure_runtime_bridge', value}); return {ok:true}; },
   stop: async () => { calls.push({fn:'stop'}); return {ok:true}; },
   set_patrol: async value => {
     calls.push({fn:'set_patrol', value});
@@ -532,6 +533,37 @@ function cancelDialog() { snapDialog(); get('confirm-cancel').onclick(); }
     }));
     return;
   }
+  if (scenario === 'bridge-hot-switch-and-history-export') {
+    initial.profiles = [
+      {uid:'p', name:'SubOne', current:true, compatible:true, selected:true},
+      {uid:'p2', name:'SubTwo', current:false, compatible:true, selected:true}
+    ];
+    initial.rows = [
+      {uid:'p', profile:'SubOne', name:'node', selected:true, state:'完成', eligible:true, score:75, speed:5e6, latency:50, jitter:2, successes:6},
+      {uid:'p2', profile:'SubTwo', name:'cross-best', selected:true, state:'完成', eligible:true, score:96, speed:18e6, latency:28, jitter:1, successes:6}
+    ];
+    initial.runtime_bridge = {state:'not_configured', ready:false, attached:false, cdp_ready:false, policy_configured:false, label:'跨订阅热切 未启用'};
+    await vm.runInContext('refreshState()', context);
+    const pillNotConfigured = get('bridge-pill').textContent;
+    get('bridge-pill').onclick();
+    const enableDialogMsg = get('confirm-message').textContent;
+    await get('confirm-accept').onclick();
+    initial.runtime_bridge = {state:'attached', ready:true, attached:true, cdp_ready:true, policy_configured:true, label:'跨订阅热切 已连接'};
+    await vm.runInContext('refreshState()', context);
+    get('group').value = 'Test';
+    const pillReady = get('bridge-pill').textContent;
+    vm.runInContext("openRowMenu(state.rows[1], 10, 10);", context);
+    const menuSwitchDisabledWhenReady = get('menu-switch').disabled;
+    get('menu-switch').onclick();
+    const crossConfirmMsg = get('confirm-message').textContent;
+    await get('confirm-accept').onclick();
+    vm.runInContext("setViewMode('history');", context);
+    await get('export').onclick();
+    process.stdout.write(JSON.stringify({
+      pillNotConfigured, enableDialogMsg, pillReady, menuSwitchDisabledWhenReady, crossConfirmMsg, calls
+    }));
+    return;
+  }
   process.stdout.write(JSON.stringify({
     calls,
     dialogs,
@@ -901,6 +933,26 @@ process.stdin.on('end', () => {
         self.assertIn("copy_node_summary", fns)
         self.assertEqual(fns.count("export_tsv"), 2)
         self.assertIn("set_selection", fns)
+
+    def test_runtime_bridge_pill_cross_profile_switch_and_history_tsv_export(self):
+        result = subprocess.run(
+            [NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "bridge-hot-switch-and-history-export"],
+            capture_output=True, timeout=5, check=True,
+        )
+        value = json.loads(result.stdout)
+        self.assertEqual(value["pillNotConfigured"], "○ 跨订阅热切")
+        self.assertIn("--remote-debugging-port=0", value["enableDialogMsg"])
+        self.assertEqual(value["pillReady"], "● 热切已连接")
+        self.assertFalse(value["menuSwitchDisabledWhenReady"])
+        self.assertIn("SubTwo", value["crossConfirmMsg"])
+        self.assertIn("cross-best", value["crossConfirmMsg"])
+        cfg_calls = [c for c in value["calls"] if c["fn"] == "configure_runtime_bridge"]
+        self.assertEqual(cfg_calls, [{"fn": "configure_runtime_bridge", "value": {"action": "enable"}}])
+        sw_calls = [c for c in value["calls"] if c["fn"] == "switch_manual"]
+        self.assertEqual(sw_calls, [{"fn": "switch_manual", "value": {"uid": "p2", "name": "cross-best", "group": "Test"}}])
+        exp_calls = [c for c in value["calls"] if c["fn"] == "export_tsv"]
+        self.assertEqual(len(exp_calls), 1)
+        self.assertEqual(exp_calls[0]["value"]["view"], "history")
 
 
 if __name__ == "__main__":

@@ -1146,6 +1146,23 @@ function renderPatrolAndHealth() {
       ? "空闲且已选策略组时，点击可立即探测当前活跃节点延迟"
       : "点击立即探测当前活跃节点延迟";
   }
+  const bp = $("bridge-pill");
+  if (bp) {
+    const rb = state.runtime_bridge || {};
+    const ready = Boolean(rb.ready);
+    const needsRestart = rb.state === "needs_restart";
+    bp.textContent = ready
+      ? (rb.attached ? "● 热切已连接" : "● 热切就绪")
+      : (needsRestart ? "● 热切待重启" : "○ 跨订阅热切");
+    bp.classList.toggle("ready", ready);
+    bp.classList.toggle("warn", needsRestart);
+    bp.disabled = Boolean(state.running || busy);
+    bp.title = ready
+      ? "跨订阅无感热切已就绪（零弹窗本机受权轻桥）；点击重新检测"
+      : (needsRestart
+        ? "已为 clash-verge.exe 写入官方 WebView2 策略，请重启一次 Clash Verge 生效；点击重新检测"
+        : "点击启用跨订阅无感热切（仅为 clash-verge.exe 写入官方 WebView2 本机策略，不修改原版程序）");
+  }
 }
 
 function render() {
@@ -1190,7 +1207,7 @@ function render() {
     : "支持托盘后台运行，退出应用后停止";
   if (state.status && state.status !== lastStatusSeen) {
     lastStatusSeen = state.status;
-    if (!state.running && !unknown && (state.status.includes("已切换并复核") || state.status.includes("已切回原节点并复核"))) {
+    if (!state.running && !unknown && (state.status.includes("已切换并复核") || state.status.includes("已切回原节点并复核") || state.status.includes("已自动热切订阅"))) {
       flashDockConfirmed();
     }
   }
@@ -1558,16 +1575,30 @@ function confirmManual(trigger = $("manual")) {
   const targetKey = viewMode === "history" ? historyActiveKey : active;
   const row = findLiveOrHistoryRow(targetKey);
   const group = $("group").value;
-  if (!row || !group) { notify("请先选中节点和策略组", true); return; }
+  const isCurrentProf = Boolean(row && state.profiles.some(p => p.uid === row.uid && p.current));
+  const bridgeReady = Boolean(state.runtime_bridge?.ready);
+  const crossHotSwitch = Boolean(row && !isCurrentProf && bridgeReady);
+  if (!row) { notify("请先选中节点和策略组", true); return; }
+  if (!isCurrentProf && !bridgeReady) {
+    notify("该节点不在当前订阅；请先启用跨订阅热切或在 Clash Verge 手动切换订阅", true);
+    return;
+  }
+  if (isCurrentProf && !group) { notify("请先选中节点和策略组", true); return; }
   const snap = {
     rowKey: key(row),
     group,
     groupsSig: groupsSignature(),
-    mode: viewMode
+    mode: viewMode,
+    crossHotSwitch,
+    bridgeReady
   };
+  const confirmTitle = crossHotSwitch ? "确认跨订阅无感热切" : "确认切换策略组";
+  const confirmMessage = crossHotSwitch
+    ? `将自动热切 Clash Verge 订阅至“${row.profile || row.uid}”，并${group ? `将策略组“${group}”` : "自动匹配策略组"}切换到“${row.name}”？`
+    : `将策略组“${group}”切换到“${row.name}”？`;
   openConfirm({
-    title: "确认切换策略组",
-    message: `将策略组“${group}”切换到“${row.name}”？`,
+    title: confirmTitle,
+    message: confirmMessage,
     trigger,
     validate: () => {
       const curKey = snap.mode === "history" ? historyActiveKey : active;
@@ -1578,7 +1609,8 @@ function confirmManual(trigger = $("manual")) {
         curKey === snap.rowKey &&
         $("group").value === snap.group &&
         exists &&
-        groupsSignature() === snap.groupsSig;
+        groupsSignature() === snap.groupsSig &&
+        Boolean(state.runtime_bridge?.ready) === snap.bridgeReady;
     },
     onAccept: async () => {
       const ok = await runBusy(async () => {
@@ -1690,7 +1722,11 @@ function openRowMenu(row, x, y, trigger = null) {
   const isCurrentProf = state.profiles.some(p => p.uid === row.uid && p.current);
   const isCompatProf = state.profiles.some(p => p.uid === row.uid && p.compatible !== false);
   const inLiveCatalog = state.rows.some(r => r.uid === row.uid && r.name === row.name);
-  $("menu-switch").disabled = state.running || Boolean(state.outcome_unknown) || !$("group").value || !isCurrentProf || (isHist && row.available === false);
+  const bridgeReady = Boolean(state.runtime_bridge?.ready);
+  const canSwitchRow = isCurrentProf
+    ? Boolean($("group").value)
+    : Boolean(bridgeReady && isCompatProf);
+  $("menu-switch").disabled = state.running || Boolean(state.outcome_unknown) || !canSwitchRow || (isHist && row.available === false);
   $("menu-retest").disabled = state.running || !isCompatProf || (isHist && row.available === false);
   if ($("menu-locate")) {
     $("menu-locate").hidden = !isHist;
@@ -1940,7 +1976,15 @@ $("arm").onclick = async () => {
 $("export").onclick = async () => {
   actionEpoch += 1;
   try {
-    const res = await api().export_tsv();
+    const isHist = viewMode === "history";
+    const res = isHist
+      ? await api().export_tsv({
+          view: "history",
+          window: historyWindow,
+          selected_only: historySelectedOnly,
+          query: $("history-search") ? $("history-search").value : ""
+        })
+      : await api().export_tsv();
     if (!res?.ok) {
       notify(res?.error || "导出失败", true);
       return;
@@ -1959,11 +2003,30 @@ $("export").onclick = async () => {
         }
       }, 1500);
     }
-    notify("已导出 TSV 并复制到剪贴板");
+    notify(isHist ? "已导出长效优选 TSV 并复制到剪贴板" : "已导出 TSV 并复制到剪贴板");
   } catch (_) {
     notify("导出失败，请检查本地状态", true);
   }
 };
+if ($("bridge-pill")) {
+  $("bridge-pill").onclick = () => {
+    if (busy || state.running || typeof api().configure_runtime_bridge !== "function") return;
+    const rb = state.runtime_bridge || {};
+    if (rb.state === "not_configured" || !rb.policy_configured && !rb.ready) {
+      openConfirm({
+        title: "启用跨订阅无感热切",
+        message: "将通过 Windows 官方 Edge WebView2 策略仅为 clash-verge.exe 写入本机随机调试端口（--remote-debugging-port=0），不修改 Clash Verge 原版文件、不影响其他应用。需要一次管理员授权，完成后重启一次 Clash Verge 即永久生效。",
+        trigger: $("bridge-pill"),
+        validate: () => !state.running && !busy,
+        onAccept: async () => {
+          await runBusy(async () => await call("configure_runtime_bridge", {action: "enable"}));
+        }
+      });
+    } else {
+      runBusy(async () => await call("configure_runtime_bridge", {action: "probe"}));
+    }
+  };
+}
 if ($("hide-tray")) {
   $("hide-tray").onclick = () => {
     if (typeof api().hide_to_tray === "function") call("hide_to_tray");

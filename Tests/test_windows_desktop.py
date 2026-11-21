@@ -100,7 +100,7 @@ class DesktopTests(unittest.TestCase):
             "undo_switch", "continue_pending", "set_schedule", "set_patrol",
             "get_history", "clear_history", "export_tsv", "copy_node_name",
             "copy_node_summary", "probe_active_node", "save_preferences",
-            "hide_to_tray", "set_minimize_to_tray",
+            "hide_to_tray", "set_minimize_to_tray", "configure_runtime_bridge",
         })
 
     def test_resolve_worker_and_headless_smoke_do_not_require_webview(self):
@@ -915,6 +915,46 @@ class DesktopTests(unittest.TestCase):
         self.assertFalse(by_id[CMD_STOP_SCHEDULE]["enabled"])
         self.assertTrue(by_id[CMD_STOP_PATROL]["enabled"])
         self.assertTrue(by_id[CMD_EXIT]["enabled"])
+
+    def test_initial_refresh_selects_only_current_profile_and_history_export_tsv(self):
+        (self.root / "profiles" / "two.yaml").write_text(
+            "proxies:\n- {name: gamma, type: vless}\n", encoding="utf-8"
+        )
+        (self.root / "profiles.yaml").write_text(
+            "current: u2\nitems:\n"
+            "- {uid: u1, name: first, type: local, file: one.yaml}\n"
+            "- {uid: u2, name: second, type: remote, file: two.yaml}\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(self.app.refresh()["ok"])
+        st = self.app.get_state()
+        self.assertEqual([(p["uid"], p["selected"]) for p in st["profiles"]], [("u1", False), ("u2", True)])
+
+        all_nodes = [{"uid": r["uid"], "name": r["name"]} for r in st["rows"]]
+        self.assertTrue(self.app.set_selection({"profiles": ["u1", "u2"], "nodes": all_nodes})["ok"])
+        self.assertTrue(self.app.refresh()["ok"])
+        st2 = self.app.get_state()
+        self.assertEqual([(p["uid"], p["selected"]) for p in st2["profiles"]], [("u1", True), ("u2", True)])
+
+        from Windows.telemetry_history import TelemetrySampleRecord
+        now = time.time()
+        for i in range(3):
+            self.app.telemetry_store.record_sample(TelemetrySampleRecord(
+                timestamp=now - i * 10, profile_uid="u2", profile_name="=second",
+                node_name="gamma", node_type="vless", source="manual",
+                requested_bytes=3 * 1_048_576, streams=2, download_complete=True,
+                download_bytes_per_second=12 * 1_048_576, latency_ms=35.0, jitter_ms=2.0,
+                head_attempts=6, head_successes=6, composite_score=91.5,
+            ))
+        text, filename, is_hist = self.app._build_tsv_export({"view": "history", "window": "7d"})
+        self.assertTrue(is_hist)
+        self.assertEqual(filename, "clash-history-results.tsv")
+        lines = text.splitlines()
+        self.assertTrue(lines[0].startswith("排名\t状态\t订阅\t节点\t类型"))
+        self.assertEqual(len(lines), 2)
+        self.assertIn("'=second", lines[1])
+        self.assertIn("gamma", lines[1])
+        self.assertIn("已认证", lines[1])
 
 if __name__ == "__main__":
     unittest.main()
