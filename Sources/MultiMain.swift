@@ -1761,7 +1761,7 @@ final class MultiSurfaceView: NSView {
     }
 }
 
-final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
+final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate,
                               NSTableViewDataSource, NSTableViewDelegate, NSComboBoxDelegate {
     private let root = ProfileRegistry.defaultRoot
     private let telemetryStore = TelemetryHistoryStore()
@@ -1821,7 +1821,31 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private let copyButton = MultiClearGlassButton(title: "导出 TSV", symbol: "square.and.arrow.up", style: .clearSecondary, height: 32, hPadding: 13, fontSize: 12)
     private let autoSwitch = NSButton(checkboxWithTitle: "测速后自动切换最高分（当前订阅）", target: nil, action: nil)
     private let status = NSTextField(wrappingLabelWithString: "请选择订阅。启动应用不会自动测速。")
-    private let scheduleStatus = NSTextField(labelWithString: "定时未启用（仅窗口打开时运行）")
+    private let scheduleStatus = NSTextField(labelWithString: "定时未启用（支持托盘后台运行；退出应用后停止）")
+    private let trayMinimizeButton = NSButton(checkboxWithTitle: "关窗进托盘", target: nil, action: nil)
+    private let hideToTrayButton = MultiClearGlassButton(title: "托盘后台", symbol: "menubar.dock.rectangle", style: .clearSecondary, height: 30, hPadding: 10, fontSize: 11.5)
+    private static let minimizeToTrayDefaultsKey = "clash.multi.minimizeToTrayOnClose"
+    private var minimizeToTrayOnClose: Bool = {
+#if MULTI_UI_TEST
+        return false
+#else
+        if UserDefaults.standard.object(forKey: "clash.multi.minimizeToTrayOnClose") == nil {
+            return true
+        }
+        return UserDefaults.standard.bool(forKey: "clash.multi.minimizeToTrayOnClose")
+#endif
+    }()
+    private var isHiddenInTray = false
+    private var statusItem: NSStatusItem?
+    private let trayMenu = NSMenu()
+    private let trayStatusItem = NSMenuItem(title: "状态：待命就绪", action: nil, keyEquivalent: "")
+    private let trayDetailItem = NSMenuItem(title: "● 活跃探测 待命", action: nil, keyEquivalent: "")
+    private let trayToggleWindowItem = NSMenuItem(title: "隐藏到托盘", action: #selector(toggleMainWindowFromTray(_:)), keyEquivalent: "")
+    private let trayMinimizeItem = NSMenuItem(title: "关闭窗口时最小化到托盘", action: #selector(toggleMinimizeToTrayOnClose(_:)), keyEquivalent: "")
+    private let trayStopRunItem = NSMenuItem(title: "停止当前测速", action: #selector(stopFromTray(_:)), keyEquivalent: "")
+    private let trayStopScheduleItem = NSMenuItem(title: "停止定时测速", action: #selector(stopScheduleFromTray(_:)), keyEquivalent: "")
+    private let trayStopPatrolItem = NSMenuItem(title: "停止智能巡检", action: #selector(stopPatrolFromTray(_:)), keyEquivalent: "")
+    private let trayQuitItem = NSMenuItem(title: "退出应用", action: #selector(quitAppFromTray(_:)), keyEquivalent: "q")
     private let subPillsStack = NSStackView()
     private let champCardView = MultiChampionCardView()
     private let bottomDockSurface = MultiClearFrostedSurface(style: .frostedDock, cornerRadius: 27, isCapsule: true)
@@ -1929,6 +1953,10 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildWindow()
+#if !MULTI_UI_TEST
+        setupAppMenu()
+        setupStatusBarItem()
+#endif
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
 #if !MULTI_UI_TEST
@@ -1965,14 +1993,207 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             }
         }
     }
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    private var isMainWindowVisible: Bool {
+        window != nil && window.isVisible && !isHiddenInTray
+    }
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        !minimizeToTrayOnClose
+    }
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showMainWindow()
+        return true
+    }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        if busy { requestStopBeforeClose(); return .terminateCancel }
+        if busy {
+            if isHiddenInTray || !window.isVisible { showMainWindow() }
+            requestStopBeforeClose()
+            return .terminateCancel
+        }
+        closeApp()
         return .terminateNow
     }
     func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if minimizeToTrayOnClose {
+            hideMainWindowToTray()
+            return false
+        }
         if busy { requestStopBeforeClose(); return false }
         return true
+    }
+    private func setupAppMenu() {
+        let mainMenu = NSMenu()
+        let appMenuItem = NSMenuItem()
+        mainMenu.addItem(appMenuItem)
+        let appMenu = NSMenu(title: "Clash 多订阅测速助手")
+        let hideTrayMenuItem = NSMenuItem(title: "隐藏到托盘", action: #selector(hideToTrayPressed(_:)), keyEquivalent: "h")
+        hideTrayMenuItem.target = self
+        appMenu.addItem(hideTrayMenuItem)
+        appMenu.addItem(NSMenuItem.separator())
+        let quitMenuItem = NSMenuItem(title: "退出 Clash 多订阅测速助手", action: #selector(quitAppFromTray(_:)), keyEquivalent: "q")
+        quitMenuItem.target = self
+        appMenu.addItem(quitMenuItem)
+        appMenuItem.submenu = appMenu
+
+        let editMenuItem = NSMenuItem()
+        mainMenu.addItem(editMenuItem)
+        let editMenu = NSMenu(title: "编辑")
+        editMenu.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "拷贝", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editMenuItem.submenu = editMenu
+
+        let windowMenuItem = NSMenuItem()
+        mainMenu.addItem(windowMenuItem)
+        let windowMenu = NSMenu(title: "窗口")
+        windowMenu.addItem(withTitle: "关闭窗口", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        windowMenu.addItem(withTitle: "最小化", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        windowMenuItem.submenu = windowMenu
+        NSApp.mainMenu = mainMenu
+    }
+    private func setupTrayMenu() {
+        trayMenu.removeAllItems()
+        trayMenu.autoenablesItems = false
+        trayMenu.delegate = self
+        trayStatusItem.isEnabled = false
+        trayDetailItem.isEnabled = false
+        for item in [trayToggleWindowItem, trayMinimizeItem, trayStopRunItem, trayStopScheduleItem, trayStopPatrolItem, trayQuitItem] {
+            item.target = self
+        }
+        trayMenu.addItem(trayStatusItem)
+        trayMenu.addItem(trayDetailItem)
+        trayMenu.addItem(NSMenuItem.separator())
+        trayMenu.addItem(trayToggleWindowItem)
+        trayMenu.addItem(trayMinimizeItem)
+        trayMenu.addItem(NSMenuItem.separator())
+        trayMenu.addItem(trayStopRunItem)
+        trayMenu.addItem(trayStopScheduleItem)
+        trayMenu.addItem(trayStopPatrolItem)
+        trayMenu.addItem(NSMenuItem.separator())
+        trayMenu.addItem(trayQuitItem)
+        updateTrayMenu()
+    }
+    private func setupStatusBarItem() {
+        guard statusItem == nil else { return }
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        if let button = item.button {
+            if let symbol = NSImage(systemSymbolName: "waveform.path", accessibilityDescription: "Clash 多订阅测速助手") {
+                let cfg = NSImage.SymbolConfiguration(pointSize: 13.5, weight: .semibold)
+                let img = symbol.withSymbolConfiguration(cfg) ?? symbol
+                img.isTemplate = true
+                button.image = img
+            } else {
+                button.title = "⚡"
+            }
+            button.toolTip = "Clash 多订阅测速助手"
+        }
+        item.menu = trayMenu
+        statusItem = item
+        updateTrayMenu()
+    }
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        if menu === trayMenu { updateTrayMenu() }
+    }
+    private func setMinimizeToTrayOnClose(_ enabled: Bool) {
+        minimizeToTrayOnClose = enabled
+#if !MULTI_UI_TEST
+        UserDefaults.standard.set(enabled, forKey: Self.minimizeToTrayDefaultsKey)
+#endif
+        trayMinimizeButton.state = enabled ? .on : .off
+        updateTrayMenu()
+    }
+    private func hideMainWindowToTray() {
+        guard !closed, window != nil else { return }
+        isHiddenInTray = true
+        window.orderOut(nil)
+#if !MULTI_UI_TEST
+        NSApp.setActivationPolicy(.accessory)
+#endif
+        updateTrayMenu()
+    }
+    private func showMainWindow() {
+        guard !closed, window != nil else { return }
+        isHiddenInTray = false
+#if !MULTI_UI_TEST
+        if NSApp.activationPolicy() != .regular {
+            NSApp.setActivationPolicy(.regular)
+        }
+#endif
+        window.makeKeyAndOrderFront(nil)
+#if !MULTI_UI_TEST
+        NSApp.activate(ignoringOtherApps: true)
+        reconnectRuntimeBridgeSilently()
+#endif
+        updateTrayMenu()
+    }
+    @objc private func hideToTrayPressed(_ sender: Any?) {
+        hideMainWindowToTray()
+    }
+    @objc private func toggleMainWindowFromTray(_ sender: Any?) {
+        if isMainWindowVisible { hideMainWindowToTray() } else { showMainWindow() }
+    }
+    @objc private func toggleMinimizeToTrayOnClose(_ sender: Any?) {
+        if (sender as? NSButton) === trayMinimizeButton {
+            setMinimizeToTrayOnClose(trayMinimizeButton.state == .on)
+        } else {
+            setMinimizeToTrayOnClose(!minimizeToTrayOnClose)
+        }
+    }
+    @objc private func stopFromTray(_ sender: Any?) {
+        if busy { stop(nil) }
+        updateTrayMenu()
+    }
+    @objc private func stopScheduleFromTray(_ sender: Any?) {
+        if schedule.isArmed {
+            disarm("已从托盘停止定时测速。")
+            updateControls()
+        }
+    }
+    @objc private func stopPatrolFromTray(_ sender: Any?) {
+        if patrolSchedule.isArmed {
+            disarmPatrol("已从托盘停止智能巡检。")
+            updateControls()
+        }
+    }
+    @objc private func quitAppFromTray(_ sender: Any?) {
+        if busy {
+            showMainWindow()
+            requestStopBeforeClose()
+            return
+        }
+        closeApp()
+#if !MULTI_UI_TEST
+        NSApp.terminate(nil)
+#endif
+    }
+    private func updateTrayMenu() {
+        let stateLine: String
+        if switchingProfile {
+            stateLine = "状态：正在热切换订阅…"
+        } else if applying {
+            stateLine = "状态：正在应用节点切换…"
+        } else if busy {
+            let total = max(runIdentities.count, currentBatch?.jobCount ?? 0)
+            let done = rows.filter { runIdentities.contains($0.identity) && ($0.state == "有效" || $0.state == "无效") }.count
+            stateLine = total > 0 ? "状态：测速中（\(done)/\(total)）" : "状态：测速中…"
+        } else if patrolSchedule.isArmed {
+            stateLine = isHiddenInTray ? "状态：智能巡检后台运行中" : "状态：智能巡检已启用"
+        } else if schedule.isArmed {
+            stateLine = isHiddenInTray ? "状态：定时测速后台运行中" : "状态：定时测速已启用"
+        } else {
+            stateLine = isHiddenInTray ? "状态：托盘后台待命" : "状态：待命就绪"
+        }
+        trayStatusItem.title = stateLine
+        let quotaMiB = currentPatrolQuotaBytes / 1_048_576
+        let usedMiB = Int(ceil(Double(cachedPatrolBytesToday) / 1_048_576.0))
+        trayDetailItem.title = "\(healthProbeStatusText) · 巡检 \(usedMiB)/\(quotaMiB) MiB"
+        trayToggleWindowItem.title = isMainWindowVisible ? "隐藏到托盘" : "显示主窗口"
+        trayMinimizeItem.state = minimizeToTrayOnClose ? .on : .off
+        trayMinimizeButton.state = minimizeToTrayOnClose ? .on : .off
+        trayStopRunItem.isEnabled = busy && !cancelled
+        trayStopScheduleItem.isEnabled = schedule.isArmed
+        trayStopPatrolItem.isEnabled = patrolSchedule.isArmed
+        statusItem?.button?.toolTip = "Clash 多订阅测速助手 — \(stateLine)"
     }
     private func requestStopBeforeClose() {
         // Revocation affects checks not yet passed; it cannot retract a commit.
@@ -2025,6 +2246,10 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 #endif
         schedule.disarm(); armedBatch = nil; patrolSchedule.disarm(); patrolArmedBatch = nil; switchAuthorization?.revoke()
         cancelLaunchChecks(); runner?.cancel()
+        if let item = statusItem {
+            NSStatusBar.system.removeStatusItem(item)
+            statusItem = nil
+        }
     }
 #if !MULTI_UI_TEST
     private func runtimeBridgeDidAttach() {
@@ -2228,6 +2453,15 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         historySearch.target = self; historySearch.action = #selector(filterHistory(_:))
         historySearch.sendsSearchStringImmediately = true
         clearHistoryButton.target = self; clearHistoryButton.action = #selector(clearHistoryPressed(_:))
+        trayMinimizeButton.font = .systemFont(ofSize: 11, weight: .medium)
+        trayMinimizeButton.controlSize = .small
+        trayMinimizeButton.state = minimizeToTrayOnClose ? .on : .off
+        trayMinimizeButton.target = self; trayMinimizeButton.action = #selector(toggleMinimizeToTrayOnClose(_:))
+        trayMinimizeButton.toolTip = "开启后关闭窗口将隐藏到顶部菜单栏托盘继续后台运行；从托盘点「退出应用」或按 ⌘Q 才真正退出"
+        trayMinimizeButton.setContentHuggingPriority(.required, for: .horizontal)
+        hideToTrayButton.target = self; hideToTrayButton.action = #selector(hideToTrayPressed(_:))
+        hideToTrayButton.toolTip = "立即隐藏主窗口到顶部菜单栏托盘，测速、定时与智能巡检继续在后台运行"
+        setupTrayMenu()
 
         // =========================================================================
         // 1. TOP COMMAND BAR (Height: 54 pt)
@@ -2536,7 +2770,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             healthStatusLabel.centerYAnchor.constraint(equalTo: healthStatusPill.centerYAnchor)
         ])
 
-        let patrolStripRow = row([patrolPill, patrolStatusLabel, spacer(), healthStatusPill], spacing: 8)
+        let patrolStripRow = row([patrolPill, patrolStatusLabel, spacer(), trayMinimizeButton, healthStatusPill], spacing: 8)
         patrolStripRow.setClippingResistancePriority(.defaultLow, for: .horizontal)
 
         let matrixStack = NSStackView(views: [matrixHeaderRow, subMidRow, strategyRouteRow, matrixDiv, paramStripRow, patrolStripRow])
@@ -2764,6 +2998,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             status,
             spacer(),
             progressView,
+            hideToTrayButton,
             undoSwitchButton,
             switchResultButton
         ], spacing: 8)
@@ -2814,7 +3049,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             // Revoke it now; an OS spawn past its final guard is still non-atomic.
             runner?.cancel()
         }
-        scheduleButton.title = "启用定时"; scheduleStatus.stringValue = "定时未启用（仅应用打开时运行；每次消耗上方流量）"
+        scheduleButton.title = "启用定时"; scheduleStatus.stringValue = "定时未启用（支持托盘后台运行；退出应用后停止）"
         if wasArmed, let reason = reason { status.stringValue = reason }
     }
 
@@ -3207,6 +3442,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             dockConfirmedUntil = nil
             updateDockAndProgressState()
         }
+        updateTrayMenu()
     }
     private func updateControls() {
         let count = nodeSelection?.count ?? 0
@@ -3282,6 +3518,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         updateDockAndProgressState()
         rebuildSubscriptionPills()
         updateChampionCard()
+        updateTrayMenu()
         profileTable.reloadData()
     }
     private func chosenOptions() -> (MultiBatchOptions, Int)? {

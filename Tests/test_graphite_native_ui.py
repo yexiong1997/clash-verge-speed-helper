@@ -46,7 +46,8 @@ extension MultiAppDelegate {
         let groups: [[(String, NSView)]] = [
             [("liveMode", liveModeButton), ("historyMode", historyModeButton), ("export", copyButton), ("funnel", funnelButton), ("load", loadTestButton), ("stop", stopButton), ("start", startButton)],
             [("parallel", parallelBox), ("size", sizePopup), ("mode", modePopup), ("interval", intervalPopup), ("schedule", scheduleButton)],
-            [("patrolQuota", patrolQuotaPopup), ("patrol", patrolButton), ("health", healthStatusPill)],
+            [("patrolQuota", patrolQuotaPopup), ("patrol", patrolButton), ("trayToggle", trayMinimizeButton), ("health", healthStatusPill)],
+            [("hideTray", hideToTrayButton), ("switchResult", switchResultButton)],
             [("all", filterAllButton), ("valid", filterValidButton), ("testing", filterTestingButton), ("failed", filterFailedButton), ("search", nodeSearch), ("topN", topNBox), ("choose", selectTopNButton), ("checkAll", selectShownButton), ("clear", clearShownButton)]
         ]
         for width in [1240.0, 1080.0] {
@@ -267,6 +268,24 @@ extension MultiAppDelegate {
         } else {
             check("table header displays and clears sort direction indicator", false, "missing score column")
         }
+        // Tray background run checks: close hides to tray without cancelling busy/scheduled state, reopen restores, true quit stops busy or exits idle.
+        setMinimizeToTrayOnClose(true)
+        check("tray mode disables terminate-after-last-window", !applicationShouldTerminateAfterLastWindowClosed(NSApp) && trayMinimizeButton.state == .on && trayMinimizeItem.state == .on)
+        window.orderFront(nil)
+        busy = true; cancelled = false; updateControls()
+        let closeWhileBusyInTray = windowShouldClose(window)
+        check("windowShouldClose hides to tray without stopping busy run", !closeWhileBusyInTray && isHiddenInTray && !window.isVisible && !closed && busy && !cancelled)
+        menuNeedsUpdate(trayMenu)
+        check("tray menu reflects hidden busy state", trayToggleWindowItem.title == "显示主窗口" && trayStopRunItem.isEnabled && trayStatusItem.title.contains("测速中"))
+        let termWhileBusy = applicationShouldTerminate(NSApp)
+        check("applicationShouldTerminate wakes window and cancels while busy", termWhileBusy == .terminateCancel && !isHiddenInTray && window.isVisible && cancelled)
+        busy = false; cancelled = false; updateControls()
+        hideToTrayPressed(nil)
+        check("hideToTrayPressed hides window while keeping app alive", isHiddenInTray && !window.isVisible && !closed)
+        _ = applicationShouldHandleReopen(NSApp, hasVisibleWindows: false)
+        check("applicationShouldHandleReopen restores main window", !isHiddenInTray && window.isVisible && trayToggleWindowItem.title == "隐藏到托盘")
+        let termWhileIdle = applicationShouldTerminate(NSApp)
+        check("applicationShouldTerminate exits cleanly when idle", termWhileIdle == .terminateNow && closed)
         window.close()
         return checks
     }
