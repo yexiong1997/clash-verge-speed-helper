@@ -352,6 +352,56 @@ extension MultiAppDelegate {
         check("emptyStatePrimaryPressed resets search filter", nodeSearch.stringValue.isEmpty && !visibleRows.isEmpty && emptyStateStack.isHidden)
         focusSearchField(nil)
         check("focusSearchField focuses nodeSearch in live mode", window.firstResponder === nodeSearch || window.firstResponder === nodeSearch.currentEditor())
+        // Default initial profile selection: current profile first, fallback to first, empty -> empty
+        let optNonCur = ProfileOption(uid: "uid-first", name: "首项订阅", path: "/fixture/1.yaml", isCurrent: false)
+        let optCur = ProfileOption(uid: "uid-cur", name: "当前订阅", path: "/fixture/2.yaml", isCurrent: true)
+        check("defaultInitialProfileSelection prefers current profile",
+              defaultInitialProfileSelection(from: [optNonCur, optCur]) == Set([optCur.id]))
+        check("defaultInitialProfileSelection falls back to first when none current",
+              defaultInitialProfileSelection(from: [optNonCur]) == Set([optNonCur.id]))
+        check("defaultInitialProfileSelection handles empty registry",
+              defaultInitialProfileSelection(from: []).isEmpty)
+
+        // TUN detection & non-blocking banner layout checks (1080 & 1240)
+        let tunDir = switchRoot.appendingPathComponent("tun-fixtures", isDirectory: true)
+        try FileManager.default.createDirectory(at: tunDir, withIntermediateDirectories: true)
+        check("readTunEnabled returns nil when files missing", ProfileRegistry.readTunEnabled(root: tunDir) == nil)
+        try "port: 7890\ntun:\n  enable: true # comment\n  stack: gvisor\n".write(
+            to: tunDir.appendingPathComponent("clash-verge.yaml"), atomically: true, encoding: .utf8)
+        check("readTunEnabled detects clash-verge.yaml tun.enable=true", ProfileRegistry.readTunEnabled(root: tunDir) == true)
+        try "tun:\n  enable: false\n".write(
+            to: tunDir.appendingPathComponent("clash-verge.yaml"), atomically: true, encoding: .utf8)
+        check("readTunEnabled detects clash-verge.yaml tun.enable=false", ProfileRegistry.readTunEnabled(root: tunDir) == false)
+        try "tun: { enable: true, stack: system }\n".write(
+            to: tunDir.appendingPathComponent("clash-verge.yaml"), atomically: true, encoding: .utf8)
+        check("readTunEnabled detects inline tun mapping", ProfileRegistry.readTunEnabled(root: tunDir) == true)
+        try FileManager.default.removeItem(at: tunDir.appendingPathComponent("clash-verge.yaml"))
+        try "enable_tun_mode: true\n".write(
+            to: tunDir.appendingPathComponent("verge.yaml"), atomically: true, encoding: .utf8)
+        check("readTunEnabled falls back to verge.yaml enable_tun_mode", ProfileRegistry.readTunEnabled(root: tunDir) == true)
+        let realTun = tunDir.appendingPathComponent("real-tun.yaml")
+        try "tun:\n  enable: true\n".write(to: realTun, atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(at: tunDir.appendingPathComponent("clash-verge.yaml"), withDestinationURL: realTun)
+        try FileManager.default.removeItem(at: tunDir.appendingPathComponent("verge.yaml"))
+        check("readTunEnabled rejects symlinked clash-verge.yaml", ProfileRegistry.readTunEnabled(root: tunDir) == nil)
+
+        updateTunNoticeBanner(true)
+        window.setContentSize(NSSize(width: 1080, height: 700))
+        rootView.layoutSubtreeIfNeeded()
+        check("TUN banner expands visibly without breaking 1080 layout",
+              !tunNoticeBanner.isHidden && abs(tunNoticeBanner.frame.height - 30) < 1 && rootView.fittingSize.width <= 1080)
+        updateTunNoticeBanner(false)
+        rootView.layoutSubtreeIfNeeded()
+        check("TUN banner collapses cleanly when disabled",
+              tunNoticeBanner.isHidden && tunNoticeBanner.frame.height < 1)
+
+        // TSV export payload & non-modal export test
+        let livePayload = buildTSVExportPayload()
+        check("buildTSVExportPayload builds live TSV payload",
+              livePayload != nil && livePayload!.filename == "clash-speed-results.tsv" && !livePayload!.isHistory && livePayload!.content.contains("原序号\t订阅"))
+        exportTSVFile(nil)
+        check("exportTSVFile updates status and copies payload", status.stringValue.contains("已导出 TSV 并复制到剪贴板"))
+
         let termWhileIdle = applicationShouldTerminate(NSApp)
         check("applicationShouldTerminate exits cleanly when idle", termWhileIdle == .terminateNow && closed)
         window.close()

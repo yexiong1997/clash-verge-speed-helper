@@ -212,7 +212,20 @@ require 'json'
 begin
   text = STDIN.read.force_encoding(Encoding::UTF_8)
   raise unless text.valid_encoding? && !text.empty?
-  stream = Psych.parse_stream(text)
+  begin
+    stream = Psych.parse_stream(text)
+  rescue Psych::SyntaxError
+    # YAML 1.2 (Go yaml.v3 / Mihomo) allows unquoted flow-mapping scalars with
+    # non-spaced colons such as SS2022 base64:base64 passwords or IPv6 literals,
+    # while libyaml/Psych (YAML 1.1) rejects them. Quote only those plain values
+    # on fallback, then enforce the exact same strict AST/tag/alias/key checks.
+    normalized = text.gsub(/(?<=:\s)([^\s,{}\[\]"'#&*!]+:[^\s,{}\[\]"'#&*!]+)(?=\s*[,}])/) do |m|
+      '"' + m.gsub('\\', '\\\\').gsub('"', '\\"') + '"'
+    end
+    raise if normalized == text
+    text = normalized
+    stream = Psych.parse_stream(text)
+  end
   raise unless stream.children.length == 1
   stack = [stream]
   until stack.empty?
@@ -1398,6 +1411,7 @@ enum MultiPalette {
     static let success = color("success", dark: 0x84D2B1, light: 0x246A4D)
     static let successSurface = color("successSurface", dark: 0x20332C, light: 0xE6F1EB)
     static let warning = color("warning", dark: 0xEDBF80, light: 0x815414)
+    static let warningSurface = color("warningSurface", dark: 0x2E261A, light: 0xFDF3E2)
     static let danger = color("danger", dark: 0xF2A19C, light: 0xA83732)
 
     static var outline: NSColor {
@@ -1558,7 +1572,7 @@ enum MultiDockVisualState: Equatable {
 // Preserve the existing view API while replacing the old glass treatment.
 enum MultiClearGlassStyle {
     case clearPrimary, clearSecondary, clearSubtle, clearDanger
-    case frostedCard, frostedDock, darkEmeraldPill
+    case frostedCard, frostedDock, darkEmeraldPill, warningBanner
 }
 
 final class MultiClearAmbientCanvas: NSView {
@@ -1636,6 +1650,9 @@ final class MultiClearFrostedSurface: NSView {
         case .darkEmeraldPill:
             fill = MultiPalette.successSurface
             stroke = MultiPalette.success.withAlphaComponent(0.35)
+        case .warningBanner:
+            fill = MultiPalette.warningSurface
+            stroke = MultiPalette.warning.withAlphaComponent(0.45)
         case .clearPrimary:
             fill = MultiPalette.selection
             stroke = MultiPalette.accent.withAlphaComponent(0.35)
@@ -2420,6 +2437,16 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private var dockConfirmedUntil: Date?
     private var registry: [ProfileOption] = []
     private var selected = Set<Data>()
+#if MULTI_UI_TEST
+    private var hasAppliedInitialProfileSelection = true
+#else
+    private var hasAppliedInitialProfileSelection = false
+#endif
+    private var tunEnabled = false
+    private let tunNoticeBanner = MultiClearFrostedSurface(style: .warningBanner, cornerRadius: 10, isCapsule: false)
+    private let tunNoticeLabel = NSTextField(labelWithString: "检测到 Clash Verge 已开启 TUN 模式，可能影响测速准确率；建议先手动关闭 TUN，测速结束后再恢复（不阻断本次测速）。")
+    private var tunBannerHeightConstraint: NSLayoutConstraint?
+    private var tunBannerTopConstraint: NSLayoutConstraint?
     // The checked identities are bound to their immutable, revalidated preview.
     private var nodeSelection: Set<MultiIdentity>?
     private var previewGeneration: UInt64 = 0
@@ -2595,7 +2622,10 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         let stopMenuItem = NSMenuItem(title: "停止当前任务", action: #selector(stop(_:)), keyEquivalent: ".")
         stopMenuItem.target = self
         actionMenu.addItem(stopMenuItem)
-        let exportMenuItem = NSMenuItem(title: "导出 TSV 结果", action: #selector(copyResults(_:)), keyEquivalent: "C")
+        let exportFileMenuItem = NSMenuItem(title: "导出 TSV 文件…", action: #selector(exportTSVFile(_:)), keyEquivalent: "E")
+        exportFileMenuItem.target = self
+        actionMenu.addItem(exportFileMenuItem)
+        let exportMenuItem = NSMenuItem(title: "复制 TSV 到剪贴板", action: #selector(copyResults(_:)), keyEquivalent: "C")
         exportMenuItem.target = self
         actionMenu.addItem(exportMenuItem)
         actionMenu.addItem(NSMenuItem.separator())
@@ -3007,7 +3037,8 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         filterFailedButton.tag = 3; filterFailedButton.target = self; filterFailedButton.action = #selector(statusFilterChanged(_:))
         startButton.target = self; startButton.action = #selector(startManual(_:)); startButton.keyEquivalent = "\r"
         stopButton.target = self; stopButton.action = #selector(stop(_:))
-        copyButton.target = self; copyButton.action = #selector(copyResults(_:))
+        copyButton.target = self; copyButton.action = #selector(exportTSVFile(_:))
+        copyButton.toolTip = "保存为 UTF-8 TSV 文件并同步复制到剪贴板（快捷键 ⌘⇧E；仅复制可用 ⌘⇧C）"
         selectTopNButton.target = self; selectTopNButton.action = #selector(selectTopNNodes(_:))
         selectShownButton.target = self; selectShownButton.action = #selector(selectShownNodes(_:))
         clearShownButton.target = self; clearShownButton.action = #selector(clearShownNodes(_:))
@@ -3690,7 +3721,26 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             bottomDock.heightAnchor.constraint(equalToConstant: 54)
         ])
 
-        for v in [topBar, topDeck, tableCard, bottomDock] {
+        tunNoticeBanner.translatesAutoresizingMaskIntoConstraints = false
+        tunNoticeBanner.isHidden = true
+        tunNoticeLabel.font = .systemFont(ofSize: 11.5, weight: .medium)
+        tunNoticeLabel.textColor = MultiPalette.warning
+        tunNoticeLabel.maximumNumberOfLines = 1
+        tunNoticeLabel.lineBreakMode = .byTruncatingTail
+        let tunNoticeRow = row([symbolIcon("exclamationmark.triangle.fill", color: MultiPalette.warning, size: 12), tunNoticeLabel, spacer()], spacing: 7)
+        tunNoticeRow.translatesAutoresizingMaskIntoConstraints = false
+        tunNoticeBanner.addSubview(tunNoticeRow)
+        NSLayoutConstraint.activate([
+            tunNoticeRow.leadingAnchor.constraint(equalTo: tunNoticeBanner.leadingAnchor, constant: 12),
+            tunNoticeRow.trailingAnchor.constraint(equalTo: tunNoticeBanner.trailingAnchor, constant: -12),
+            tunNoticeRow.centerYAnchor.constraint(equalTo: tunNoticeBanner.centerYAnchor)
+        ])
+        let tunHeight = tunNoticeBanner.heightAnchor.constraint(equalToConstant: 0)
+        tunBannerHeightConstraint = tunHeight
+        let tunTop = tunNoticeBanner.topAnchor.constraint(equalTo: topBar.bottomAnchor, constant: 0)
+        tunBannerTopConstraint = tunTop
+
+        for v in [topBar, tunNoticeBanner, topDeck, tableCard, bottomDock] {
             rootCanvas.addSubview(v)
         }
         NSLayoutConstraint.activate([
@@ -3698,9 +3748,14 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             topBar.trailingAnchor.constraint(equalTo: rootCanvas.trailingAnchor),
             topBar.topAnchor.constraint(equalTo: rootCanvas.topAnchor),
 
+            tunNoticeBanner.leadingAnchor.constraint(equalTo: rootCanvas.leadingAnchor, constant: 24),
+            tunNoticeBanner.trailingAnchor.constraint(equalTo: rootCanvas.trailingAnchor, constant: -24),
+            tunTop,
+            tunHeight,
+
             topDeck.leadingAnchor.constraint(equalTo: rootCanvas.leadingAnchor, constant: 24),
             topDeck.trailingAnchor.constraint(equalTo: rootCanvas.trailingAnchor, constant: -24),
-            topDeck.topAnchor.constraint(equalTo: topBar.bottomAnchor, constant: 4),
+            topDeck.topAnchor.constraint(equalTo: tunNoticeBanner.bottomAnchor, constant: 4),
 
             tableCard.leadingAnchor.constraint(equalTo: rootCanvas.leadingAnchor, constant: 24),
             tableCard.trailingAnchor.constraint(equalTo: rootCanvas.trailingAnchor, constant: -24),
@@ -3862,11 +3917,19 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         let root = self.root
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let result = try? ProfileRegistry.options(root: root)
+            let detectedTun = ProfileRegistry.readTunEnabled(root: root)
             DispatchQueue.main.async { [weak self] in
                 guard let self = self, !self.closed else { return }
                 self.busy = false
+                self.updateTunNoticeBanner(detectedTun == true)
                 if let result = result {
                     self.registry = result; self.selected = self.selected.intersection(Set(result.map(\.id)))
+                    if !self.hasAppliedInitialProfileSelection {
+                        self.hasAppliedInitialProfileSelection = true
+                        if self.selected.isEmpty {
+                            self.selected = self.defaultInitialProfileSelection(from: result)
+                        }
+                    }
                     self.status.stringValue = result.isEmpty ? "没有可用的本地订阅。" : "请选择订阅。测试前会重新验证内容。"
                 } else {
                     self.registry = []; self.selected = []; self.status.stringValue = "无法安全读取订阅列表，请检查后刷新。"
@@ -3875,6 +3938,22 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                 if !self.selected.isEmpty { self.loadNodePreview() }
             }
         }
+    }
+    func defaultInitialProfileSelection(from options: [ProfileOption]) -> Set<Data> {
+        if let current = options.first(where: { $0.isCurrent }) {
+            return [current.id]
+        }
+        if let first = options.first {
+            return [first.id]
+        }
+        return []
+    }
+    func updateTunNoticeBanner(_ enabled: Bool) {
+        tunEnabled = enabled
+        tunNoticeBanner.isHidden = !enabled
+        tunBannerHeightConstraint?.constant = enabled ? 30 : 0
+        tunBannerTopConstraint?.constant = enabled ? 4 : 0
+        tunNoticeBanner.needsDisplay = true
     }
     @objc private func focusSearchField(_ sender: Any?) {
         guard window != nil else { return }
@@ -4430,7 +4509,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         } else {
             let empty = visibleRows.isEmpty
             emptyStateLabel.stringValue = busy ? "正在读取订阅和节点…" :
-                (selectionPreview == nil ? "请先勾选订阅源" : "当前筛选没有节点")
+                (selectionPreview == nil ? (selected.isEmpty ? "请先勾选订阅源" : "所选订阅节点读取失败") : "当前筛选没有节点")
             emptyStateLabel.isHidden = !empty
             emptyStateStack.isHidden = !empty
             if empty {
@@ -4441,7 +4520,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                     emptyStatePrimaryButton.isHidden = true
                     emptyStateSecondaryButton.isHidden = true
                 } else if selectionPreview == nil {
-                    emptyStateIconView.image = NSImage(systemSymbolName: registry.isEmpty ? "exclamationmark.triangle" : "network", accessibilityDescription: nil)?.withSymbolConfiguration(.init(pointSize: 17, weight: .semibold))
+                    emptyStateIconView.image = NSImage(systemSymbolName: (registry.isEmpty || !selected.isEmpty) ? "exclamationmark.triangle" : "network", accessibilityDescription: nil)?.withSymbolConfiguration(.init(pointSize: 17, weight: .semibold))
                     if registry.isEmpty {
                         emptyStateActionMode = 3
                         emptyStateHintLabel.stringValue = "未检测到本地订阅，请确认 Clash Verge 已导入订阅后刷新"
@@ -4449,6 +4528,14 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                         emptyStatePrimaryButton.title = "刷新订阅列表"
                         emptyStatePrimaryButton.isHidden = false
                         emptyStateSecondaryButton.isHidden = true
+                    } else if !selected.isEmpty {
+                        emptyStateActionMode = 3
+                        emptyStateHintLabel.stringValue = "当前已选订阅格式不兼容或无有效节点；可取消勾选异常订阅或刷新重试"
+                        emptyStateHintLabel.isHidden = false
+                        emptyStatePrimaryButton.title = "刷新订阅列表"
+                        emptyStatePrimaryButton.isHidden = false
+                        emptyStateSecondaryButton.title = "全选全部订阅"
+                        emptyStateSecondaryButton.isHidden = registry.count <= 1
                     } else if registry.contains(where: { $0.isCurrent }) {
                         emptyStateActionMode = 1
                         emptyStateHintLabel.stringValue = "支持多订阅并发基准测速、两段优选与安全热切换"
@@ -4796,6 +4883,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
         DispatchQueue.global(qos: .userInitiated).async {
             let active = (try? ProfileRegistry.options(root: root))?.first(where: { $0.isCurrent })
+            let detectedTun = ProfileRegistry.readTunEnabled(root: root)
             let profile = active.flatMap { current in
                 preview.profiles.first { $0.option.id == current.id && multiBytesEqual($0.option.path, current.path) }
             }
@@ -4803,6 +4891,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             let identity = snapshotMatches ? multiWaitForLocalController(root: root) : nil
             DispatchQueue.main.async {
                 guard !self.closed, !self.busy, self.groupRefreshInFlight, self.groupGeneration == generation else { return }
+                if let detectedTun = detectedTun { self.updateTunNoticeBanner(detectedTun) }
                 guard active != nil else {
                     fail("无法读取 Clash Verge 当前订阅；请刷新配置。")
                     return
@@ -6268,9 +6357,9 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         return ["\(row.index + 1)", row.profileName, row.nodeName, m.nodeType, speed, latency,
                 String(format: "%.1f%%", failures), jitter, row.eligibleScore == nil && m.score != nil ? "\(score)（信息项）" : score]
     }
-    @objc private func copyResults(_ sender: Any?) {
+    func buildTSVExportPayload() -> (content: String, filename: String, isHistory: Bool)? {
         if viewMode == .history {
-            guard !historyVisibleIndices.isEmpty else { return }
+            guard !historyVisibleIndices.isEmpty else { return nil }
             let header = "排名\t状态\t订阅\t节点\t类型\t稳健吞吐\t典型延迟\t可用率\t样本\t长效稳健分\t基础分\t健康扣分"
             let lines = historyVisibleIndices.enumerated().map { rankIdx, idx -> String in
                 let s = historySummaries[idx]
@@ -6288,18 +6377,51 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                 ]
                 return fields.map(multiTSVSafeCell).joined(separator: "\t")
             }
-            let content = ([header] + lines).joined(separator: "\n")
-            NSPasteboard.general.clearContents(); NSPasteboard.general.setString(content, forType: .string)
-            copyButton.flashConfirmation(title: "已复制", symbol: "checkmark")
-            status.stringValue = "已复制长效优选榜；其中包含订阅与节点名称，请注意隐私。"
-            return
+            return (([header] + lines).joined(separator: "\n"), "clash-history-results.tsv", true)
         }
-        guard !rows.isEmpty else { return }
+        guard !rows.isEmpty else { return nil }
         let header = "原序号\t订阅\t节点\t类型\t已验证速度\tHEAD延迟\tHEAD失败率\tHEAD抖动\t综合分"
         let content = ([header] + rows.map { cells($0).map(multiTSVSafeCell).joined(separator: "\t") }).joined(separator: "\n")
-        NSPasteboard.general.clearContents(); NSPasteboard.general.setString(content, forType: .string)
+        return (content, "clash-speed-results.tsv", false)
+    }
+    @objc private func copyResults(_ sender: Any?) {
+        guard let payload = buildTSVExportPayload() else { return }
+        NSPasteboard.general.clearContents(); NSPasteboard.general.setString(payload.content, forType: .string)
         copyButton.flashConfirmation(title: "已复制", symbol: "checkmark")
-        status.stringValue = "已复制结果；其中包含订阅与节点名称，请注意隐私。"
+        status.stringValue = payload.isHistory
+            ? "已复制长效优选榜；其中包含订阅与节点名称，请注意隐私。"
+            : "已复制结果；其中包含订阅与节点名称，请注意隐私。"
+    }
+    @objc private func exportTSVFile(_ sender: Any?) {
+        guard let payload = buildTSVExportPayload() else { return }
+#if MULTI_UI_TEST
+        NSPasteboard.general.clearContents(); NSPasteboard.general.setString(payload.content, forType: .string)
+        copyButton.flashConfirmation(title: "已导出", symbol: "checkmark")
+        status.stringValue = payload.isHistory
+            ? "已导出长效优选 TSV 并复制到剪贴板；内容包含订阅与节点名称，请注意隐私。"
+            : "已导出 TSV 并复制到剪贴板；内容包含订阅与节点名称，请注意隐私。"
+#else
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = payload.filename
+        panel.canCreateDirectories = true
+        panel.isExtensionHidden = false
+        panel.title = payload.isHistory ? "导出长效优选榜 TSV" : "导出测速结果 TSV"
+        let finishExport: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard let self = self, !self.closed, response == .OK, let targetURL = panel.url else { return }
+            let utf8BOM = "\u{FEFF}" + payload.content
+            do {
+                try Data(utf8BOM.utf8).write(to: targetURL, options: .atomic)
+                NSPasteboard.general.clearContents(); NSPasteboard.general.setString(payload.content, forType: .string)
+                self.copyButton.flashConfirmation(title: "已导出", symbol: "checkmark")
+                self.status.stringValue = payload.isHistory
+                    ? "已导出长效优选 TSV 并复制到剪贴板；内容包含订阅与节点名称，请注意隐私。"
+                    : "已导出 TSV 并复制到剪贴板；内容包含订阅与节点名称，请注意隐私。"
+            } catch {
+                self.status.stringValue = "导出 TSV 文件失败，请检查保存目录权限。"
+            }
+        }
+        panel.begin(completionHandler: finishExport)
+#endif
     }
     func tableViewSelectionDidChange(_ notification: Notification) {
         guard let table = notification.object as? NSTableView, table === resultTable else { return }

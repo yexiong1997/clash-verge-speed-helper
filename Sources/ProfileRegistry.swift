@@ -161,6 +161,132 @@ public enum ProfileRegistry {
         return result
     }
 
+    /// Safely inspects clash-verge.yaml (tun.enable) and falls back to
+    /// verge.yaml (enable_tun_mode) under the caller-supplied root without
+    /// following symlinks or spawning external processes. Any missing, symlinked,
+    /// oversized, or malformed file degrades cleanly to nil so callers can
+    /// show a non-blocking advisory notice without interfering with refresh.
+    public static func readTunEnabled(root: URL) -> Bool? {
+        guard root.isFileURL, root.host == nil || root.host == "",
+              root.query == nil, root.fragment == nil else { return nil }
+        let rootPath = root.standardizedFileURL.path
+        guard rootPath.utf8.first == 47, validText(rootPath) else { return nil }
+        let rootFD = rootPath.withCString { Darwin.open($0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
+        guard rootFD >= 0 else { return nil }
+        defer { _ = Darwin.close(rootFD) }
+        var rootStat = stat()
+        guard fstat(rootFD, &rootStat) == 0, isDirectory(rootStat) else { return nil }
+
+        if let data = readRegularFileAt(rootFD, name: "clash-verge.yaml"),
+           let value = parseClashTunEnable(data) {
+            return value
+        }
+        if let data = readRegularFileAt(rootFD, name: "verge.yaml"),
+           let value = parseTopLevelYAMLBool(data, key: "enable_tun_mode") {
+            return value
+        }
+        return nil
+    }
+
+    private static func readRegularFileAt(_ dirFD: Int32, name: String) -> Data? {
+        var before = stat()
+        guard statAt(dirFD, name, &before), isRegular(before),
+              before.st_size >= 0, before.st_size <= maximumYAMLBytes else { return nil }
+        let fd = name.withCString { Darwin.openat(dirFD, $0, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC) }
+        guard fd >= 0 else { return nil }
+        defer { _ = Darwin.close(fd) }
+        var opened = stat()
+        guard fstat(fd, &opened) == 0, isRegular(opened), sameVersion(before, opened),
+              let data = try? readBounded(fd) else { return nil }
+        var after = stat()
+        guard fstat(fd, &after) == 0, sameVersion(opened, after) else { return nil }
+        return data
+    }
+
+    private static func stripYAMLComment(_ raw: Substring) -> String {
+        var out = ""
+        var inSingle = false
+        var inDouble = false
+        var prevSpace = true
+        for ch in raw {
+            if ch == "'" && !inDouble {
+                inSingle.toggle()
+            } else if ch == "\"" && !inSingle {
+                inDouble.toggle()
+            } else if ch == "#" && !inSingle && !inDouble && prevSpace {
+                break
+            }
+            out.append(ch)
+            prevSpace = (ch == " " || ch == "\t")
+        }
+        return out.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func parseExactYAMLBool(_ raw: Substring) -> Bool? {
+        let cleaned = stripYAMLComment(raw)
+        if cleaned == "true" { return true }
+        if cleaned == "false" { return false }
+        return nil
+    }
+
+    private static func parseClashTunEnable(_ data: Data) -> Bool? {
+        guard let text = String(data: data, encoding: .utf8) else { return nil }
+        var inTun = false
+        var tunIndent: Int? = nil
+        for rawLine in text.split(omittingEmptySubsequences: false, whereSeparator: { $0.isNewline }) {
+            let trimmed = rawLine.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty || trimmed.hasPrefix("#") { continue }
+            let indent = rawLine.prefix(while: { $0 == " " }).count
+            if rawLine.first == "\t" { continue }
+            if indent == 0 {
+                inTun = false
+                tunIndent = nil
+                guard let colon = rawLine.firstIndex(of: ":") else { continue }
+                let key = rawLine[..<colon].trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+                if key == "tun" {
+                    let rest = stripYAMLComment(rawLine[rawLine.index(after: colon)...])
+                    if rest.isEmpty {
+                        inTun = true
+                    } else if rest.hasPrefix("{") && rest.hasSuffix("}") {
+                        let inner = rest.dropFirst().dropLast()
+                        for pair in inner.split(separator: ",") {
+                            guard let pairColon = pair.firstIndex(of: ":") else { continue }
+                            let k = pair[..<pairColon].trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+                            if k == "enable", let parsed = parseExactYAMLBool(pair[pair.index(after: pairColon)...]) {
+                                return parsed
+                            }
+                        }
+                    }
+                }
+                continue
+            }
+            if inTun {
+                if let expected = tunIndent, indent > expected { continue }
+                guard let colon = rawLine.firstIndex(of: ":") else { continue }
+                if tunIndent == nil { tunIndent = indent }
+                guard indent == tunIndent else { continue }
+                let key = rawLine[..<colon].trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+                if key == "enable" {
+                    return parseExactYAMLBool(rawLine[rawLine.index(after: colon)...])
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func parseTopLevelYAMLBool(_ data: Data, key targetKey: String) -> Bool? {
+        guard let text = String(data: data, encoding: .utf8) else { return nil }
+        for rawLine in text.split(omittingEmptySubsequences: false, whereSeparator: { $0.isNewline }) {
+            if rawLine.isEmpty || rawLine.first == " " || rawLine.first == "\t" || rawLine.first == "#" { continue }
+            guard let colon = rawLine.firstIndex(of: ":") else { continue }
+            let key = rawLine[..<colon].trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+            if key == targetKey {
+                return parseExactYAMLBool(rawLine[rawLine.index(after: colon)...])
+            }
+        }
+        return nil
+    }
+
     private static let maximumYAMLBytes: off_t = 4 * 1024 * 1024
     private static let maximumJSONBytes = 8 * 1024 * 1024
     private static let maximumFieldBytes = 8 * 1024

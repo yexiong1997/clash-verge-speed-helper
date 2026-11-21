@@ -814,6 +814,12 @@ class MultiAppHeadlessTests(unittest.TestCase):
     def test_inspect_nodes_and_reject_unsafe_yaml(self):
         valid = "proxies:\n  - name: 'é'\n  - name: 'é'\n"
         self.assertEqual(self.run_driver({"action": "inspect", "yaml": valid})["names"], ["é", "é"])
+        ss2022_yaml = (
+            "proxies:\n"
+            "  - {name: ss2022-node, type: ss, server: 1.1.1.1, port: 443, cipher: 2022-blake3-aes-128-gcm, password: abc+def=:ghi+jkl=}\n"
+            "  - {name: v6-node, type: ss, server: 2001:db8::1, port: 443, cipher: aes-128-gcm, password: pwd}\n"
+        )
+        self.assertEqual(self.run_driver({"action": "inspect", "yaml": ss2022_yaml})["names"], ["ss2022-node", "v6-node"])
         invalid = ["", "[]", "proxies: []", "proxies: [{name: a}, {name: a}]",
                    "proxies: [{name: a}]\nproxy-providers: {}", "proxies: [{name: a}]\nrule-providers: {}",
                    "proxies: [{name: a}, {name: &x b}, {name: *x}]", "proxies: [{name: a, name: b}]",
