@@ -6,7 +6,7 @@ param(
     [string]$GoArchive = '',
     [string]$OfflineCache = '',
     [string]$ExportOfflineCache = '',
-    [string]$OutputDirectory = (Join-Path $env:LOCALAPPDATA 'ClashSpeedHelper\verified-worker')
+    [string]$OutputDirectory = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -16,6 +16,11 @@ $goHash = '89efb4f9b30812eee083cc1770fdd2913c14d301064f6454851428f9707d190b'
 $commit = 'd3b9b151893fa7415fc4197242aadedc25e40391'
 $goFile = 'go1.25.0.windows-amd64.zip'
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+if (-not $PSBoundParameters.ContainsKey('OutputDirectory')) {
+    $OutputDirectory = Join-Path $root 'build\verified-worker'
+} elseif ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
+    throw 'OutputDirectory must not be empty.'
+}
 $patch = Join-Path $root 'Worker\verified-worker.patch'
 $offline = $OfflineCache -ne ''
 

@@ -137,6 +137,10 @@ class ProfileTests(unittest.TestCase):
                 parse_yaml(raw)
 
     def test_reject_provider_and_duplicate_names(self):
+        self.assertEqual(
+            inspect_nodes(b"rule-providers: {ads: {type: http}}\nproxies:\n- {name: A}\n"),
+            ("A",),
+        )
         for raw in (b"proxy-providers: {}\nproxies: []\n",
                     b"proxies:\n- {name: A}\n- {name: A}\n"):
             with self.subTest(raw=raw), self.assertRaises(ProfileError):

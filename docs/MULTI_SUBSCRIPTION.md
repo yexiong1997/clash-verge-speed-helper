@@ -8,22 +8,26 @@ Windows 版与下面的 macOS 版分别实现；两者均为本地桌面应用�
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Scripts\build-verified-worker.ps1
-python -B .\Worker\self-test.py "$env:LOCALAPPDATA\ClashSpeedHelper\verified-worker\clash-speedtest.exe"
+python -B .\Worker\self-test.py ".\build\verified-worker\clash-speedtest.exe"
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Scripts\build-multi.ps1
 .\build\windows-env\Scripts\python.exe -B -m unittest discover -s Tests -p 'test_*.py' -v
 ```
 
-`build-multi.ps1` 打印新的 `build\windows-<时间戳>\ClashSpeedHelper\ClashSpeedHelper.exe`；整个文件夹是应用，不能只复制 EXE。可用 `-WorkerPath` 指定其他已核验的 Windows worker。worker 构建脚本支持 `-OfflineCache <目录>`，但这不是操作系统级网络隔离；Windows 构建还假定项目及缓存目录可信。构建和运行条件详见 `Scripts/build-verified-worker.ps1` 与 [worker 契约](../Worker/CONTRACT.md)。
+`build-multi.ps1` 打印新的 `build\windows-<时间戳>\ClashSpeedHelper\ClashSpeedHelper.exe`；整个文件夹是应用，不能只复制 EXE。正式安装可运行 `.\Scripts\install-multi.ps1`（默认安装到 `D:\Program Files\ClashSpeedHelper`，可用 `-InstallRoot` 覆盖）。可用 `-WorkerPath` 指定其他已核验的 Windows worker。worker 构建脚本支持 `-OfflineCache <目录>`，但这不是操作系统级网络隔离；Windows 构建还假定项目及缓存目录可信。构建和运行条件详见 `Scripts/build-verified-worker.ps1` 与 [worker 契约](../Worker/CONTRACT.md)。
 
-首次打开点击“刷新”，再勾选订阅和节点。默认读取 `%APPDATA%\io.github.clash-verge-rev.clash-verge-rev`；测试可用 `CLASH_SPEED_HELPER_ROOT` 或命令行 `--profile-root <隔离目录>` 覆盖。只读取直接 `proxies`，拒绝 YAML 重复键、别名、显式标签、提供者以及不安全路径；拒绝重解析点并检查文件身份与快照。Windows 版当前最多加载 32 个订阅、总计 2000 个节点；某个登记的订阅不符合要求时整次刷新会失败。
+首次打开会自动读取本地订阅，并在控制器可用时自动刷新当前订阅的策略组（只有唯一非 `GLOBAL` 策略组包含全部待测节点或仅 1 个非 `GLOBAL` 候选组时才自动建议选中，仍请核对）。默认读取 `%APPDATA%\io.github.clash-verge-rev.clash-verge-rev`；测试可用 `CLASH_SPEED_HELPER_ROOT` 或命令行 `--profile-root <隔离目录>` 覆盖。只读取直接 `proxies`，拒绝 YAML 重复键、别名、显式标签、`proxy-providers` 以及不安全路径（Windows 版允许含 `rule-providers` 且存在内联 `proxies` 的配置，并在单个订阅因 `proxy-providers` 或空节点不兼容时仅跳过该订阅而非整次失败）；拒绝重解析点并检查文件身份与快照。Windows 版当前最多加载 32 个订阅、总计 2000 个节点。
 
-开始或“加压验证 · 20M”会发起真实测速并消耗流量；20M 按每个已勾选节点、全局并发 2、精确模式执行。“智能两段优选”先按每节点 1 MiB、最多 10 个节点并发初筛，再将可评分前 N（最多 10）名按每节点 20 MiB、并发 2、4 流复测；停止或校验失败时不进入下一阶段。流量估计不是上限。搜索及状态筛选只过滤显示；表头可排序，“勾选”按当前可见顺序选择前 N 项并取消其他勾选。节点右键菜单可切换、复测或复制名称；也可聚焦行内复选框后用菜单键或 Shift+F10 打开。定时需手动启用、应用保持运行，界面显示下次运行倒计时，改变节点、参数或授权会解除；不会在启动后自动恢复。
+开始或“加压验证 · 20M”会发起真实测速并消耗流量；20M 按每个已勾选节点、全局并发 2、精确模式执行。“智能两段优选”先按每节点 1 MiB、最多 10 个节点并发初筛，保留未进复测节点的初筛分（`初筛 xx.x`），再自动将可评分前 **10** 名（与“前 N 项”勾选框解耦）按每节点 20 MiB、并发 2、4 流复测；停止或校验失败时不进入下一阶段。测速期间 worker 通过 stderr 上报实时探测与下载进度（供表格行进度条、总进度条、Sparkline 曲线及动效使用），测速结束后自动恢复按综合分降序。流量估计不是上限。搜索及状态筛选只过滤显示；表头可排序，“勾选”按当前可见顺序选择前 N 项并取消其他勾选。节点右键菜单可切换、复测或复制名称；也可聚焦行内复选框后用菜单键或 Shift+F10 打开。定时需手动启用，支持托盘后台运行、退出应用后停止，界面显示下次运行倒计时，改变节点、参数或授权会解除；不会在启动后自动恢复。
 
-自动切换默认关闭。刷新策略组后，Windows 版从 `clash-verge.yaml` 取得 `secret` 及本机控制器：可选 `external-controller-pipe`（Named Pipe）或 `external-controller-unix`（Windows AF_UNIX），携带 Bearer 认证发送 HTTP；两项同时非空时拒绝猜测，不降级到 TCP，不输出 secret。Named Pipe 要求服务端进程属于当前用户且进程身份不变；AF_UNIX 要求系统支持该功能、路径为本机盘符绝对路径且 UTF-8 不超过 107 字节、父目录没有重解析点，socket 对象必须是当前用户拥有的 AF_UNIX 专用重解析点，且连接前、发送前和响应后的文件身份一致。其他重解析点不作为 socket 接受。
+Windows 版支持**系统托盘后台运行与单实例唤醒**：启动后常驻系统托盘，默认开启“关闭窗口时最小化到托盘”（持久化在 `%LOCALAPPDATA%\ClashSpeedHelper\settings.json`，测试或 `--profile-root` 隔离到目标目录 `.telemetry\settings.json`）；隐藏到托盘后正在进行的测速、定时测速、智能巡检与 60s 活跃探测保持运行；左/双击托盘图标或再次启动 `ClashSpeedHelper.exe` 会唤醒并前置已有窗口。托盘菜单展示状态摘要、显示/隐藏、最小化开关及安全停止项；若测速或切换进行中点击“退出应用”，会先唤醒窗口并执行安全停止并严守 `outcome_unknown` 锁定边界，空闲时再彻底退出并清理托盘图标。
+
+Windows 版已同步 macOS 的**长效优选、智能巡检与活跃健康探测**体系：所有非取消的有效测速样本（`manual` / `load_20m` / `funnel_s1` / `funnel_s2` / `scheduled` / `patrol` / `retest`）写入本地 30 天自动清理的 SQLite 档案（`%LOCALAPPDATA%\ClashSpeedHelper\telemetry-v1.sqlite`，测试与 `--profile-root` 会自动隔离到目标目录下的 `.telemetry`）；按 **24小时 / 7天 / 30天 / 晚高峰（20:00–23:30，权重 1.25×）** 进行时间与包大小加权分位数、贝叶斯收缩与可用率计算，需至少 3 次成功且可用率 ≥ 50% 才获“主力”资格。刷新策略组及空闲期每 60 秒通过本地控制器 `GET /proxies/<node>/delay` 对当前激活节点做一次只读活跃探测（连续失败按 24h 半衰期扣分最多 25 分，测速成功立即清零）。**“开启巡检”** 按 50/80/150/300 MiB/天日配额每 30 分钟执行一次守擂+探索（1 MiB/2 流，不改写用户勾选，不触发自动切换，且与定时测速互斥）。在“长效优选”页点“清空记录”需 4 秒内二次确认（`确认清空?`）。
+
+界面默认勾选“自动切换最高分”（若只想测速不切换，可在开始前取消勾选；若上轮切换结果未知则强制取消并锁定）。刷新策略组后，Windows 版从 `clash-verge.yaml` 取得 `secret` 及本机控制器：可选 `external-controller-pipe`（Named Pipe）或 `external-controller-unix`（Windows AF_UNIX），携带 Bearer 认证发送 HTTP；两项同时非空时拒绝猜测，不降级到 TCP，不输出 secret。Named Pipe 要求服务端进程属于当前用户且进程身份不变；AF_UNIX 要求系统支持该功能、路径为本机盘符绝对路径且 UTF-8 不超过 107 字节、父目录没有重解析点，socket 对象必须是当前用户拥有的 AF_UNIX 专用重解析点，且连接前、发送前和响应后的文件身份一致。其他重解析点不作为 socket 接受。
 
 只有当前订阅和直接 `Selector` 成员可参与切换；写前重新核对配置快照、组当前选择及授权，HTTP 204 后必须再次 GET 验证。若 PUT 结果未知，整个应用会话锁定切换且不自动重试；请先在 Clash 中人工核验实际状态。Windows 允许 AF_UNIX 文件在句柄仍打开时被重命名，故这些检查只能降低替换风险，**不是原子比较并交换**，仍有并发竞态；同一用户身份和文件检查也不能证明进程来源可信。切换停止后无法撤回已发请求。
 
-最高分来自非当前订阅时，助手不会代替用户切换订阅。需要继续时，先在 Clash Verge 手动切换到该订阅，在助手点击“刷新”并刷新策略组，然后明确点击“继续应用最优”并确认；订阅文件、身份或配置列表变动时不会保留该候选。Windows 暂不支持 macOS 的自动运行时注入和跨订阅热切换，也不运行 macOS 安装清理脚本。复测时如已选择策略组或开启自动切换，会重新核验原控制器及策略组；发生变化时不启动复测。已确认成功的当前订阅直接节点切换可尝试“切回原节点”；再次写入前会重新核对订阅、控制器、组当前选择和直接成员，条件变化或结果未知时不会盲目重试。Windows UI 不含 macOS 全部动画。
+最高分来自非当前订阅时，助手不会代替用户切换订阅。需要继续时，先在 Clash Verge 手动切换到该订阅，在助手点击“刷新”并刷新策略组，然后明确点击“继续应用最优”并确认；订阅文件、身份或配置列表变动时不会保留该候选。Windows 暂不支持 macOS 的自动运行时注入和跨订阅热切换，也不运行 macOS 安装清理脚本。复测时如已选择策略组或开启自动切换，会重新核验原控制器及策略组；发生变化时不启动复测，且支持从“长效优选”榜单直接发起兼容订阅的 20 MiB 单节点复测。已确认成功的当前订阅直接节点切换可尝试“切回原节点”；再次写入前会重新核对订阅、控制器、组当前选择和直接成员，条件变化或结果未知时不会盲目重试。
 
 Windows 测试使用合成 YAML、回环地址、模拟 Named Pipe 与 AF_UNIX socket 和合成子进程，不读取真实配置或写入真实控制器。旧有 macOS/Unix 专用测试在 Windows 上明确跳过，并不因此代表已经通过 macOS 测试；Windows 专属覆盖见 `Tests/test_windows_*.py`。Windows 上无法创建符号链接时相应用例跳过，目录联接（junction）检查仍单独测试；系统不支持 AF_UNIX 时相关合成测试会跳过。Worker 自测在缺少已验证的 Windows 网络沙箱时跳过若干禁止联网用例，不能视为沙箱验证。
 

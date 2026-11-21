@@ -2,8 +2,8 @@
 # Build, verify, install, and prune stale ClashSpeedHelper variants on Windows x64.
 [CmdletBinding(PositionalBinding = $false)]
 param(
-    [string]$WorkerPath = (Join-Path $env:LOCALAPPDATA 'ClashSpeedHelper\verified-worker\clash-speedtest.exe'),
-    [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'Programs'),
+    [string]$WorkerPath = '',
+    [string]$InstallRoot = 'D:\Program Files',
     [string]$SourceDir = '',
     [switch]$Help
 )
@@ -18,8 +18,9 @@ Usage:
 
 Builds a verified ClashSpeedHelper package in a private staging directory (or
 validates an explicitly supplied -SourceDir), runs ClashSpeedHelper.exe --smoke-test,
-replaces <InstallRoot>\ClashSpeedHelper idempotently, and cleans up stale
-ClashSpeedHelper backup/staging directories under <InstallRoot>.
+replaces <InstallRoot>\ClashSpeedHelper idempotently (defaulting to
+D:\Program Files\ClashSpeedHelper and <repo>\build\verified-worker\clash-speedtest.exe),
+and cleans up stale ClashSpeedHelper backup/staging directories under <InstallRoot>.
 It never modifies Clash Verge configuration directories or system security settings.
 '@
     exit 0
@@ -177,6 +178,11 @@ function Stop-InstalledProcess([string]$AppPath) {
 
 $root = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 Assert-NoReparse $root
+if (-not $PSBoundParameters.ContainsKey('WorkerPath') -and -not $SourceDir) {
+    $WorkerPath = Join-Path $root 'build\verified-worker\clash-speedtest.exe'
+} elseif (-not $SourceDir -and [string]::IsNullOrWhiteSpace($WorkerPath)) {
+    throw 'A verified Windows worker is required; supply -WorkerPath.'
+}
 $safeInstallRoot = Assert-SafeInstallRoot $InstallRoot
 Ensure-Directory $safeInstallRoot
 

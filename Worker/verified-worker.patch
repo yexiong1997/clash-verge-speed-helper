@@ -11,7 +11,7 @@
  	PacketLoss    float64        `json:"packet_loss"`
 --- /dev/null
 +++ b/cmd/verified-worker/main.go
-@@ -0,0 +1,524 @@
+@@ -0,0 +1,702 @@
 +// Verified JSON worker, derived from faceair/clash-speedtest v1.8.6
 +// (GPL-3.0); see the accompanying source patch and provenance notice.
 +package main
@@ -30,6 +30,7 @@
 +	"strconv"
 +	"strings"
 +	"sync"
++	"sync/atomic"
 +	"time"
 +
 +	_ "github.com/faceair/clash-speedtest/cmd/verified-worker/safeinit"
@@ -44,6 +45,14 @@
 +const maxStreams = 128
 +
 +// This intentionally contains no proxy configuration or raw errors.
++type progressV1 struct {
++	Progress      int     `json:"progress"`
++	Phase         string  `json:"phase"`
++	ReceivedBytes int64   `json:"received_bytes"`
++	ExpectedBytes int64   `json:"expected_bytes"`
++	BPS           float64 `json:"bps"`
++}
++
 +type resultV1 struct {
 +	Version                int     `json:"version"`
 +	NodeName               string  `json:"node_name"`
@@ -98,19 +107,51 @@
 +}
 +
 +func execute() int {
++	var progressOut *os.File
++	if os.Getenv("CLASH_VERIFIED_PROGRESS") == "1" {
++		progressOut = dupStderr()
++	}
 +	out, _, ok := resultOutput()
 +	if !ok {
++		if progressOut != nil {
++			progressOut.Close()
++		}
 +		return 1
 +	}
 +	defer out.Close()
++	if progressOut != nil {
++		defer progressOut.Close()
++	}
 +	// Keep the process handles silenced until exit: background library logs
 +	// must never regain the inherited pipes after private input is processed.
 +	// The parent process and its standard handles are never modified.
 +	mihomolog.SetLevel(mihomolog.SILENT)
-+	return run(out)
++	return run(out, progressOut)
 +}
 +
-+func run(out io.Writer) (status int) {
++func emitProgress(w io.Writer, phase string, received, expected int64, bps float64) {
++	if w == nil {
++		return
++	}
++	if received < 0 {
++		received = 0
++	}
++	if received > expected {
++		received = expected
++	}
++	if math.IsNaN(bps) || math.IsInf(bps, 0) || bps < 0 {
++		bps = 0
++	}
++	_ = json.NewEncoder(w).Encode(progressV1{
++		Progress:      1,
++		Phase:         phase,
++		ReceivedBytes: received,
++		ExpectedBytes: expected,
++		BPS:           bps,
++	})
++}
++
++func run(out io.Writer, progressOut io.Writer) (status int) {
 +	status = 1
 +	defer func() {
 +		if recover() != nil {
@@ -180,6 +221,7 @@
 +	}
 +	res := resultV1{Version: 1, NodeName: name, NodeType: p.Type().String(),
 +		HeadAttempts: 6, ExpectedBytes: chunk * int64(o.streams)}
++	emitProgress(progressOut, "head", 0, res.ExpectedBytes, 0)
 +	latencies := testHeads(p, target, o.latency)
 +	res.HeadSuccesses = len(latencies)
 +	if len(latencies) > 0 {
@@ -195,6 +237,8 @@
 +		}
 +		res.JitterMS = math.Sqrt(variance / float64(len(latencies)))
 +	}
++	var progressBytes atomic.Int64
++	emitProgress(progressOut, "download", 0, res.ExpectedBytes, 0)
 +	results := make(chan transfer, o.streams)
 +	var wg sync.WaitGroup
 +	started := time.Now()
@@ -209,10 +253,49 @@
 +				results <- v
 +				wg.Done()
 +			}()
-+			v = download(p, target, chunk, o.timeout)
++			v = download(p, target, chunk, o.timeout, &progressBytes)
++		}()
++	}
++	var tickerWg sync.WaitGroup
++	stopTicker := make(chan struct{})
++	if progressOut != nil {
++		tickerWg.Add(1)
++		go func() {
++			defer tickerWg.Done()
++			ticker := time.NewTicker(120 * time.Millisecond)
++			defer ticker.Stop()
++			var lastBytes int64 = -1
++			var ticks int
++			for {
++				select {
++				case <-stopTicker:
++					return
++				case <-ticker.C:
++					ticks++
++					cur := progressBytes.Load()
++					if cur > res.ExpectedBytes {
++						cur = res.ExpectedBytes
++					}
++					elapsed := time.Since(started).Seconds()
++					bps := 0.0
++					if cur > 0 && elapsed > 0 {
++						denom := elapsed
++						if denom < 0.15 {
++							denom = 0.15
++						}
++						bps = float64(cur) / denom
++					}
++					if cur != lastBytes || ticks%2 == 0 {
++						emitProgress(progressOut, "download", cur, res.ExpectedBytes, bps)
++						lastBytes = cur
++					}
++				}
++			}
 +		}()
 +	}
 +	wg.Wait()
++	close(stopTicker)
++	tickerWg.Wait()
 +	elapsed := time.Since(started).Seconds()
 +	close(results)
 +	res.DownloadComplete = true
@@ -442,24 +525,102 @@
 +	}
 +}
 +
++type activityConn struct {
++	net.Conn
++	timeout time.Duration
++}
++
++func (c *activityConn) Read(b []byte) (int, error) {
++	if c.timeout > 0 {
++		_ = c.Conn.SetReadDeadline(time.Now().Add(c.timeout))
++	}
++	return c.Conn.Read(b)
++}
++
++func (c *activityConn) Write(b []byte) (int, error) {
++	if c.timeout > 0 {
++		_ = c.Conn.SetWriteDeadline(time.Now().Add(c.timeout))
++	}
++	return c.Conn.Write(b)
++}
++
++type idleReader struct {
++	r       io.Reader
++	timeout time.Duration
++	timer   *time.Timer
++}
++
++func (ir *idleReader) Read(p []byte) (int, error) {
++	n, err := ir.r.Read(p)
++	if n > 0 {
++		ir.timer.Reset(ir.timeout)
++	}
++	return n, err
++}
++
++func overallDownloadTimeout(stallTimeout time.Duration, size int64) time.Duration {
++	// Permit steady transfers down to 64 KiB/s (~0.5 Mbps per stream) while still
++	// capping anti-slowloris duration below MultiBatchRunner's 180s watchdog.
++	const minProgressBytesPerSec = 64 * 1024
++	extra := time.Duration(float64(size) / float64(minProgressBytesPerSec) * float64(time.Second))
++	overall := 3*stallTimeout + extra
++	maxOverall := 120 * time.Second
++	if stallTimeout > maxOverall {
++		maxOverall = stallTimeout
++	}
++	if overall < stallTimeout {
++		return stallTimeout
++	}
++	if overall > maxOverall {
++		return maxOverall
++	}
++	return overall
++}
++
++func dialMetadata(p constant.Proxy, ctx context.Context, addr string) (net.Conn, error) {
++	host, port, err := net.SplitHostPort(addr)
++	if err != nil {
++		return nil, err
++	}
++	n, err := strconv.ParseUint(port, 10, 16)
++	if err != nil || n == 0 {
++		return nil, io.ErrUnexpectedEOF
++	}
++	return p.DialContext(ctx, &constant.Metadata{Host: host, DstPort: uint16(n)})
++}
++
 +// Same dial model as upstream's speedtester.createClient; never consult the
 +// environment's HTTP proxy, never follow redirects, and never decompress.
 +func clientFor(p constant.Proxy, timeout time.Duration) *http.Client {
 +	tr := &http.Transport{
-+		DisableCompression: true,
++		DisableCompression:    true,
++		TLSHandshakeTimeout:   timeout,
++		ResponseHeaderTimeout: timeout,
 +		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-+			host, port, err := net.SplitHostPort(addr)
-+			if err != nil {
-+				return nil, err
-+			}
-+			n, err := strconv.ParseUint(port, 10, 16)
-+			if err != nil || n == 0 {
-+				return nil, io.ErrUnexpectedEOF
-+			}
-+			return p.DialContext(ctx, &constant.Metadata{Host: host, DstPort: uint16(n)})
++			return dialMetadata(p, ctx, addr)
 +		},
 +	}
 +	return &http.Client{Timeout: timeout, Transport: tr,
++		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
++}
++
++func downloadClientFor(p constant.Proxy, stallTimeout time.Duration) *http.Client {
++	tr := &http.Transport{
++		DisableCompression:    true,
++		DisableKeepAlives:     true,
++		TLSHandshakeTimeout:   stallTimeout,
++		ResponseHeaderTimeout: stallTimeout,
++		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
++			dialCtx, dialCancel := context.WithTimeout(ctx, stallTimeout)
++			defer dialCancel()
++			conn, err := dialMetadata(p, dialCtx, addr)
++			if err != nil {
++				return nil, err
++			}
++			return &activityConn{Conn: conn, timeout: stallTimeout}, nil
++		},
++	}
++	return &http.Client{Transport: tr,
 +		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 +}
 +
@@ -513,10 +674,25 @@
 +	return err == nil && total > last
 +}
 +
-+func download(p constant.Proxy, target string, size int64, timeout time.Duration) transfer {
-+	c := clientFor(p, timeout)
++type countingReader struct {
++	r     io.Reader
++	total *atomic.Int64
++}
++
++func (cr *countingReader) Read(p []byte) (int, error) {
++	n, err := cr.r.Read(p)
++	if n > 0 && cr.total != nil {
++		cr.total.Add(int64(n))
++	}
++	return n, err
++}
++
++func download(p constant.Proxy, target string, size int64, timeout time.Duration, counter *atomic.Int64) transfer {
++	c := downloadClientFor(p, timeout)
 +	defer c.CloseIdleConnections()
-+	req, err := http.NewRequest(http.MethodGet, target, nil)
++	reqCtx, reqCancel := context.WithTimeout(context.Background(), overallDownloadTimeout(timeout, size))
++	defer reqCancel()
++	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, target, nil)
 +	if err != nil {
 +		return transfer{}
 +	}
@@ -531,14 +707,16 @@
 +		(resp.StatusCode == http.StatusPartialContent && !validRange(resp.Header, size)) {
 +		return transfer{}
 +	}
++	stallTimer := time.AfterFunc(timeout, reqCancel)
++	defer stallTimer.Stop()
 +	// size+1 distinguishes a genuine EOF at exactly size from excess data.
-+	r := &io.LimitedReader{R: resp.Body, N: size + 1}
-+	n, readErr := io.Copy(io.Discard, r)
++	r := &io.LimitedReader{R: &idleReader{r: resp.Body, timeout: timeout, timer: stallTimer}, N: size + 1}
++	n, readErr := io.Copy(io.Discard, &countingReader{r: r, total: counter})
 +	return transfer{bytes: n, ok: readErr == nil && n == size && r.N > 0}
 +}
 --- /dev/null
 +++ b/cmd/verified-worker/output_unix.go
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,57 @@
 +//go:build darwin || linux
 +
 +package main
@@ -548,6 +726,14 @@
 +
 +	"golang.org/x/sys/unix"
 +)
++
++func dupStderr() *os.File {
++	fd, err := unix.Dup(2)
++	if err != nil {
++		return nil
++	}
++	return os.NewFile(uintptr(fd), "progress")
++}
 +
 +// Keep a private result descriptor and silence both inherited descriptors
 +// before any input is read. Restore both even if only one redirection succeeds.
@@ -590,7 +776,7 @@
 +}
 --- /dev/null
 +++ b/cmd/verified-worker/output_windows.go
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,81 @@
 +package main
 +
 +import (
@@ -598,6 +784,15 @@
 +
 +	"golang.org/x/sys/windows"
 +)
++
++func dupStderr() *os.File {
++	process := windows.CurrentProcess()
++	var dst windows.Handle
++	if windows.DuplicateHandle(process, windows.Handle(os.Stderr.Fd()), process, &dst, 0, false, windows.DUPLICATE_SAME_ACCESS) != nil {
++		return nil
++	}
++	return os.NewFile(uintptr(dst), "progress")
++}
 +
 +// Windows has process standard handles, not Unix descriptors. A duplicated
 +// stdout is the only result channel; Go's os.Stdout/os.Stderr and native

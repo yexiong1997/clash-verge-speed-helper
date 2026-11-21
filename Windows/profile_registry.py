@@ -233,7 +233,7 @@ def inspect_nodes(raw):
     if not raw or len(raw) > MAX_PROFILE:
         raise ProfileError("invalid profile")
     document = parse_yaml(raw)
-    if not isinstance(document, dict) or "proxy-providers" in document or "rule-providers" in document:
+    if not isinstance(document, dict) or "proxy-providers" in document:
         raise ProfileError("invalid profile")
     proxies = document.get("proxies")
     if not isinstance(proxies, list) or not 1 <= len(proxies) <= 2000:

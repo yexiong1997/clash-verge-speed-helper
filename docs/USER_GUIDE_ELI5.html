@@ -405,8 +405,9 @@
         <div class="inner">
           <p><strong>Windows x64 多订阅版构建与验证：</strong></p>
           <pre>powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Scripts\build-verified-worker.ps1
-python -B .\Worker\self-test.py "$env:LOCALAPPDATA\ClashSpeedHelper\verified-worker\clash-speedtest.exe"
+python -B .\Worker\self-test.py ".\build\verified-worker\clash-speedtest.exe"
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Scripts\build-multi.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Scripts\install-multi.ps1
 .\build\windows-env\Scripts\python.exe -B -m unittest discover -s Tests -p 'test_*.py' -v</pre>
           <p style="margin-top:10px"><strong>macOS 多订阅版安装：</strong></p>
           <pre>/bin/bash Scripts/install-multi.sh</pre>

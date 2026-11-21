@@ -44,6 +44,10 @@ class ControllerError(Exception):
     """Never contains raw responses, pipe names, secrets, or OS diagnostics."""
 
 
+class ProbeError(ControllerError):
+    """Read-only proxy delay probe returned an unexpected HTTP status or payload."""
+
+
 def _valid_text(value, allow_empty=False):
     if not isinstance(value, str) or (not value and not allow_empty):
         return False
@@ -52,6 +56,11 @@ def _valid_text(value, allow_empty=False):
                 not any(unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp") for ch in value))
     except UnicodeError:
         return False
+
+
+def _valid_test_url(url):
+    return (_valid_text(url) and len(url.encode("utf-8")) <= 1024 and
+            (url.startswith("http://") or url.startswith("https://")))
 
 
 def _valid_group(name):
@@ -417,9 +426,10 @@ class PipeController:
         self.timeout = max(.05, min(5, float(timeout)))
         self.identity = None
 
-    def _request(self, method, path, body=None):
+    def _request(self, method, path, body=None, timeout=None):
         try:
-            deadline = time.monotonic() + self.timeout
+            effective_timeout = self.timeout if timeout is None else max(.05, min(35, float(timeout)))
+            deadline = time.monotonic() + effective_timeout
             data = _request_bytes(self.settings, method, path, body)
             if self.settings.unix:
                 with _pin_unix_socket(self.settings.unix) as (socket_path, identity):
@@ -443,7 +453,7 @@ class PipeController:
                             if current != identity:
                                 raise ControllerError("controller changed")
                         return response
-            win32pipe.WaitNamedPipe(self.settings.pipe, max(1, min(2000, int(self.timeout * 1000))))
+            win32pipe.WaitNamedPipe(self.settings.pipe, max(1, min(2000, int(effective_timeout * 1000))))
             handle = win32file.CreateFile(self.settings.pipe, win32con.GENERIC_READ | win32con.GENERIC_WRITE,
                                          0, None, win32con.OPEN_EXISTING, _OVERLAPPED, None)
             try:
@@ -497,6 +507,28 @@ class PipeController:
         if not isinstance(now, str) or not isinstance(members, list) or not all(isinstance(x, str) for x in members):
             raise ControllerError("invalid selector")
         return ProxyGroup(name, now, tuple(members))
+
+    def probe_node_delay(self, node, timeout_ms=3500, test_url="http://www.gstatic.com/generate_204"):
+        if (not _valid_text(node) or node in (".", "..") or
+                type(timeout_ms) is not int or not 100 <= timeout_ms <= 30_000 or
+                not _valid_test_url(test_url)):
+            raise ControllerError("invalid probe request")
+        path = f"/proxies/{quote(node, safe='-._~')}/delay?timeout={timeout_ms}&url={quote(test_url, safe='-._~')}"
+        max_time = max(5.0, math.ceil(timeout_ms / 1000.0) + 2.0)
+        status, raw = self._request("GET", path, timeout=max_time)
+        if status != 200:
+            raise ProbeError("probe failed")
+        if len(raw) > 4096:
+            raise ProbeError("invalid probe response")
+        try:
+            value = _strict_json(raw)
+        except ControllerError:
+            raise ProbeError("invalid probe response") from None
+        delay = value.get("delay") if isinstance(value, dict) else None
+        if (type(delay) not in (int, float) or isinstance(delay, bool) or
+                not math.isfinite(delay) or delay <= 0 or delay > 60_000):
+            raise ProbeError("invalid probe response")
+        return float(delay)
 
 
 class SwitchLatch:

@@ -43,6 +43,12 @@ class Fixture {
       return 0;
     }
     if (input == "wait") { Thread.Sleep(30000); return 0; }
+    if (input == "progress") {
+      Console.Error.WriteLine("{\"progress\":1,\"phase\":\"head\",\"received_bytes\":0,\"expected_bytes\":100,\"bps\":0}");
+      Console.Error.WriteLine("not-json-ignored");
+      Console.Error.WriteLine("{\"progress\":1,\"phase\":\"download\",\"received_bytes\":50,\"expected_bytes\":100,\"bps\":12345.5}");
+      Console.Error.Flush();
+    }
     if (input.StartsWith("slow:")) {
       File.WriteAllText(input.Substring(5), "started");
       Thread.Sleep(6500);
@@ -231,6 +237,20 @@ class BatchTests(unittest.TestCase):
             self.assertEqual(results, ["cancelled"])
         finally:
             handle.Close()
+
+    def test_live_progress_streaming_on_stderr(self):
+        results = []
+        progress = []
+        runner = MultiBatchRunner(self.exe, [self.job(b"progress")], 1, watchdog=5)
+        runner.run(
+            lambda job, status, value: results.append((status, value)),
+            on_progress=lambda job, upd: progress.append((job.name, upd.phase, upd.received_bytes, upd.expected_bytes, upd.bps)),
+        )
+        self.assertEqual([s for s, _ in results], ["ok"])
+        self.assertEqual(progress, [
+            ("A", "head", 0, 100, 0.0),
+            ("A", "download", 50, 100, 12345.5),
+        ])
 
 
 if __name__ == "__main__":

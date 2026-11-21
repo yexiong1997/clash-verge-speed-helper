@@ -1,6 +1,6 @@
 [CmdletBinding(PositionalBinding = $false)]
 param(
-    [string]$WorkerPath = (Join-Path $env:LOCALAPPDATA 'ClashSpeedHelper\verified-worker\clash-speedtest.exe'),
+    [string]$WorkerPath = '',
     [string]$DistRoot = ''
 )
 $ErrorActionPreference = 'Stop'
@@ -32,7 +32,9 @@ function Assert-FixedDisk([string]$Path) {
 
 $root = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 Assert-NoReparse $root
-if ([string]::IsNullOrWhiteSpace($WorkerPath)) {
+if (-not $PSBoundParameters.ContainsKey('WorkerPath')) {
+    $WorkerPath = Join-Path $root 'build\verified-worker\clash-speedtest.exe'
+} elseif ([string]::IsNullOrWhiteSpace($WorkerPath)) {
     throw 'A verified Windows worker is required; supply -WorkerPath.'
 }
 $worker = [System.IO.Path]::GetFullPath($WorkerPath)
@@ -94,6 +96,7 @@ Push-Location $root
 try {
     & $python -m PyInstaller --noconfirm --windowed --onedir --name ClashSpeedHelper `
         --distpath $dist --workpath (Join-Path $work 'work') --specpath $work `
+        --icon (Join-Path $root 'Windows\ui\app.ico') `
         --paths $root --collect-all webview --collect-all clr_loader `
         --hidden-import win32timezone --add-data "$(Join-Path $root 'Windows\ui');Windows\ui" `
         (Join-Path $root 'Windows\run.py')

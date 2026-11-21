@@ -26,7 +26,7 @@ class Element {
     this.disabled = false; this.textContent = ''; this.isConnected = true;
     this.hidden = ['confirm-dialog', 'tun-notice', 'row-menu'].includes(id);
     this.classList = { set: new Set(), toggle(c, f) { f === undefined ? (this.set.has(c) ? this.set.delete(c) : this.set.add(c)) : (f ? this.set.add(c) : this.set.delete(c)); }, add(c) { this.set.add(c); } };
-    this.dataset = {}; this.parentElement = null; this.style = {}; this.children = []; this.listeners = {};
+    this.dataset = {}; this.attributes = {}; this.parentElement = null; this.style = {}; this.children = []; this.listeners = {};
   }
   replaceChildren(...nodes) {
     for (const c of this.children) c.parentElement = null;
@@ -65,8 +65,8 @@ class Element {
     this.parentElement = null;
   }
   add(opt) { this.children.push(opt); }
-  setAttribute() {}
-  removeAttribute() {}
+  setAttribute(k, v) { this.attributes[k] = String(v); if (k === 'hidden') this.hidden = true; }
+  removeAttribute(k) { delete this.attributes[k]; if (k === 'hidden') this.hidden = false; }
   focus() { if (!this.disabled && this.isConnected !== false) activeElement = this; }
   click() { if (!this.disabled && typeof this.onclick === 'function') return this.onclick(); }
   contains(target) {
@@ -92,11 +92,18 @@ class Element {
 const elements = new Map();
 const get = id => {if (!elements.has(id)) elements.set(id, new Element(id)); return elements.get(id);};
 get('row-menu').append(get('menu-switch'), get('menu-retest'), get('menu-copy'));
+const hwinBtns = ['24h', '7d', '30d', 'peak'].map(w => {
+  const b = new Element('hwin-' + w, 'button');
+  b.dataset.hwin = w;
+  if (w === '7d') b.classList.add('active');
+  return b;
+});
 const docListeners = {};
 const doc = {
   getElementById: get,
   createElement: tag => new Element('', tag),
-  querySelectorAll: () => [],
+  querySelectorAll: sel => sel === 'button[data-hwin]' ? hwinBtns : [],
+  querySelector: () => null,
   addEventListener(type, handler) { (docListeners[type] ||= []).push(handler); },
   dispatch(type, event) { for (const h of (docListeners[type] || [])) h(event); },
   get activeElement() { return activeElement; }
@@ -129,20 +136,47 @@ const api = {
   continue_pending: async value => { calls.push({fn:'continue_pending', value}); return {ok:true}; },
   set_schedule: async value => { calls.push({fn:'set_schedule', value}); return {ok:true}; },
   set_selection: async value => { calls.push({fn:'set_selection', value}); return {ok:true}; },
-  copy_node_name: async value => { calls.push({fn:'copy_node_name', value}); return {ok:true}; }
+  copy_node_name: async value => { calls.push({fn:'copy_node_name', value}); return {ok:true}; },
+  set_patrol: async value => {
+    calls.push({fn:'set_patrol', value});
+    initial.patrol = {armed: Boolean(value.enabled), quota_bytes: value.quota_bytes, remaining: value.enabled ? 1800 : null, used_bytes_today: 0};
+    return {ok:true};
+  },
+  get_history: async value => {
+    calls.push({fn:'get_history', value});
+    return {
+      ok: true,
+      summaries: [
+        {uid:'p', profile:'Fixture', name:'node', node_type:'vless', long_term_score:88.5, base_score:90.0,
+         health_penalty:1.5, active_failure_streak:0, weighted_median_score:89.0, weighted_p20_score:84.0,
+         weighted_median_speed_bps:12582912, weighted_median_latency_ms:42, weighted_median_jitter_ms:3,
+         availability_rate:0.95, total_count:10, success_count:9, failure_count:1, is_qualified:true,
+         last_tested_at:1700000000, available:true}
+      ]
+    };
+  },
+  clear_history: async () => { calls.push({fn:'clear_history'}); return {ok:true}; },
+  hide_to_tray: async () => { calls.push({fn:'hide_to_tray'}); return {ok:true}; },
+  set_minimize_to_tray: async value => {
+    calls.push({fn:'set_minimize_to_tray', value});
+    initial.minimize_to_tray = Boolean(value.enabled);
+    return {ok:true, minimize_to_tray: initial.minimize_to_tray};
+  }
 };
 const context = vm.createContext({
   document: doc,
   window: {
     pywebview: {api},
     confirm: () => { throw new Error('window.confirm must not be used'); },
-    addEventListener() {},
+    listeners: {},
+    addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); },
     innerWidth: 1200,
     innerHeight: 800
   },
-  Option:class {constructor(text,value){this.text=text;this.value=value;}},setInterval(){},initial,console});
+  Option:class {constructor(text,value){this.text=text;this.value=value;}},setInterval(){},setTimeout(){return 1;},clearTimeout(){},initial,console});
 get('parallel').value='4'; get('size').value='3145728'; get('mode').value='fast';
 get('topn').value='2'; get('status-filter').value='all'; get('interval').value='0';
+get('patrol-quota').value='83886080';
 if (['retest', 'cancel-retest', 'escape-retest'].includes(scenario)) {get('group').value='Test'; get('auto').checked=true;}
 if (scenario === 'countdown') {initial.schedule_minutes=15; initial.schedule_remaining=125; initial.schedule_active=false;}
 const root=process.argv[1];
@@ -251,6 +285,9 @@ function cancelDialog() { snapDialog(); get('confirm-cancel').onclick(); }
     get('funnel').onclick();
     get('topn').value = '5';
     get('topn').oninput();
+    const funnelStayedOpenOnTopn = get('confirm-dialog').hidden === false;
+    get('parallel').value = '3';
+    await get('parallel').onchange();
     results.push(get('confirm-dialog').hidden);
     await get('confirm-accept').onclick();
 
@@ -274,7 +311,60 @@ function cancelDialog() { snapDialog(); get('confirm-cancel').onclick(); }
     await vm.runInContext('refreshState()', context);
     results.push(get('confirm-dialog').hidden);
     await get('confirm-accept').onclick();
-    process.stdout.write(JSON.stringify({results, calls}));
+    process.stdout.write(JSON.stringify({results, calls, funnelStayedOpenOnTopn}));
+    return;
+  } else if (scenario === 'live-progress') {
+    initial.running = true;
+    initial.rows = [
+      {uid:'p', profile:'Fixture', name:'head-node', selected:true, state:'测速中', eligible:true,
+       score:null, speed:null, latency:null, jitter:null, successes:null,
+       live:{phase:'head', received_bytes:0, expected_bytes:1048576, bps:0, samples:[]}},
+      {uid:'p', profile:'Fixture', name:'dl-node', selected:true, state:'测速中', eligible:true,
+       score:null, speed:null, latency:null, jitter:null, successes:null,
+       live:{phase:'download', received_bytes:524288, expected_bytes:1048576, bps:10485760, samples:[1000000, 4000000, 10485760]}}
+    ];
+    await vm.runInContext('refreshState()', context);
+    const rowsDom = get('rows').children.map(tr => tr.children.map(td => td.textContent || td.children?.[0]?.children?.[0]?.textContent || ''));
+    process.stdout.write(JSON.stringify({
+      rowsDom,
+      progressActive: get('overall-progress').classList.set.has('active'),
+      progressTransform: get('overall-progress-fill').style.transform,
+      sparklineHidden: get('best-sparkline').hidden,
+      sparklineHasHiddenAttr: 'hidden' in get('best-sparkline').attributes,
+      sparklinePath: get('best-sparkline-path').attributes.d || '',
+      bestScore: get('best-score').textContent,
+      bestSpeed: get('best-speed').textContent
+    }));
+    return;
+  } else if (scenario === 'history-and-patrol') {
+    get('view-history').onclick();
+    await new Promise(r => setImmediate(r));
+    const histToolsHidden = get('history-tools').hidden;
+    const liveToolsHidden = get('live-tools').hidden;
+    const firstRowTexts = get('rows').children[0]?.children.map(td => td.textContent || td.children?.[0]?.textContent || td.children?.[0]?.children?.[0]?.textContent || '') || [];
+    await hwinBtns[3].onclick();
+    await new Promise(r => setImmediate(r));
+    await get('clear-history').onclick();
+    const armedLabel = get('clear-history').textContent;
+    await get('clear-history').onclick();
+    const resetLabel = get('clear-history').textContent;
+    get('patrol-quota').value = '157286400';
+    await get('patrol-toggle').onclick();
+    process.stdout.write(JSON.stringify({
+      calls, histToolsHidden, liveToolsHidden, firstRowTexts, armedLabel, resetLabel,
+      patrolNote: get('patrol-note').textContent,
+      patrolToggle: get('patrol-toggle').textContent
+    }));
+    return;
+  } else if (scenario === 'tray-controls') {
+    initial.minimize_to_tray = false;
+    await vm.runInContext('refreshState()', context);
+    const syncedFalse = get('minimize-to-tray').checked;
+    const idleNote = get('schedule-note').textContent;
+    get('minimize-to-tray').checked = true;
+    await get('minimize-to-tray').onchange();
+    get('hide-tray').onclick();
+    process.stdout.write(JSON.stringify({syncedFalse, idleNote, calls, checkedAfter: get('minimize-to-tray').checked}));
     return;
   } else if (scenario === 'tun-notice') {
     const states = [];
@@ -323,6 +413,28 @@ function cancelDialog() { snapDialog(); get('confirm-cancel').onclick(); }
     resolveSlow();
     await bg;
     process.stdout.write(JSON.stringify({status: get('status').textContent, calls}));
+    return;
+  } else if (scenario === 'incompatible-profile') {
+    initial.profiles = [
+      {uid:'p', name:'Fixture', selected:true, current:true, compatible:true},
+      {uid:'p2', name:'Provider', selected:false, current:false, compatible:false}
+    ];
+    vm.runInContext('state = JSON.parse(JSON.stringify(initial)); render();', context);
+    const chips = get('profiles').children.map(c => ({text: c.textContent, disabled: c.disabled}));
+    process.stdout.write(JSON.stringify({chips}));
+    return;
+  } else if (scenario === 'startup-auto-sync') {
+    const emptyInitial = {profiles:[], rows:[], groups:[], suggested_group:null, running:false, status:'ready', tun_enabled:null, outcome_unknown:false};
+    let step = 0;
+    api.get_state = async () => {
+      if (step === 0) return JSON.parse(JSON.stringify(emptyInitial));
+      if (step === 1) return {...JSON.parse(JSON.stringify(initial)), groups:[], suggested_group:null};
+      return {...JSON.parse(JSON.stringify(initial)), groups:[{name:'GLOBAL',now:'node'},{name:'Main',now:'node'}], suggested_group:'Main'};
+    };
+    api.refresh = async () => { calls.push({fn:'refresh'}); step = 1; return {ok:true}; };
+    api.refresh_groups = async () => { calls.push({fn:'refresh_groups'}); step = 2; return {ok:true}; };
+    for (const fn of (context.window.listeners['pywebviewready'] || [])) await fn();
+    process.stdout.write(JSON.stringify({calls, group: get('group').value}));
     return;
   }
   process.stdout.write(JSON.stringify({
@@ -391,7 +503,7 @@ class WindowsRowModelTests(unittest.TestCase):
         self.assertTrue(value["dialogHidden"])
         self.assertEqual(len(value["calls"]), 1)
         self.assertEqual(value["calls"][0]["fn"], "start_funnel")
-        self.assertEqual(value["calls"][0]["value"]["top_count"], 2)
+        self.assertEqual(value["calls"][0]["value"]["top_count"], 10)
         self.assertFalse(value["calls"][0]["value"]["auto_switch"])
 
     def test_retest_best_preserves_original_group_and_auto_switch(self):
@@ -488,6 +600,7 @@ class WindowsRowModelTests(unittest.TestCase):
         result = subprocess.run([NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "invalidate-matrix"],
                                 capture_output=True, timeout=5, check=True)
         value = json.loads(result.stdout)
+        self.assertTrue(value["funnelStayedOpenOnTopn"])
         self.assertEqual(value["results"], [True, True, True, True])
         self.assertEqual(value["calls"], [])
 
@@ -519,6 +632,133 @@ class WindowsRowModelTests(unittest.TestCase):
         value = json.loads(result.stdout)
         self.assertEqual(value["status"], "FRESH_AFTER_ACTION")
         self.assertEqual(len(value["calls"]), 1)
+
+    def test_incompatible_profile_chip_is_disabled_with_label(self):
+        result = subprocess.run([NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "incompatible-profile"],
+                                capture_output=True, timeout=5, check=True)
+        value = json.loads(result.stdout)
+        self.assertEqual(value["chips"], [
+            {"text": "Fixture", "disabled": False},
+            {"text": "Provider（不支持）", "disabled": True},
+        ])
+
+    def test_startup_auto_loads_subscriptions_and_suggests_group_and_defaults_auto_checked(self):
+        html = (ROOT / "Windows/ui/index.html").read_text(encoding="utf-8")
+        self.assertIn('id="auto" checked', html)
+        result = subprocess.run([NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "startup-auto-sync"],
+                                capture_output=True, timeout=5, check=True)
+        value = json.loads(result.stdout)
+        self.assertEqual([c["fn"] for c in value["calls"]], ["refresh", "refresh_groups"])
+        self.assertEqual(value["group"], "Main")
+
+    def test_freeze_order_and_stage1_score_fallback_ranking(self):
+        rows = [
+            {"uid": "p1", "profile": "One", "name": "first", "state": "测速中", "eligible": True,
+             "score": None, "stage1_score": 60.0, "speed": None, "latency": None, "jitter": None, "successes": None},
+            {"uid": "p1", "profile": "One", "name": "second", "state": "完成", "eligible": True,
+             "score": 95.0, "stage1_score": None, "speed": 100, "latency": 20, "jitter": 1, "successes": 6},
+            {"uid": "p1", "profile": "One", "name": "s1_high", "state": "初筛 88.2", "eligible": True,
+             "score": None, "stage1_score": 88.2, "speed": None, "latency": None, "jitter": None, "successes": None},
+        ]
+        profiles = [{"uid": "p1", "selected": True}]
+        frozen_data = {"rows": rows, "profiles": profiles, "options": {"freezeOrder": True}}
+        frozen = json.loads(subprocess.run(
+            [NODE, "-e", DRIVER, str(ROOT / "Windows/ui/row_model.js")],
+            input=json.dumps(frozen_data).encode(), capture_output=True, timeout=5, check=True,
+        ).stdout)
+        self.assertEqual(frozen, ["first", "second", "s1_high"])
+
+        ranked_data = {"rows": rows, "profiles": profiles, "options": {"freezeOrder": False}}
+        ranked = json.loads(subprocess.run(
+            [NODE, "-e", DRIVER, str(ROOT / "Windows/ui/row_model.js")],
+            input=json.dumps(ranked_data).encode(), capture_output=True, timeout=5, check=True,
+        ).stdout)
+        self.assertEqual(ranked, ["second", "s1_high", "first"])
+
+    def test_history_row_model_filtering_and_sorting(self):
+        script = """
+const model = require(process.argv[1]);
+let input = '';
+process.stdin.on('data', chunk => input += chunk);
+process.stdin.on('end', () => {
+  const x = JSON.parse(input);
+  process.stdout.write(JSON.stringify(model.historyRows(x.summaries, x.profiles, x.options).map(r => r.name)));
+});
+"""
+        summaries = [
+            {"uid": "p1", "profile": "SubA", "name": "alpha", "node_type": "vless", "long_term_score": 82.0,
+             "weighted_median_speed_bps": 900, "weighted_median_latency_ms": 55, "availability_rate": 0.9,
+             "total_count": 5, "success_count": 5},
+            {"uid": "p2", "profile": "SubB", "name": "beta", "node_type": "ss", "long_term_score": 91.0,
+             "weighted_median_speed_bps": 1500, "weighted_median_latency_ms": 20, "availability_rate": 1.0,
+             "total_count": 4, "success_count": 4},
+            {"uid": "p1", "profile": "SubA", "name": "dead", "node_type": "trojan", "long_term_score": 0.0,
+             "weighted_median_speed_bps": 0, "weighted_median_latency_ms": 0, "availability_rate": 0.0,
+             "total_count": 3, "success_count": 0},
+        ]
+        profiles = [{"uid": "p1", "selected": True}, {"uid": "p2", "selected": False}]
+        sel_only = json.loads(subprocess.run(
+            [NODE, "-e", script, str(ROOT / "Windows/ui/row_model.js")],
+            input=json.dumps({"summaries": summaries, "profiles": profiles, "options": {"selectedOnly": True}}).encode(),
+            capture_output=True, timeout=5, check=True,
+        ).stdout)
+        self.assertEqual(sel_only, ["alpha", "dead"])
+
+        all_by_lat = json.loads(subprocess.run(
+            [NODE, "-e", script, str(ROOT / "Windows/ui/row_model.js")],
+            input=json.dumps({"summaries": summaries, "profiles": profiles,
+                              "options": {"selectedOnly": False, "sort": "weighted_median_latency_ms", "ascending": True}}).encode(),
+            capture_output=True, timeout=5, check=True,
+        ).stdout)
+        self.assertEqual(all_by_lat, ["beta", "alpha", "dead"])
+
+    def test_live_progress_and_sparkline_rendering(self):
+        result = subprocess.run([NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "live-progress"],
+                                capture_output=True, timeout=5, check=True)
+        value = json.loads(result.stdout)
+        self.assertEqual(value["rowsDom"][0][3:6], ["探测延迟", "探测中", "探测延迟…"])
+        self.assertEqual(value["rowsDom"][1][3:6], ["下载中", "下载 50%", "10.00 MiB/s"])
+        self.assertTrue(value["progressActive"])
+        self.assertIn("scaleX(", value["progressTransform"])
+        self.assertFalse(value["sparklineHidden"])
+        self.assertFalse(value["sparklineHasHiddenAttr"])
+        self.assertTrue(value["sparklinePath"].startswith("M0.0 "))
+        self.assertEqual(value["bestScore"], "50%")
+        self.assertEqual(value["bestSpeed"], "10.00 MiB/s")
+
+    def test_history_view_clear_confirm_and_patrol_toggle(self):
+        result = subprocess.run([NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "history-and-patrol"],
+                                capture_output=True, timeout=5, check=True)
+        value = json.loads(result.stdout)
+        self.assertFalse(value["histToolsHidden"])
+        self.assertTrue(value["liveToolsHidden"])
+        self.assertEqual(value["firstRowTexts"][0:3], ["1", "扣分", "node"])
+        self.assertEqual(value["armedLabel"], "确认清空?")
+        self.assertEqual(value["resetLabel"], "清空记录")
+        self.assertEqual(value["patrolToggle"], "停止巡检")
+        self.assertIn("150 MiB", value["patrolNote"])
+        self.assertEqual(value["calls"], [
+            {"fn": "get_history", "value": {"window": "7d"}},
+            {"fn": "get_history", "value": {"window": "peak"}},
+            {"fn": "clear_history"},
+            {"fn": "set_patrol", "value": {"enabled": True, "quota_bytes": 157286400}},
+        ])
+
+    def test_tray_controls_sync_and_schedule_copy(self):
+        html = (ROOT / "Windows/ui/index.html").read_text(encoding="utf-8")
+        self.assertIn('id="minimize-to-tray" checked', html)
+        self.assertIn('id="hide-tray"', html)
+        self.assertIn("支持托盘后台运行，退出应用后停止", html)
+        result = subprocess.run([NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "tray-controls"],
+                                capture_output=True, timeout=5, check=True)
+        value = json.loads(result.stdout)
+        self.assertFalse(value["syncedFalse"])
+        self.assertEqual(value["idleNote"], "支持托盘后台运行，退出应用后停止")
+        self.assertTrue(value["checkedAfter"])
+        self.assertEqual(value["calls"], [
+            {"fn": "set_minimize_to_tray", "value": {"enabled": True}},
+            {"fn": "hide_to_tray"},
+        ])
 
 
 if __name__ == "__main__":

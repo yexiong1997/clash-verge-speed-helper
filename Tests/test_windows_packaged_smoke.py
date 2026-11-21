@@ -82,7 +82,36 @@ class InstallScriptGuardTests(unittest.TestCase):
         res = self._invoke("-Help")
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn("install-multi.ps1", res.stdout)
+        self.assertIn(r"D:\Program Files\ClashSpeedHelper", res.stdout)
+        self.assertIn(r"build\verified-worker\clash-speedtest.exe", res.stdout)
         self.assertFalse((self.sandbox / "Roaming" / "io.github.clash-verge-rev.clash-verge-rev").exists())
+
+    def test_defaults_target_d_drive_and_reject_explicit_empty_paths(self):
+        install_text = (ROOT / "Scripts" / "install-multi.ps1").read_text(encoding="utf-8")
+        build_text = (ROOT / "Scripts" / "build-multi.ps1").read_text(encoding="utf-8")
+        worker_text = (ROOT / "Scripts" / "build-verified-worker.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("[string]$InstallRoot = 'D:\\Program Files'", install_text)
+        self.assertIn(r"build\verified-worker\clash-speedtest.exe", install_text)
+        self.assertIn(r"build\verified-worker\clash-speedtest.exe", build_text)
+        self.assertIn(r"build\verified-worker", worker_text)
+
+        env = _isolated_env(self.sandbox)
+        for script_name, flag in (
+            ("install-multi.ps1", "-WorkerPath"),
+            ("build-multi.ps1", "-WorkerPath"),
+            ("build-verified-worker.ps1", "-OutputDirectory"),
+        ):
+            res = subprocess.run(
+                [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                 "-File", str(ROOT / "Scripts" / script_name), flag, ""],
+                cwd=self.sandbox,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            self.assertNotEqual(res.returncode, 0, f"{script_name} accepted empty {flag}")
 
     def test_refuses_clash_verge_config_root_drive_root_and_conflicting_flags(self):
         verge_dir = self.sandbox / "Roaming" / "io.github.clash-verge-rev.clash-verge-rev"

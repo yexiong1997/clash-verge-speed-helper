@@ -19,8 +19,8 @@ if os.name == "nt":
     import win32con
     import win32file
     import win32pipe
-    from Windows.controller import (AssistedSwitch, ControllerError, PipeController, Settings,
-                                    SwitchLatch, _IO_UNRESOLVED, read_settings)
+    from Windows.controller import (AssistedSwitch, ControllerError, PipeController, ProbeError,
+                                    Settings, SwitchLatch, _IO_UNRESOLVED, read_settings)
     from Windows.desktop import Desktop
     from Windows.measurement import VerifiedMeasurement
     from Windows.profile_registry import load_registry, snapshot_profile
@@ -42,6 +42,8 @@ class ControllerTests(unittest.TestCase):
         self.now = "A"
         self.puts = 0
         self.bad_put_status = False
+        self.custom_proxies = None
+        self.delay_handler = None
         self.stall = False
         self.release_stall = threading.Event()
         self.stop = threading.Event()
@@ -100,8 +102,14 @@ class ControllerTests(unittest.TestCase):
                     status, response = (500 if self.bad_put_status else 204), b""
                 else:
                     group = {"name": "Test", "type": "Selector", "now": self.now, "all": ["A", "B"]}
-                    obj = {"proxies": {"Test": group}} if target == b"/proxies" else group
-                    status, response = 200, json.dumps(obj).encode()
+                    if b"/delay?" in target and self.delay_handler is not None:
+                        status, response = self.delay_handler(target)
+                    elif target == b"/proxies":
+                        obj = {"proxies": self.custom_proxies if self.custom_proxies is not None else {"Test": group}}
+                        status, response = 200, json.dumps(obj).encode()
+                    else:
+                        obj = group
+                        status, response = 200, json.dumps(obj).encode()
                 win32file.WriteFile(pipe, f"HTTP/1.1 {status} OK\r\nContent-Length: {len(response)}\r\nConnection: close\r\n\r\n".encode() + response)
                 win32file.FlushFileBuffers(pipe)
             except pywintypes.error:
@@ -463,6 +471,24 @@ class ControllerTests(unittest.TestCase):
         finally:
             app.close()
 
+    def test_refresh_groups_suggests_unique_non_global_full_group(self):
+        app = Desktop(self.root / "not-used.exe", root=self.root)
+        try:
+            self.custom_proxies = {
+                "GLOBAL": {"name": "GLOBAL", "type": "Selector", "now": "A", "all": ["A", "B"]},
+                "Partial": {"name": "Partial", "type": "Selector", "now": "A", "all": ["A"]},
+                "Main": {"name": "Main", "type": "Selector", "now": "A", "all": ["A", "B"]},
+            }
+            self.assertTrue(app.refresh()["ok"])
+            self.assertTrue(app.refresh_groups()["ok"])
+            self.assertEqual(app.get_state()["suggested_group"], "Main")
+
+            self.custom_proxies["Main2"] = {"name": "Main2", "type": "Selector", "now": "A", "all": ["A", "B"]}
+            self.assertTrue(app.refresh_groups()["ok"])
+            self.assertIsNone(app.get_state()["suggested_group"])
+        finally:
+            app.close()
+
     def test_refresh_groups_preserves_tun_enabled_on_offline_pipe_and_resets_on_profile_error(self):
         verge_cfg = self.root / "clash-verge.yaml"
         offline_pipe = r"\\.\pipe\clash-helper-offline-" + uuid.uuid4().hex
@@ -481,6 +507,47 @@ class ControllerTests(unittest.TestCase):
             verge_cfg.mkdir()
             self.assertFalse(app.refresh_groups()["ok"])
             self.assertIsNone(app.get_state()["tun_enabled"])
+        finally:
+            app.close()
+
+    def test_probe_node_delay_and_desktop_health_probe_penalty_decay(self):
+        registry = load_registry(self.root)
+        settings = read_settings(registry)
+        ctrl = PipeController(settings)
+        self.delay_handler = lambda _target: (200, json.dumps({"delay": 142}).encode())
+        self.assertEqual(ctrl.probe_node_delay("A", timeout_ms=2500), 142.0)
+
+        self.delay_handler = lambda _target: (504, b'{"message":"timeout"}')
+        with self.assertRaises(ProbeError):
+            ctrl.probe_node_delay("A", timeout_ms=2500)
+
+        self.delay_handler = lambda _target: (200, b'{"delay": -1}')
+        with self.assertRaises(ProbeError):
+            ctrl.probe_node_delay("A", timeout_ms=2500)
+
+        with self.assertRaises(ControllerError):
+            ctrl.probe_node_delay("A", timeout_ms=2500, test_url="ftp://invalid")
+
+        app = Desktop(self.root / "not-used.exe", root=self.root)
+        try:
+            self.assertTrue(app.refresh()["ok"])
+            self.assertTrue(app.refresh_groups()["ok"])
+            if app._health_probe_thread is not None:
+                app._health_probe_thread.join(timeout=2.0)
+            app.telemetry_store.clear_all()
+            self.delay_handler = lambda _target: (504, b"")
+            app._run_health_probe()
+            st1 = app.get_state()
+            self.assertEqual(st1["health_probe"]["level"], "warn")
+            app._run_health_probe()
+            st2 = app.get_state()
+            self.assertEqual(st2["health_probe"]["level"], "danger")
+            self.assertIn("活跃异常", st2["health_probe"]["text"])
+            self.delay_handler = lambda _target: (200, json.dumps({"delay": 88}).encode())
+            app._run_health_probe()
+            st3 = app.get_state()
+            self.assertEqual(st3["health_probe"]["level"], "ok")
+            self.assertIn("88ms", st3["health_probe"]["text"])
         finally:
             app.close()
 

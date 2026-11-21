@@ -3,6 +3,8 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import _winapi
+import json
+import math
 import msvcrt
 import os
 import subprocess
@@ -37,6 +39,38 @@ class Job:
     latency_timeout: str
     download_timeout: str
     server_url: str = "https://speed.cloudflare.com"
+
+
+@dataclass(frozen=True)
+class ProgressUpdate:
+    phase: str
+    received_bytes: int
+    expected_bytes: int
+    bps: float
+
+
+def _parse_progress_line(raw_line):
+    if not raw_line or len(raw_line) > 4096:
+        return None
+    try:
+        data = json.loads(raw_line.decode("utf-8", "strict"))
+    except Exception:
+        return None
+    if type(data) is not dict or data.get("progress") != 1:
+        return None
+    phase = data.get("phase")
+    received = data.get("received_bytes")
+    expected = data.get("expected_bytes")
+    bps = data.get("bps")
+    if phase not in ("head", "download"):
+        return None
+    if type(received) is not int or type(expected) is not int:
+        return None
+    if received < 0 or expected < 0:
+        return None
+    if type(bps) not in (int, float) or isinstance(bps, bool) or not math.isfinite(bps) or bps < 0:
+        return None
+    return ProgressUpdate(phase, min(received, expected) if expected > 0 else received, expected, float(bps))
 
 
 def _literal_regex(name):
@@ -84,9 +118,9 @@ class MultiBatchRunner:
                 except Exception:
                     pass
 
-    def run(self, on_result):
+    def run(self, on_result, on_progress=None):
         with ThreadPoolExecutor(max_workers=self.parallel, thread_name_prefix="speed-worker") as pool:
-            futures = {pool.submit(self._one, job): job for job in self.jobs}
+            futures = {pool.submit(self._one, job, on_progress): job for job in self.jobs}
             for future in as_completed(futures):
                 job = futures[future]
                 try:
@@ -95,7 +129,7 @@ class MultiBatchRunner:
                     status, measurement = "worker_failed", None
                 on_result(job, status, measurement)
 
-    def _one(self, job):
+    def _one(self, job, on_progress=None):
         if self.cancelled.is_set():
             return "cancelled", None
         if not job.name or not job.yaml or not (1 <= job.streams <= 128) or job.download_bytes < job.streams:
@@ -145,10 +179,14 @@ class MultiBatchRunner:
                     startup.dwFlags |= win32con.STARTF_USESTDHANDLES
                     startup.hStdInput, startup.hStdOutput, startup.hStdError = map(int, child_handles)
                     startup.lpAttributeList = {"handle_list": list(map(int, child_handles))}
+                    child_env = None
+                    if on_progress is not None:
+                        child_env = dict(os.environ)
+                        child_env["CLASH_VERIFIED_PROGRESS"] = "1"
                     process, main_thread, _pid, _tid = _winapi.CreateProcess(
                         self.executable, subprocess.list2cmdline(args), None, None, True,
                         win32con.CREATE_NO_WINDOW | win32con.CREATE_SUSPENDED | _EXTENDED_STARTUPINFO_PRESENT,
-                        None, None, startup)
+                        child_env, None, startup)
                 finally:
                     close_failed = False
                     for handle in child_handles:
@@ -202,9 +240,45 @@ class MultiBatchRunner:
                     if keep:
                         overflow[0] = True
 
+            def drain_stderr(stream):
+                if on_progress is None:
+                    drain(stream, False)
+                    return
+                buf = bytearray()
+                discard_line = False
+                try:
+                    with stream:
+                        while True:
+                            chunk = stream.read(4096)
+                            if not chunk:
+                                break
+                            for part in chunk.splitlines(keepends=True):
+                                ends_line = part.endswith(b"\n")
+                                if discard_line:
+                                    if ends_line:
+                                        discard_line = False
+                                    continue
+                                if len(buf) + len(part) > 4096:
+                                    buf.clear()
+                                    if not ends_line:
+                                        discard_line = True
+                                    continue
+                                buf.extend(part)
+                                if ends_line:
+                                    line = bytes(buf).rstrip(b"\r\n")
+                                    buf.clear()
+                                    update = _parse_progress_line(line)
+                                    if update is not None and not self.cancelled.is_set():
+                                        try:
+                                            on_progress(job, update)
+                                        except Exception:
+                                            pass
+                except Exception:
+                    pass
+
             threads = [threading.Thread(target=write_input, daemon=True),
                        threading.Thread(target=drain, args=(stdout_file, True), daemon=True),
-                       threading.Thread(target=drain, args=(stderr_file, False), daemon=True)]
+                       threading.Thread(target=drain_stderr, args=(stderr_file,), daemon=True)]
             for thread in threads:
                 thread.start()
             deadline = time.monotonic() + self.watchdog
