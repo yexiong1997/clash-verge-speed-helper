@@ -5,6 +5,10 @@ State-machine dates are synthetic; a clock check samples system uptime only.
 No network, controller, profile, timers, or app is used.
 Run: python3 -B Tests/test_schedule.py
 """
+import sys
+if sys.platform == "win32":
+    if __name__ == "__main__": print("SKIP: Swift schedule; see test_windows_core.py"); sys.exit(0)
+    import unittest; raise unittest.SkipTest("Swift schedule; see test_windows_core.py")
 import os
 from pathlib import Path
 import subprocess

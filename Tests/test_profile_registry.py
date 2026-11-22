@@ -5,6 +5,10 @@ Run on macOS: python3 -B Tests/test_profile_registry.py
 The only compiled program and every profile/registry it reads live in a 0700
 TemporaryDirectory; the root is always explicitly passed over stdin.
 """
+import sys
+if sys.platform == "win32":
+    if __name__ == "__main__": print("SKIP: POSIX Swift registry; see test_windows_core.py"); sys.exit(0)
+    import unittest; raise unittest.SkipTest("POSIX Swift registry; see test_windows_core.py")
 import hashlib
 import json
 import os

@@ -9,6 +9,10 @@ project on macOS, under a deny-network / deny-external-writes sandbox. It probes
 both TCP and Unix sockets and a forbidden write before invoking the builder.
 The test never executes the produced worker.
 """
+import sys
+if sys.platform == "win32":
+    if __name__ == "__main__": print("SKIP: POSIX offline builder test"); sys.exit(0)
+    import unittest; raise unittest.SkipTest("POSIX offline builder test")
 import base64
 import errno
 import hashlib

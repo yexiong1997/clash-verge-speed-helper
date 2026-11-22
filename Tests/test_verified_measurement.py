@@ -6,6 +6,7 @@ folder. No worker, profile, network service, controller, or app is accessed.
 Run: python3 -B Tests/test_verified_measurement.py -v
 """
 
+import sys
 import base64
 import json
 import math
@@ -115,6 +116,11 @@ def expected_score(speed, latency, jitter, successes):
 class VerifiedMeasurementTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        if sys.platform == "win32":
+            sys.path.insert(0, str(PROJECT))
+            from Windows.measurement import decode_measurement
+            cls.decoder = staticmethod(decode_measurement)
+            return
         compiler = shutil.which("swiftc")
         if compiler is None:
             raise RuntimeError("swiftc is required to run the decoder tests")
@@ -143,6 +149,19 @@ class VerifiedMeasurementTests(unittest.TestCase):
         cases = list(cases)
         if not cases:
             return []
+        if sys.platform == "win32":
+            output = []
+            for raw, name, requested, streams in cases:
+                value = self.decoder(raw, name, requested, streams)
+                output.append(None if value is None else {
+                    "nodeName": value.node_name, "nodeType": value.node_type,
+                    "headAttempts": value.head_attempts, "headSuccesses": value.head_successes,
+                    "latencyMilliseconds": value.latency_ms, "jitterMilliseconds": value.jitter_ms,
+                    "expectedBytes": value.expected_bytes, "receivedBytes": value.received_bytes,
+                    "downloadComplete": value.download_complete,
+                    "downloadBytesPerSecond": value.download_bytes_per_second, "score": value.score,
+                })
+            return output
         lines = []
         for raw, name, requested, streams in cases:
             lines.append("\t".join((base64.b64encode(raw).decode("ascii"),

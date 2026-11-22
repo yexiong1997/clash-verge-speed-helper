@@ -8,6 +8,10 @@ are additionally restricted by macOS sandbox-exec to this fixture's exact
 loopback ports and Unix socket, synthetic HOME, and private temp directory.
 The test fails closed if the source instrumentation anchors no longer match.
 """
+import sys
+if sys.platform == "win32":
+    if __name__ == "__main__": print("SKIP: macOS sandbox integration"); sys.exit(0)
+    import unittest; raise unittest.SkipTest("macOS sandbox integration")
 import errno
 import hashlib
 import json

@@ -2,7 +2,7 @@
 
 ## Provenance and build
 
-This worker is built from faceair/clash-speedtest v1.8.6, clean upstream commit `d3b9b151893fa7415fc4197242aadedc25e40391`, using the self-contained source patch in this directory and `Scripts/build-verified-worker.sh`. The build script downloads a pinned Go >=1.25 release only under `build/`, verifies its SHA-256 against a fixed digest obtained from official go.dev release metadata, verifies the pinned upstream source archive, and uses Go module checksums. It does not install Go or change the global PATH. The output is `build/verified-worker/clash-speedtest` (native host architecture); no prebuilt binary is committed.
+This worker is built from faceair/clash-speedtest v1.8.6, clean upstream commit `d3b9b151893fa7415fc4197242aadedc25e40391`, using the self-contained source patch in this directory and `Scripts/build-verified-worker.sh` on Unix or `Scripts/build-verified-worker.ps1` on Windows x64. The scripts use pinned Go 1.25.0, verify the Go and upstream source archive SHA-256 values, and use Go module checksums; they do not install Go or change the global PATH. The Unix output is `build/verified-worker/clash-speedtest`; the Windows script defaults to `build\verified-worker\clash-speedtest.exe`. No prebuilt binary is committed.
 
 Upstream is GPLv3 licensed; the patch is derived from that upstream source and is provided here as source, with upstream attribution. This notice does not declare that the containing project is GPL-licensed and does not assert legal compliance. Consult counsel about redistribution obligations.
 
@@ -11,10 +11,10 @@ Upstream is GPLv3 licensed; the patch is derived from that upstream source and i
 The caller supplies a Clash configuration on standard input and executes:
 
 ```
-clash-speedtest -c /dev/stdin -f '<exact-name-regex>' -server-url '<http(s)-url>' -download-size <bytes> -concurrent <streams> -timeout <duration> -max-latency <duration> -rename=false -json-v1
+clash-speedtest -c - -f '<exact-name-regex>' -server-url '<http(s)-url>' -download-size <bytes> -concurrent <streams> -timeout <duration> -max-latency <duration> -rename=false -json-v1
 ```
 
-The caller must construct an exact-name regex (Go regexp syntax). There is at most one selected node per invocation; no concurrent node tests. Do not persist the configuration. The worker accepts only `proxies` directly present on stdin; nonempty `proxy-providers` are rejected rather than downloaded. Input is limited to 32 MiB, streams to 1–128, and both durations must be positive; download-size must be at least the stream count. Node endpoint fields are validated before adapter construction as specified below; unsupported or ambiguous forms fail closed. SSH and WireGuard nodes are rejected entirely, and HTTP nodes with any custom `headers` field or decoder-equivalent alias are rejected entirely, before adapter construction. The process isolates the dependency home before its initialization and does not read the user's Clash configuration. Successful stdout consists of exactly one JSON line with no other output:
+Both `-c -` and `-c /dev/stdin` mean standard input on Windows and Unix; neither opens a configuration file. The caller must construct an exact-name regex (Go regexp syntax). There is at most one selected node per invocation; no concurrent node tests. Do not persist the configuration. The worker accepts only `proxies` directly present on stdin; nonempty `proxy-providers` are rejected rather than downloaded. Input is limited to 32 MiB, streams to 1–128, and both durations must be positive; download-size must be at least the stream count. Node endpoint fields are validated before adapter construction as specified below; unsupported or ambiguous forms fail closed. SSH and WireGuard nodes are rejected entirely, and HTTP nodes with any custom `headers` field or decoder-equivalent alias are rejected entirely, before adapter construction. The process isolates the dependency home before its initialization and does not read the user's Clash configuration. Successful stdout consists of exactly one JSON line with no other output:
 
 ```
 {"version":1,"node_name":"...","node_type":"...","head_attempts":6,"head_successes":0,"latency_ms":0,"jitter_ms":0,"expected_bytes":0,"received_bytes":0,"download_complete":false,"download_bytes_per_second":0}

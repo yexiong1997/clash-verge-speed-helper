@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Clash 测速工作台</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="row_model.js" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <main class="app">
+    <header class="command">
+      <div class="brand"><span class="brand-icon" aria-hidden="true">ϟ</span><div class="brand-title-row"><strong>Clash 测速工作台</strong><span class="brand-pill">Mihomo · Clear Prism Glass</span></div></div>
+      <div class="actions"><label class="switch tray-switch" title="开启后点击右上角 × 会最小化到系统托盘，后台继续运行"><input type="checkbox" id="minimize-to-tray" checked><span>关闭时最小化到托盘</span></label><button id="hide-tray" class="tray-btn">隐藏到托盘</button><button id="export">导出 TSV</button><button id="funnel">智能两段优选</button><button id="stress">加压验证 · 20M</button><button id="stop" class="danger">停止</button><button id="start" class="primary">开始测速</button></div>
+    </header>
+    <div id="tun-notice" class="tun-notice" role="status" aria-live="polite" hidden>检测到 Clash Verge 已开启 TUN 模式，可能影响测速准确率；建议先手动关闭 TUN，测速结束后再恢复（不阻断本次测速）。</div>
+    <section class="overview">
+      <article class="champion" id="champion-card">
+        <div class="champion-top">
+          <div class="eyebrow" id="best-eyebrow">最优路由</div>
+          <div class="champion-actions"><button id="retest-best">复测最优</button><button id="switch-best">切换最优</button><span class="score-pill"><small>评分</small><b id="best-score">—</b></span></div>
+        </div>
+        <div class="champion-body">
+          <strong id="best-name">等待测速</strong>
+          <div id="best-profile" class="champion-sub">选择订阅源与节点后开始</div>
+          <div id="best-telemetry" class="champion-telemetry" aria-label="关键遥测指标">
+            <div class="tele-item"><small id="best-t1-label">延迟</small><b id="best-t1-val">—</b></div>
+            <div class="tele-item"><small id="best-t2-label">抖动</small><b id="best-t2-val">—</b></div>
+            <div class="tele-item"><small id="best-t3-label">丢包</small><b id="best-t3-val">—</b></div>
+          </div>
+        </div>
+        <div class="champion-bottom">
+          <div class="speed-readout"><small>下载速度</small><b id="best-speed">—</b></div>
+          <svg id="best-sparkline" class="champion-sparkline" viewBox="0 0 120 28" preserveAspectRatio="none" role="img" aria-label="下载吞吐曲线" hidden>
+            <title id="best-sparkline-title">下载吞吐曲线</title>
+            <defs>
+              <linearGradient id="spark-grad" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="#34d399" stop-opacity="0.34"></stop>
+                <stop offset="100%" stop-color="#34d399" stop-opacity="0"></stop>
+              </linearGradient>
+            </defs>
+            <path id="best-sparkline-area" class="spark-area" d=""></path>
+            <path id="best-sparkline-path" class="spark-line" d=""></path>
+            <circle id="best-sparkline-dot" class="spark-dot" cx="0" cy="0" r="2.2" hidden></circle>
+          </svg>
+          <span id="best-ready" class="ready-pill tone-idle">● 待命就绪</span>
+        </div>
+      </article>
+      <article class="card sources">
+        <div class="section-head">
+          <div class="source-title-row"><h2>订阅源矩阵</h2><span id="source-summary" class="meta-pill">尚未加载订阅</span><span id="traffic" class="meta-pill">预计流量 —</span></div>
+          <div class="source-actions"><button id="all-profiles" class="quiet">全选</button><button id="clear-profiles" class="quiet">清空</button><button id="refresh" class="quiet">刷新</button></div>
+        </div>
+        <div id="profiles" class="profile-list"><span class="empty">点击刷新读取本机订阅</span></div>
+        <div class="strategy-row">
+          <div class="group-pill"><span class="pill-label">策略组</span><select id="group" aria-label="当前订阅策略组"><option value="">请选择策略组</option></select></div>
+          <button id="refresh-groups">刷新策略组</button>
+          <button type="button" id="bridge-pill" class="bridge-pill" title="点击配置或探测跨订阅无感热切桥">○ 跨订阅热切</button>
+          <label class="switch"><input type="checkbox" id="auto" checked><span>自动切换最高分</span></label>
+        </div>
+      </article>
+    </section>
+    <section class="settings card" aria-label="测速参数">
+      <label class="param-pill"><span>并发</span><select id="parallel" aria-label="并发数"><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option><option>9</option><option selected>10</option></select></label>
+      <label class="param-pill"><span>包大小</span><select id="size" aria-label="每节点下载量"><option value="262144">256 KiB</option><option value="524288">512 KiB</option><option value="1048576">1 MiB</option><option value="2097152">2 MiB</option><option value="3145728" selected>3 MiB</option><option value="5242880">5 MiB</option><option value="20971520">20 MiB</option><option value="52428800">50 MiB</option></select></label>
+      <label class="param-pill"><span>模式</span><select id="mode" aria-label="测速模式"><option value="fast">快速</option><option value="accurate">精确</option></select></label>
+      <div class="param-pill param-schedule"><span>定时</span><select id="interval" aria-label="定时间隔"><option value="0">关闭</option><option value="15">15 分钟</option><option value="30">30 分钟</option><option value="60">1 小时</option><option value="120">2 小时</option><option value="360">6 小时</option><option value="720">12 小时</option><option value="1440">24 小时</option></select><button id="arm" class="pill">启用定时</button></div>
+      <div class="param-pill param-patrol"><span>巡检</span><select id="patrol-quota" aria-label="巡检日配额"><option value="52428800">50 MiB/天</option><option value="83886080" selected>80 MiB/天</option><option value="157286400">150 MiB/天</option><option value="314572800">300 MiB/天</option></select><button id="patrol-toggle" class="pill">开启巡检</button></div>
+      <div class="setting-notes"><span class="setting-note" id="schedule-note">支持托盘后台运行，退出应用后停止</span><span class="patrol-note" id="patrol-note">今日 0/80 MiB</span></div>
+    </section>
+    <section class="table-card card">
+      <div class="section-head table-head">
+        <div class="table-title-row">
+          <div class="view-tabs" role="tablist" aria-label="视图切换"><button id="view-live" role="tab" aria-selected="true" class="tab active">实时测速</button><button id="view-history" role="tab" aria-selected="false" class="tab">长效优选</button></div>
+          <span id="count" class="count-pill">0 / 0</span>
+          <button type="button" id="health-pill" class="health-pill" title="点击立即探测当前活跃节点延迟">● 活跃探测 待命</button>
+        </div>
+        <div id="live-tools" class="table-tools">
+          <div class="filter-pills" role="group" aria-label="状态筛选">
+            <button type="button" class="filter-pill active" data-status="all" aria-pressed="true">全部 <span class="fp-n" id="fc-all">0</span></button>
+            <button type="button" class="filter-pill" data-status="valid" aria-pressed="false">仅有效 <span class="fp-n" id="fc-valid">0</span></button>
+            <button type="button" class="filter-pill" data-status="testing" aria-pressed="false">测速中 <span class="fp-n" id="fc-testing">0</span></button>
+            <button type="button" class="filter-pill" data-status="failed" aria-pressed="false">失败 <span class="fp-n" id="fc-failed">0</span></button>
+          </div>
+          <select id="status-filter" aria-label="按状态筛选" hidden><option value="all">全部状态</option><option value="valid">有效</option><option value="testing">等待或测速中</option><option value="failed">失败或不可评分</option></select>
+          <input id="search" type="search" placeholder="搜索节点 (Ctrl+F)" aria-label="搜索订阅或节点">
+          <div class="topn-pill"><label for="topn">前</label><input id="topn" type="number" min="1" max="2000" value="10" aria-label="Top N 节点数"><span>项</span></div>
+          <button id="top" class="quiet">勾选</button>
+          <button id="all-nodes" class="quiet">全选</button>
+          <button id="clear-nodes" class="quiet">清空</button>
+        </div>
+        <div id="history-tools" class="table-tools" hidden>
+          <div class="win-pills" role="group" aria-label="历史时间窗"><button class="win-pill" data-hwin="24h">24小时</button><button class="win-pill active" data-hwin="7d">7天</button><button class="win-pill" data-hwin="30d">30天</button><button class="win-pill" data-hwin="peak">晚高峰</button></div>
+          <button id="history-selected-only" class="quiet toggle-pill selected" aria-pressed="true">仅已选订阅</button>
+          <input id="history-search" type="search" placeholder="搜索历史 (Ctrl+F)" aria-label="搜索历史节点或订阅">
+          <button id="clear-history" class="danger quiet">清空记录</button>
+        </div>
+      </div>
+      <div id="table-scroll" class="table-scroll">
+        <table>
+          <thead id="live-thead"><tr><th scope="col">选择</th><th scope="col"><button class="sort" data-sort="name">节点</button></th><th scope="col"><button class="sort" data-sort="profile">订阅源</button></th><th scope="col"><button class="sort" data-sort="state">状态</button></th><th scope="col" aria-sort="descending"><button class="sort" data-sort="score">综合分</button></th><th scope="col"><button class="sort" data-sort="speed">验证吞吐</button></th><th scope="col"><button class="sort" data-sort="latency">延迟</button></th><th scope="col"><button class="sort" data-sort="jitter">抖动</button></th><th scope="col"><button class="sort" data-sort="successes">成功</button></th></tr></thead>
+          <thead id="history-thead" hidden><tr><th scope="col"><button class="hsort" data-hsort="rank">#</button></th><th scope="col">状态</th><th scope="col"><button class="hsort" data-hsort="name">节点名称</button></th><th scope="col"><button class="hsort" data-hsort="profile">订阅</button></th><th scope="col"><button class="hsort" data-hsort="node_type">协议</button></th><th scope="col"><button class="hsort" data-hsort="weighted_median_speed_bps">稳健吞吐</button></th><th scope="col"><button class="hsort" data-hsort="weighted_median_latency_ms">典型延迟</button></th><th scope="col"><button class="hsort" data-hsort="availability_rate">可用率</button></th><th scope="col"><button class="hsort" data-hsort="total_count">样本</button></th><th scope="col" aria-sort="descending"><button class="hsort" data-hsort="long_term_score">长效稳健分</button></th></tr></thead>
+          <tbody id="rows"></tbody>
+        </table>
+        <div id="empty" class="table-empty">
+          <div class="empty-icon" id="empty-icon" aria-hidden="true">◎</div>
+          <div class="empty-title" id="empty-title">暂无可展示节点</div>
+          <div class="empty-desc" id="empty-desc">当前筛选没有节点；可调整搜索或刷新订阅</div>
+          <div class="empty-actions" id="empty-actions"></div>
+        </div>
+      </div>
+    </section>
+    <footer id="dock" class="dock card"><div id="overall-progress" class="overall-progress" aria-hidden="true"><div id="overall-progress-fill" class="progress-fill"></div><div id="overall-progress-pulse" class="progress-pulse" hidden></div></div><div class="dock-status"><span id="dock-dot" class="dock-dot" aria-hidden="true"></span><span id="dock-progress-pill" class="dock-progress-pill" hidden>0/0 · 0%</span><span id="status" role="status" aria-live="polite">准备就绪</span></div><div class="dock-actions"><button id="undo">切回原节点</button><button id="manual">切换选中节点</button><button id="continue">继续应用最优</button><button id="dock-start">开始</button><button id="dock-stop" class="danger">停止</button></div></footer>
+  </main>
+  <div id="row-menu" class="context-menu" role="menu" aria-label="节点快捷操作" hidden>
+    <button id="menu-switch" role="menuitem">立即切换至此节点</button>
+    <button id="menu-retest" role="menuitem">单独 20MiB 加压复测此节点</button>
+    <button id="menu-locate" role="menuitem" hidden>在实时队列中查看</button>
+    <div id="menu-live-sep" class="menu-sep" role="separator"></div>
+    <button id="menu-only-node" role="menuitem">仅勾选此节点</button>
+    <button id="menu-filter-profile" role="menuitem">仅筛选「同订阅」</button>
+    <div class="menu-sep" role="separator"></div>
+    <button id="menu-copy" role="menuitem">复制节点名称</button>
+    <button id="menu-copy-summary" role="menuitem">复制测速摘要</button>
+  </div>
+  <div id="confirm-dialog" class="confirm-backdrop" role="dialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-message" hidden>
+    <div class="confirm-card card">
+      <h3 id="confirm-title">确认操作</h3>
+      <p id="confirm-message"></p>
+      <div class="confirm-actions">
+        <button id="confirm-cancel" type="button">取消</button>
+        <button id="confirm-accept" type="button" class="primary">确认继续</button>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

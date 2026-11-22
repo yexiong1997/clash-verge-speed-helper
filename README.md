@@ -1,8 +1,8 @@
 # Clash 节点测速助手
 
-一个面向 macOS 的本地桌面助手：读取 Clash Verge Rev 当前配置或用户选定的 YAML，用 [faceair/clash-speedtest](https://github.com/faceair/clash-speedtest) 逐节点进行**真实下载测速**，展示并复制结果；也可在用户确认后，将指定 Clash 策略组切到测速最快的合格直接成员。启动时会尝试向已安装的官方 Clash Verge Rev 注入运行时桥接，不修改 `.app`、不重新签名、不重装。
+本地桌面助手：读取 Clash Verge Rev 配置，用 [faceair/clash-speedtest](https://github.com/faceair/clash-speedtest) 逐节点进行**真实下载测速**。原单订阅版支持 macOS；多订阅 V4 版另提供 Windows x64 实现。只有用户开启并确认相应操作后才可能切换指定策略组。macOS 版与 Windows 版均支持通过轻量运行时桥接实现不修改官方 Clash Verge 安装包的跨订阅热切换与界面同步（不可用时自动回退至手动续接）。
 
-> 本页主要描述原来的单订阅版本。独立的多订阅版本采用 [A 石墨安静版界面](docs/SCHEME_A_GRAPHITE.md)，保留原有工作台布局，使用统一的浅色/深色配色、单层边框和简短状态反馈。它支持跨订阅勾选节点、选择当前列表前 N 项、智能两段优选、吞吐进度、表头排序与筛选、最优路由直切和复测、双击行与右键操作、跨订阅自动切换、切回原节点及定时倒计时。测速期间保持行序，每阶段结束后按综合分排序。其开关默认值、测速组件和切换流程不同。启动时会尝试注入官方 Clash Verge 的运行时补丁，具体状态以窗口底部提示为准。请阅读[多订阅版本使用指南](docs/MULTI_SUBSCRIPTION.md)，并以该版本的构建与验证状态为准。
+> 新手可先看下方 **30 秒极简说明**，或本地浏览器打开交互式图文说明页 [docs/USER_GUIDE_ELI5.html](docs/USER_GUIDE_ELI5.html)。独立的多订阅版本（macOS 原生 AppKit + Windows x64 WebView2）采用 [A 石墨安静版界面](docs/SCHEME_A_GRAPHITE.md)，支持跨订阅勾选、智能两段优选、长效优选榜与智能巡检、托盘后台运行及跨订阅热切换；完整技术规范与校验边界见 [多订阅版本使用指南](docs/MULTI_SUBSCRIPTION.md) 与 [Windows 规格说明](docs/WINDOWS_V1_SPEC.md)，下方仍保留原单订阅版与各平台构建说明。
 
 > **开始前请注意（以下为原单订阅版本）**
 >
@@ -11,7 +11,61 @@
 > - 自动切换包含多次检查，但并非原子操作，也不能保证完全安全。不要在关键业务、不可容忍切换或流量消耗的环境中贸然使用。
 > - 本项目的许可证尚未指定；公开查看不自动授予一般性的使用、修改和再分发权限（GitHub 服务条款可能允许查看和 fork）。上游组件的许可另见[第三方说明](docs/THIRD_PARTY.md)。
 
-## 环境与构建
+## 30 秒看懂：它是干嘛的（ELI5）
+
+平时选节点就像挑西瓜，只看标签上的“高速 / 低延迟”根本不知道哪个真稳定。这个助手就像给 Clash Verge 配了个**“跑腿试吃员”**：你不用自己一个个切节点打开网页试，它会派出小分队去 Cloudflare 真实下载一小块文件，按 **速度（40）+ 延迟（30）+ 稳定性（20）+ 抖动（10）** 排出 **0–100 分榜单**。
+
+- **它会做什么**：只读本机 Clash Verge 订阅 → 真实下载测速排榜 →（在你允许后）帮你切到当前订阅里最快的节点。
+- **它不会做什么**：不修改 Clash Verge 安装文件；你不点开始绝不偷跑流量；不读带复杂 `proxy-providers` 的黑盒配置。
+- **流量提醒**：测速会真实连接节点与 Cloudflare 并消耗订阅流量，界面显示的预计 MiB **只是下载正文估算，不是扣费上限**。
+
+### 3 步快速上手（多订阅工作台）
+
+1. **拉名单**：打开助手自动加载本机订阅并建议策略组；节点太多时可用搜索框或输入“前 N 项”点击 **“勾选”** 缩小范围。
+2. **跑优选**：新手推荐直接点 **“智能两段优选”**——先用 **1 MiB** 快速海选，再自动挑综合分前 **10** 名用 **20 MiB** 精确复测（不受“前 N 项”勾选框干扰），省流量也更准；测速过程实时显示每行进度条、吞吐曲线与动效，并自动归档进 **“长效优选”** 榜单。
+3. **看榜切换**：界面默认勾选 **“自动切换最高分”**（如只想测速请先取消勾选），也可切换到 **“长效优选”** 看 24 小时/7 天/30 天/晚高峰综合表现或开启 **“巡检”** 守擂+探索；切完想恢复可点 **“切回原节点”**（Windows 确认成功的直接切换）。
+
+### 按钮人话速查（多订阅工作台）
+
+| 按钮 / 选项 | 流量影响 | 干嘛用的 |
+| --- | --- | --- |
+| **刷新** / **刷新策略组** | 零流量 | 只读取本机 Clash Verge 订阅与策略组状态，不会联网测速 |
+| **开始测速** | 消耗流量 | 按当前“并发数 / 每节点大小 / 模式”跑完所有勾选节点 |
+| **智能两段优选** | 消耗流量 | 先 1 MiB 粗筛、再 20 MiB 精确复测前 10 名（4 流，独立于“前 N 项”），性价比最高 |
+| **加压验证 · 20M** | 较耗流量 | 对**每一个已勾选节点**都用 20 MiB + 精确模式（4 流）重测，节点多时注意额度 |
+| **并发 × 模式（快速 2 流 / 精确 4 流）** | 参数设定 | 同时连接数 = 并发节点数 × 每节点流数；开太高会互相抢带宽导致排榜失真 |
+| **启用定时** | 周期耗流量 | 支持托盘后台运行，退出应用后停止；若勾选“自动切换最高分”则每轮后自动应用 |
+| **开启巡检** / **长效优选** | 按日配额（默认 80 MiB/天） | 与定时互斥；每 30 分钟按“守擂+探索”抽测 1 MiB 写入本地 30 天 SQLite 档案，结合活跃探测扣分（24h 衰减）生成 **24小时 / 7天 / 30天 / 晚高峰** 稳健榜单 |
+| **隐藏到托盘** / **关闭时最小化到托盘** | 零流量 | Windows / macOS 均支持常驻系统托盘后台运行、托盘菜单安全快捷停止与二次启动单实例唤醒；测速或切换进行中点“退出应用”会先唤醒窗口并触发安全停止 |
+| **切换最优** / **切换选中节点** / **继续应用最优** | 改动策略组 | **Windows 版**不会自动换订阅，若第一名在别的订阅里，需先在 Clash Verge 手动切订阅 → 刷新与刷新策略组 → 点 **“继续应用最优”**；**macOS 版**可尝试通过运行时桥接自动跨订阅切换 |
+
+<details>
+<summary>展开查看：4 条人话排错提示（遇到报错先看这里）</summary>
+
+  - **刷新后订阅为空或整次失败**：只接受直接内联 `proxies` 的规范 YAML；含 `proxy-providers`、无内联节点、重名节点或 YAML 别名的配置会被拒绝或标记为不支持（Windows 版会跳过单个不兼容的订阅，不阻断其余有效订阅）。
+- **提示“切换结果未知”且按钮锁定**：切换请求已发出但未拿到确定回执，助手已锁死切换以防重复误操作；**不要盲目重试**，先打开 Clash Verge 看实际选中的节点。
+- **测速结果和日常看视频体感不一致**：开着 Clash TUN 可能让测速流量被二次路由，且高并发会互相抢网；想测准极限速度，可暂关 TUN、把并发设为 `1`、模式选 `精确` 再测。
+- **切换后原来的“自动选择”子组不见了**：切换动作会固定到具体节点；可点 **“切回原节点”**（Windows）或在 Clash Verge 策略组里手动选回原策略。
+
+</details>
+
+## Windows 多订阅版
+
+需要 Windows x64、Microsoft Edge WebView2 Runtime、Python 3.12、PowerShell 5.1、Git、`curl.exe`、`tar.exe` 和 GNU `patch.exe`。构建过程联网下载固定版本 Go、上游源码、Go 模块及 Python 依赖；运行打包后的应用不需要安装 Python 或 Go，但仍需要 WebView2 Runtime。工作区及依赖必须可信，切勿跳过校验。
+
+在项目根目录运行（首次构建可能需要数分钟）：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Scripts\build-verified-worker.ps1
+python -B .\Worker\self-test.py ".\build\verified-worker\clash-speedtest.exe"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Scripts\build-multi.ps1
+```
+
+第二个构建脚本打印新生成的 `build\windows-<时间戳>\ClashSpeedHelper\ClashSpeedHelper.exe` 路径；请保留其同目录的 `clash-speedtest.exe` 和 `_internal` 目录。如需直接安装，可运行 `.\Scripts\install-multi.ps1`（默认安装到 `D:\Program Files\ClashSpeedHelper`，可用 `-InstallRoot` 覆盖）。已有其他可信 worker 时可通过 `-WorkerPath <绝对路径>` 指定。Windows 版不是已签名的安装包，也未做所有系统版本兼容性验证。
+
+运行后自动读取本地订阅并在控制器可用时尝试刷新及智能建议策略组（默认目录为 `%APPDATA%\io.github.clash-verge-rev.clash-verge-rev`；`CLASH_SPEED_HELPER_ROOT` 环境变量可供测试时指定隔离目录）。仅在测速时连接所选节点和 Cloudflare；切换可通过配置中的本地 Named Pipe 或 Windows AF_UNIX socket 与 Bearer secret 进行，界面默认勾选“自动切换最高分”（仅测速时可手动取消勾选）。测试仅使用合成节点和模拟控制器，**未验证真实节点测速或对真实控制器写入**。详细的使用、安全边界及测试见[多订阅指南](docs/MULTI_SUBSCRIPTION.md#windows-x64-多订阅版)。
+
+## macOS 原单订阅版：环境与构建
 
 当前构建设计面向 **macOS Apple Silicon（arm64）**。需要 Xcode Command Line Tools（包括 `swiftc`）、系统 AppKit、`/usr/bin/ruby`（带 YAML/JSON 支持）、`/usr/bin/curl`；运行本地测试另需 Python 3，端到端测试还需要 `/usr/bin/sandbox-exec`。自动切换需要正在运行、配置和本机 Unix 控制接口可被当前用户访问的 Clash Verge Rev / 兼容内核；仅测速不要求它正在运行。
 

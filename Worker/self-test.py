@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Synthetic localhost-only integrity test; no user app/config/node is read.
 
-Usage: python3 Worker/self-test.py build/verified-worker/clash-speedtest
+Usage: python3 Worker/self-test.py build/verified-worker/clash-speedtest[.exe]
 On macOS the worker runs under sandbox-exec with outbound network restricted
 solely to loopback. The in-memory HTTP CONNECT proxy additionally rejects all
-non-fixture destinations. The configuration is passed only through stdin.
+non-fixture destinations. On Windows only the literal-loopback fixtures are
+run; cases requiring a verified deny-network sandbox are explicitly skipped.
+The configuration is passed only through stdin.
 """
 import http.server
 import json
@@ -14,6 +16,7 @@ import socket
 import socketserver
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -30,6 +33,13 @@ class Target(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, *_):
         pass
+
+    def handle(self):
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # A deliberately truncated/timeout fixture may close a keep-alive.
+            pass
 
     def do_HEAD(self):
         if self.path == "/redirect":
@@ -135,8 +145,12 @@ class ProxyServer(socketserver.ThreadingTCPServer):
 
 
 def sandbox_command(worker, *, deny_network=False):
+    if sys.platform == "win32":
+        if deny_network:
+            raise RuntimeError("no verified Windows deny-network sandbox")
+        return [str(worker)]
     if sys.platform != "darwin":
-        raise RuntimeError("macOS sandbox-exec is required for this self-test")
+        raise RuntimeError("self-test requires macOS sandbox-exec or Windows loopback fixtures")
     if not os.path.exists("/usr/bin/sandbox-exec"):
         raise RuntimeError("sandbox-exec unavailable; refusing an unsandboxed self-test")
     profile = '''(version 1)
@@ -177,7 +191,8 @@ with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         raise RuntimeError("TCP/UDP deny-network canary failed; refusing unsafe fixtures")
 
 
-def run_case(command, proxy_port, target_port, path, *, name=r"\Asynthetic-node\z", config=None):
+def run_case(command, proxy_port, target_port, path, *, name=r"\Asynthetic-node\z", config=None,
+             config_arg="/dev/stdin", home=os.devnull):
     if config is None:
         config = ("proxies:\n"
                   "  - name: synthetic-node\n"
@@ -186,12 +201,21 @@ def run_case(command, proxy_port, target_port, path, *, name=r"\Asynthetic-node\
                   f"    port: {proxy_port}\n"
                   "    username: synthetic-user\n"
                   f"    password: {SECRET}\n")
-    args = command + ["-c", "/dev/stdin", "-f", name,
+    args = command + ["-c", config_arg, "-f", name,
                       "-server-url", f"http://127.0.0.1:{target_port}{path}",
                       "-download-size", str(SIZE * 2), "-concurrent", "2",
                       "-timeout", "300ms", "-max-latency", "500ms",
                       "-rename=false", "-json-v1"]
-    env = {"HOME": "/dev/null", "XDG_CONFIG_HOME": "/dev/null", "TMPDIR": "/dev/null"}
+    env = {key: home for key in ("HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
+                                 "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME")}
+    env.update({key: "synthetic-untrusted" for key in
+                ("SAFE_PATHS", "SKIP_SAFE_PATH_CHECK", "SSL_CERT_FILE", "SSL_CERT_DIR")})
+    if sys.platform == "win32":
+        for key in ("SystemRoot", "WINDIR"):
+            if key in os.environ:
+                env[key] = os.environ[key]
+    else:
+        env["TMPDIR"] = "/dev/null"
     p = subprocess.run(args, input=config.encode(), stdout=subprocess.PIPE,
                        stderr=subprocess.PIPE, env=env, timeout=12)
     assert SECRET.encode() not in p.stdout + p.stderr
@@ -206,7 +230,8 @@ def main():
     if not worker.is_file() or not os.access(worker, os.X_OK):
         raise RuntimeError("worker is not an executable regular file")
     command = sandbox_command(worker)
-    with TargetServer(("127.0.0.1", 0), Target) as target:
+    with tempfile.TemporaryDirectory(prefix="verified-worker-self-test-") as home, \
+            TargetServer(("127.0.0.1", 0), Target) as target:
         with ProxyServer(("127.0.0.1", 0), Proxy) as proxy:
             proxy.target_port = target.server_address[1]
             for server in (target, proxy):
@@ -227,36 +252,47 @@ def main():
                     "/timeout": (6, False, 2),
                     "/no-eof": (6, False, SIZE * 2),
                 }
-                for path, (heads, complete, received) in expected.items():
-                    p = run_case(command, port, target_port, path)
-                    assert p.returncode == 0, f"{path}: exit {p.returncode}; stderr={p.stderr!r}"
-                    assert p.stderr == b"", f"{path}: unexpected stderr"
-                    assert p.stdout.endswith(b"\n") and p.stdout.count(b"\n") == 1
-                    obj = json.loads(p.stdout)
-                    assert set(obj) == {"version", "node_name", "node_type", "head_attempts", "head_successes",
-                                        "latency_ms", "jitter_ms", "expected_bytes", "received_bytes",
-                                        "download_complete", "download_bytes_per_second"}
-                    assert obj["version"] == 1 and obj["node_name"] == "synthetic-node"
-                    assert obj["head_attempts"] == 6 and obj["head_successes"] == heads, (path, obj)
-                    assert obj["expected_bytes"] == SIZE * 2 and obj["received_bytes"] == received, (path, obj)
-                    assert obj["download_complete"] is complete, (path, obj)
-                    assert (obj["download_bytes_per_second"] > 0) == complete, (path, obj)
-                    print(f"PASS {path}")
+                for config_arg in ("/dev/stdin", "-"):
+                    for path, (heads, complete, received) in expected.items():
+                        if path == "/mixed":
+                            Target.mixed_gets = 0
+                        p = run_case(command, port, target_port, path, config_arg=config_arg, home=home)
+                        assert p.returncode == 0, f"{path}: exit {p.returncode}"
+                        assert p.stderr == b"", f"{path}: unexpected stderr"
+                        assert p.stdout.endswith(b"\n") and p.stdout.count(b"\n") == 1
+                        obj = json.loads(p.stdout)
+                        assert set(obj) == {"version", "node_name", "node_type", "head_attempts", "head_successes",
+                                            "latency_ms", "jitter_ms", "expected_bytes", "received_bytes",
+                                            "download_complete", "download_bytes_per_second"}
+                        assert obj["version"] == 1 and obj["node_name"] == "synthetic-node"
+                        assert obj["head_attempts"] == 6 and obj["head_successes"] == heads, (path, obj)
+                        assert obj["expected_bytes"] == SIZE * 2 and obj["received_bytes"] == received, (path, obj)
+                        assert obj["download_complete"] is complete, (path, obj)
+                        assert (obj["download_bytes_per_second"] > 0) == complete, (path, obj)
+                        print(f"PASS {config_arg} {path}")
                 assert Target.redirected == 0, "a redirect was followed"
                 for regex, config in ((r"\Amissing\z", None), ("[", None),
                                       (r"\Asynthetic-node\z", "not: [valid\n" + SECRET)):
-                    p = run_case(command, port, target_port, "/good", name=regex, config=config)
+                    p = run_case(command, port, target_port, "/good", name=regex, config=config, home=home)
                     assert p.returncode != 0 and p.stdout == b"" and p.stderr == b""
                 print("PASS empty selection, invalid regex, and invalid config")
                 node = ("proxies:\n  - name: synthetic-node\n    type: http\n"
                         "    server: 127.0.0.1\n    port: {}\n"
                         "    username: synthetic-user\n    password: " + SECRET + "\n")
                 for invalid in ("-1", "0", "65536", "1.5", '"-1"', "null"):
-                    p = run_case(command, port, target_port, "/good", config=node.format(invalid))
+                    p = run_case(command, port, target_port, "/good", config=node.format(invalid), home=home)
                     assert p.returncode != 0 and p.stdout == b"" and p.stderr == b"", invalid
-                p = run_case(command, port, target_port, "/good", config=node.format(f'"{port}"'))
+                p = run_case(command, port, target_port, "/good", config=node.format(f'"{port}"'), home=home)
                 assert p.returncode != 0 and p.stdout == b"" and p.stderr == b""
                 print("PASS invalid node ports, including quoted integers")
+                p = run_case(command, port, target_port, "/good", config_arg="not-stdin", home=home)
+                assert p.returncode != 0 and p.stdout == b"" and p.stderr == b""
+                print("PASS filesystem configuration path rejected")
+                assert not list(Path(home).iterdir()), "worker wrote to inherited home/config path"
+                print("PASS no writes to inherited home/config paths")
+                if sys.platform == "win32":
+                    print("SKIP deny-network unsafe-node fixtures: no verified Windows sandbox")
+                    return
                 deny_command = sandbox_command(worker, deny_network=True)
                 verify_network_denied(deny_command, port)
                 common = {"name": "synthetic-node", "server": "127.0.0.1", "port": port}

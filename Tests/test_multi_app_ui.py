@@ -3,6 +3,10 @@
 
 Run on macOS: python3 -B Tests/test_multi_app_ui.py
 """
+import sys
+if sys.platform == "win32":
+    if __name__ == "__main__": print("SKIP: AppKit UI test; see test_windows_desktop.py"); sys.exit(0)
+    import unittest; raise unittest.SkipTest("AppKit UI test; see test_windows_desktop.py")
 import hashlib
 import json
 import os

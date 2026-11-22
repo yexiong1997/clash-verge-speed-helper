@@ -43,3 +43,10 @@ clash-speedtest
 docs/*.png
 docs/SCHEME_*.md
 * 2.*
+
+# Windows build and packaging artifacts
+*.exe
+*.dll
+*.msi
+*.spec
+Thumbs.db
