@@ -1208,6 +1208,7 @@ func multiSelectTopN(rows: [MultiRow], visibleRows: [Int], count: Int) -> Set<Mu
 
 private final class MultiNodeCheckbox: NSButton {
     var nodeIdentity: MultiIdentity?
+    var telemetryIdentity: TelemetryIdentity?
     private var isHovered = false { didSet { if oldValue != isHovered { needsDisplay = true } } }
     private var trackingAreaRef: NSTrackingArea?
 
@@ -2338,6 +2339,8 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private let historyModeButton = MultiClearGlassButton(title: "长效优选", style: .clearSubtle, height: 24, hPadding: 10, fontSize: 11)
     private let patrolQuotaPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let patrolButton = MultiClearGlassButton(title: "开启巡检", style: .clearSecondary, height: 22, hPadding: 9, fontSize: 11)
+    private let patrolInfoButton = MultiClearGlassButton(title: "", symbol: "questionmark.circle", style: .clearSubtle, height: 20, hPadding: 5, fontSize: 11)
+    private var patrolInfoPopover: NSPopover?
     private let patrolStatusLabel = NSTextField(labelWithString: "巡检未启用 · 今日 0/80 MiB")
     private let healthStatusLabel = NSTextField(labelWithString: "● 活跃探测 待命")
     private let healthStatusPill = MultiClearFrostedSurface(style: .clearSubtle, cornerRadius: 14, isCapsule: true)
@@ -2346,6 +2349,8 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private let historyWin7dButton = MultiClearGlassButton(title: "7天", style: .clearPrimary, height: 24, hPadding: 8, fontSize: 11)
     private let historyWin30dButton = MultiClearGlassButton(title: "30天", style: .clearSubtle, height: 24, hPadding: 8, fontSize: 11)
     private let historyWinPeakButton = MultiClearGlassButton(title: "晚高峰", style: .clearSubtle, height: 24, hPadding: 8, fontSize: 11)
+    private let historySelectAllButton = MultiClearGlassButton(title: "全选", style: .clearSubtle, height: 24, hPadding: 7.5, fontSize: 11)
+    private let historyClearSelectionButton = MultiClearGlassButton(title: "清空", style: .clearSubtle, height: 24, hPadding: 7.5, fontSize: 11)
     private let historySelectedOnlyButton = MultiClearGlassButton(title: "仅已选订阅", style: .clearSecondary, height: 24, hPadding: 9, fontSize: 11)
     private let historySearch = NSSearchField()
     private let clearHistoryButton = MultiClearGlassButton(title: "清空记录", style: .clearDanger, height: 24, hPadding: 9, fontSize: 11)
@@ -2480,6 +2485,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private var historySelectedOnly = false
     private var historySummaries: [TelemetryNodeSummary] = []
     private var historyVisibleIndices: [Int] = []
+    private var historySelection = Set<TelemetryIdentity>()
     private var historySortColumn: String?
     private var historySortAscending = false
     private var historyRefreshGeneration: UInt64 = 0
@@ -2487,12 +2493,14 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private var clearHistoryConfirmTimer: Timer?
     private var patrolArmedBatch: MultiPreparedBatch?
     private var cachedPatrolBytesToday: Int = 0
+    private var cachedPatrolQuotaDay: Date = Calendar.current.startOfDay(for: Date())
     private var patrolLastSummaryText: String = ""
     private var healthProbeTimer: Timer?
     private var healthProbeInFlight = false
     private var healthProbeStatusText: String = "● 活跃探测 待命"
     private var healthProbeStatusColor: NSColor = MultiPalette.muted
     private let patrolQuotaBytesValues = [50 * 1_048_576, 80 * 1_048_576, 150 * 1_048_576, 300 * 1_048_576]
+    private let patrolMaxNodesPerTickValues = [4, 5, 6, 8]
     private let patrolQuotaLabels = ["50 MiB/天", "80 MiB/天", "150 MiB/天", "300 MiB/天"]
     private var runSwitchRequested = false
     private var cancelled = false
@@ -2835,12 +2843,16 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         scheduleStatus.isHidden = narrow
         patrolStatusLabel.isHidden = narrow
         scheduleButton.toolTip = scheduleStatus.toolTip ?? scheduleStatus.stringValue
-        patrolButton.toolTip = patrolStatusLabel.stringValue
+        let patrolHelp = buildPatrolToolTip()
+        patrolButton.toolTip = patrolHelp
+        patrolQuotaPopup.toolTip = patrolHelp
+        patrolInfoButton.toolTip = patrolHelp
+        patrolStatusLabel.toolTip = patrolHelp
     }
     func applicationWillTerminate(_ notification: Notification) { closeApp() }
     private func closeApp() {
         guard !closed else { return }
-        closed = true; timer?.invalidate(); timer = nil; uiMotionTimer?.invalidate(); uiMotionTimer = nil
+        closed = true; patrolInfoPopover?.close(); patrolInfoPopover = nil; timer?.invalidate(); timer = nil; uiMotionTimer?.invalidate(); uiMotionTimer = nil
         healthProbeTimer?.invalidate(); healthProbeTimer = nil
         clearHistoryConfirmTimer?.invalidate(); clearHistoryConfirmTimer = nil
         stopTestingMotionTimer()
@@ -3049,6 +3061,11 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         liveModeButton.target = self; liveModeButton.action = #selector(viewModeChanged(_:))
         historyModeButton.target = self; historyModeButton.action = #selector(viewModeChanged(_:))
         patrolButton.target = self; patrolButton.action = #selector(togglePatrol(_:))
+        patrolInfoButton.target = self; patrolInfoButton.action = #selector(togglePatrolInfoPopover(_:))
+        patrolInfoButton.widthAnchor.constraint(equalToConstant: 22).isActive = true
+        patrolInfoButton.setAccessibilityLabel("智能巡检功能说明")
+        historySelectAllButton.target = self; historySelectAllButton.action = #selector(historySelectAllVisible(_:))
+        historyClearSelectionButton.target = self; historyClearSelectionButton.action = #selector(historyClearSelection(_:))
         for btn in [historyWin24hButton, historyWin7dButton, historyWin30dButton, historyWinPeakButton] {
             btn.target = self; btn.action = #selector(historyWindowChanged(_:))
         }
@@ -3393,8 +3410,9 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             label("巡检", size: 11, weight: .medium, color: MultiPalette.muted),
             makeCapsuleDivider(),
             patrolQuotaPopup,
-            patrolButton
-        ], spacing: 6)
+            patrolButton,
+            patrolInfoButton
+        ], spacing: 5)
         patrolPillRow.translatesAutoresizingMaskIntoConstraints = false
         patrolPill.addSubview(patrolPillRow)
         NSLayoutConstraint.activate([
@@ -3547,7 +3565,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         historySearch.placeholderString = "搜索历史节点或订阅…"
         historySearch.controlSize = .small
         historySearch.font = .systemFont(ofSize: 11.5)
-        historySearch.widthAnchor.constraint(equalToConstant: 150).isActive = true
+        historySearch.widthAnchor.constraint(equalToConstant: 128).isActive = true
 
         let historyToolbar = row([
             label("长效优选榜", size: 13, weight: .semibold),
@@ -3556,11 +3574,13 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             historyWin7dButton,
             historyWin30dButton,
             historyWinPeakButton,
+            historySelectAllButton,
+            historyClearSelectionButton,
             spacer(),
             historySelectedOnlyButton,
             historySearch,
             clearHistoryButton
-        ], spacing: 6)
+        ], spacing: 5)
         historyToolbar.translatesAutoresizingMaskIntoConstraints = false
         historyToolbar.setClippingResistancePriority(.defaultLow, for: .horizontal)
         historyToolbar.isHidden = true
@@ -3608,7 +3628,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         addColumn(resultTable, "rank", "#", 34, minWidth: 30, maxWidth: 44, align: .center)
         addColumn(resultTable, "profile", "订阅", 116, minWidth: 84)
         addColumn(resultTable, "node", "节点名称", 210, minWidth: 140)
-        addColumn(resultTable, "type", "协议", 66, minWidth: 54, maxWidth: 80, align: .center)
+        addColumn(resultTable, "type", "协议", 76, minWidth: 66, maxWidth: 92, align: .center)
         addColumn(resultTable, "speed", "验证吞吐", 96, minWidth: 76, align: .right)
         addColumn(resultTable, "latency", "延迟", 68, minWidth: 54, align: .right)
         addColumn(resultTable, "failure", "丢包率", 58, minWidth: 48, align: .right)
@@ -3873,6 +3893,11 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         return idx >= 2 ? 1800 : 3600
     }
 
+    private var currentPatrolMaxPerTick: Int {
+        let idx = patrolQuotaPopup.indexOfSelectedItem
+        return patrolMaxNodesPerTickValues.indices.contains(idx) ? patrolMaxNodesPerTickValues[idx] : patrolMaxNodesPerTickValues[1]
+    }
+
     private func updatePatrolStatusText() {
         let quotaMiB = currentPatrolQuotaBytes / 1_048_576
         let usedMiB = Int(ceil(Double(cachedPatrolBytesToday) / 1_048_576.0))
@@ -3890,9 +3915,87 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             patrolStatusLabel.stringValue = "巡检未启用 · \(suffix)"
             patrolStatusLabel.textColor = MultiPalette.muted
         }
-        patrolButton.toolTip = patrolStatusLabel.stringValue
+        let patrolHelp = buildPatrolToolTip()
+        patrolButton.toolTip = patrolHelp
+        patrolQuotaPopup.toolTip = patrolHelp
+        patrolInfoButton.toolTip = patrolHelp
+        patrolStatusLabel.toolTip = patrolHelp
         healthStatusLabel.stringValue = healthProbeStatusText
         healthStatusLabel.textColor = healthProbeStatusColor
+    }
+    func buildPatrolToolTip() -> String {
+        let quotaMiB = currentPatrolQuotaBytes / 1_048_576
+        let usedMiB = Int(ceil(Double(cachedPatrolBytesToday) / 1_048_576.0))
+        let intervalMin = Int(currentPatrolIntervalSeconds / 60)
+        let batchCap = currentPatrolMaxPerTick
+        let nightCap = max(2, batchCap / 2)
+        let peakReserveMiB = max(1, quotaMiB / 4)
+        let stateLine = patrolStatusLabel.stringValue
+        return """
+        智能巡检（后台低干扰积累长效评分）
+        • 按配额自动配速：每 \(intervalMin) 分钟以 2 并发抽测最多 \(batchCap) 节点（深夜 01:00–07:00 减半至 \(nightCap) 节点，每节点 1 MiB / 2 流），结果归档至「长效优选榜」。
+        • 智能轮换挑点：健康扣分旗舰 5 分钟快复核 + 合格守擂 90 分钟轮换（晚高峰 45 分钟且首轮直测）+ 多订阅轮询冷启动与潜力节点快速毕业。
+        • 死节点退避与晚高峰保护：连续失败节点严格退避 2~24 小时不重复探测（失败仅计 ≤256 KiB）；20:00 前预留 25%（约 \(peakReserveMiB) MiB）供晚高峰及夜间采样。
+        • 只测速不改动节点勾选，也不会自动切换代理节点；支持托盘后台运行。
+        当前状态：\(stateLine)（今日 \(usedMiB)/\(quotaMiB) MiB）
+        """
+    }
+    @objc private func togglePatrolInfoPopover(_ sender: Any?) {
+        if let existing = patrolInfoPopover, existing.isShown {
+            existing.performClose(sender)
+            return
+        }
+        let pop = NSPopover()
+        pop.behavior = .transient
+        pop.animates = !MultiPalette.reducesMotion
+        let vc = NSViewController()
+        let root = NSView(frame: NSRect(x: 0, y: 0, width: 348, height: 224))
+        let quotaMiB = currentPatrolQuotaBytes / 1_048_576
+        let usedMiB = Int(ceil(Double(cachedPatrolBytesToday) / 1_048_576.0))
+        let intervalMin = Int(currentPatrolIntervalSeconds / 60)
+        let batchCap = currentPatrolMaxPerTick
+        let nightCap = max(2, batchCap / 2)
+        let peakReserveMiB = max(1, quotaMiB / 4)
+        let titleLbl = label("智能巡检功能说明", size: 13, weight: .semibold, color: MultiPalette.text)
+        let subLbl = label("每 \(intervalMin) 分钟最多 \(batchCap) 节点 · 今日 \(usedMiB)/\(quotaMiB) MiB（晚高峰预留 \(peakReserveMiB) MiB）", size: 11, weight: .medium, color: MultiPalette.accent)
+        subLbl.lineBreakMode = .byTruncatingTail
+        let bullets = [
+            "• 全天均衡配速：按日配额自动控速（深夜 01:00–07:00 减半至 \(nightCap) 节点），20:00 前预留 25% 给晚高峰采样，避免通宵或午前耗尽预算。",
+            "• 守擂轮换与冷启动：健康扣分旗舰 5 分钟快复核；合格主力 90 分钟轮换（晚高峰 45 分钟）；多订阅交错探索并优先助推 1–2 样本潜力节点达标。",
+            "• 死节点严格退避：连续失败节点自动跳过 2~24 小时指数退避窗口，失败探针仅计低额防空转成本（≤256 KiB）。",
+            "• 低干扰且安全：仅 2 并发 1 MiB 轻量采样，绝不改勾选、不会自动切换节点，支持托盘后台运行。"
+        ]
+        var items: [NSView] = [titleLbl, subLbl]
+        for line in bullets {
+            let f = NSTextField(wrappingLabelWithString: line)
+            f.font = .systemFont(ofSize: 11.5, weight: .regular)
+            f.textColor = MultiPalette.text
+            f.maximumNumberOfLines = 3
+            f.preferredMaxLayoutWidth = 292
+            items.append(f)
+        }
+        let stack = NSStackView(views: items)
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 6
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 14),
+            stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -14),
+            stack.topAnchor.constraint(equalTo: root.topAnchor, constant: 12),
+            stack.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -12)
+        ])
+        root.layoutSubtreeIfNeeded()
+        vc.view = root
+        pop.contentViewController = vc
+        pop.contentSize = NSSize(width: 320, height: max(180, stack.fittingSize.height + 24))
+        patrolInfoPopover = pop
+#if !MULTI_UI_TEST
+        if patrolInfoButton.window != nil {
+            pop.show(relativeTo: patrolInfoButton.bounds, of: patrolInfoButton, preferredEdge: .maxY)
+        }
+#endif
     }
     @objc private func configurationChanged(_ sender: Any?) {
 #if !MULTI_UI_TEST
@@ -4013,7 +4116,16 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
     }
     private func toggleSelectedRowWithSpace() -> Bool {
-        guard viewMode == .live, !busy, nodeSelection != nil else { return false }
+        guard !busy else { return false }
+        if viewMode == .history {
+            let selectedRows = resultTable.selectedRowIndexes.filter { historyVisibleIndices.indices.contains($0) }
+            guard !selectedRows.isEmpty else { return false }
+            let ids = selectedRows.map { historySummaries[historyVisibleIndices[$0]].identity }
+            let shouldCheck = ids.contains { !historySelection.contains($0) }
+            changeHistorySelection(ids, checked: shouldCheck)
+            return true
+        }
+        guard viewMode == .live, nodeSelection != nil else { return false }
         let selectedRow = resultTable.selectedRow
         guard visibleRows.indices.contains(selectedRow), rows.indices.contains(visibleRows[selectedRow]) else { return false }
         let identity = rows[visibleRows[selectedRow]].identity
@@ -4022,17 +4134,17 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         return true
     }
     private func copySelectedRowWithShortcut() -> Bool {
-        let selectedRow = resultTable.selectedRow
-        guard selectedRow >= 0 else { return false }
         if viewMode == .history {
-            guard historyVisibleIndices.indices.contains(selectedRow) else { return false }
-            let name = historySummaries[historyVisibleIndices[selectedRow]].nodeName
+            let targets = selectedHistoryTargets(preferredRow: resultTable.selectedRow >= 0 ? resultTable.selectedRow : nil)
+            guard !targets.isEmpty else { return false }
+            let text = targets.map(\.nodeName).joined(separator: "\n")
             NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(name, forType: .string)
-            status.stringValue = "已复制节点名称：\(name)"
+            NSPasteboard.general.setString(text, forType: .string)
+            status.stringValue = targets.count == 1 ? "已复制节点名称：\(targets[0].nodeName)" : "已复制 \(targets.count) 个长效节点名称。"
             return true
         } else {
-            guard visibleRows.indices.contains(selectedRow), rows.indices.contains(visibleRows[selectedRow]) else { return false }
+            let selectedRow = resultTable.selectedRow
+            guard selectedRow >= 0, visibleRows.indices.contains(selectedRow), rows.indices.contains(visibleRows[selectedRow]) else { return false }
             let name = rows[visibleRows[selectedRow]].nodeName
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(name, forType: .string)
@@ -4040,12 +4152,70 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             return true
         }
     }
+    func selectedHistoryTargets(preferredRow: Int? = nil) -> [TelemetryNodeSummary] {
+        let visibleChecked = historyVisibleIndices.compactMap { idx -> TelemetryNodeSummary? in
+            let s = historySummaries[idx]
+            return historySelection.contains(s.identity) ? s : nil
+        }
+        if !visibleChecked.isEmpty { return visibleChecked }
+        let allChecked = historySummaries.filter { historySelection.contains($0.identity) }
+        if !allChecked.isEmpty { return allChecked }
+        let highlighted = resultTable.selectedRowIndexes.filter { historyVisibleIndices.indices.contains($0) }
+        if highlighted.count > 1, (preferredRow == nil || highlighted.contains(preferredRow!)) {
+            return highlighted.sorted().map { historySummaries[historyVisibleIndices[$0]] }
+        }
+        if let r = preferredRow, historyVisibleIndices.indices.contains(r) {
+            return [historySummaries[historyVisibleIndices[r]]]
+        }
+        if resultTable.selectedRow >= 0, historyVisibleIndices.indices.contains(resultTable.selectedRow) {
+            return [historySummaries[historyVisibleIndices[resultTable.selectedRow]]]
+        }
+        return []
+    }
+    private func changeHistorySelection(_ identities: [TelemetryIdentity], checked: Bool) {
+        guard !busy else { return }
+        if checked {
+            for id in identities { historySelection.insert(id) }
+        } else {
+            for id in identities { historySelection.remove(id) }
+        }
+        let checkCol = resultTable.column(withIdentifier: NSUserInterfaceItemIdentifier("check"))
+        if viewMode == .history && checkCol >= 0 && resultTable.numberOfRows > 0 {
+            resultTable.reloadData(forRowIndexes: IndexSet(integersIn: 0..<resultTable.numberOfRows), columnIndexes: IndexSet(integer: checkCol))
+        }
+        updateControls()
+        let visCheckedCount = historyVisibleIndices.filter { historySelection.contains(historySummaries[$0].identity) }.count
+        status.stringValue = visCheckedCount > 0
+            ? "长效优选榜已勾选 \(visCheckedCount) / \(historyVisibleIndices.count) 个节点；可直接点击上方开始测速、加压复测或右键批量操作。"
+            : "已取消勾选长效候选节点。"
+    }
+    @objc private func toggleHistoryNode(_ sender: MultiNodeCheckbox) {
+        guard !busy, let id = sender.telemetryIdentity else { return }
+        changeHistorySelection([id], checked: sender.state == .on)
+    }
+    @objc private func historySelectAllVisible(_ sender: Any?) {
+        guard !busy, !historyVisibleIndices.isEmpty else { return }
+        let ids = historyVisibleIndices.map { historySummaries[$0].identity }
+        changeHistorySelection(ids, checked: true)
+    }
+    @objc private func historyClearSelection(_ sender: Any?) {
+        guard !busy, !historySelection.isEmpty else { return }
+        historySelection.removeAll()
+        if viewMode == .history && resultTable.numberOfRows > 0 {
+            let checkCol = resultTable.column(withIdentifier: NSUserInterfaceItemIdentifier("check"))
+            if checkCol >= 0 {
+                resultTable.reloadData(forRowIndexes: IndexSet(integersIn: 0..<resultTable.numberOfRows), columnIndexes: IndexSet(integer: checkCol))
+            }
+        }
+        updateControls()
+        status.stringValue = "已清空长效优选榜勾选。"
+    }
     private func updateRowContextMenu() {
         let targetRow = resultTable.clickedRow >= 0 ? resultTable.clickedRow : resultTable.selectedRow
         let isHist = (viewMode == .history)
         let hasRow = targetRow >= 0 && (isHist ? historyVisibleIndices.indices.contains(targetRow) : visibleRows.indices.contains(targetRow))
         let ready = !busy && !groupRefreshInFlight && !closed
-        rowMenuCheckOnlyItem.isHidden = isHist
+        rowMenuCheckOnlyItem.isHidden = false
         rowMenuFilterProfileItem.isHidden = isHist
         rowMenuJumpLiveItem.isHidden = !isHist
         guard hasRow else {
@@ -4057,14 +4227,27 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
         if isHist {
             let s = historySummaries[historyVisibleIndices[targetRow]]
+            let targets = selectedHistoryTargets(preferredRow: targetRow)
+            let batchCount = targets.count
+            let resolvableTargets = targets.filter { canResolveRegistryOption(for: $0) }
             let canResolve = canResolveRegistryOption(for: s)
             rowMenuSwitchItem.isEnabled = ready && !switchOutcomeUnknown && canResolve
-            rowMenuRetestItem.isEnabled = ready && canResolve
-            rowMenuJumpLiveItem.isEnabled = !busy && rows.contains(where: { $0.identity == MultiIdentity(profile: s.identity.profile, node: s.nodeName) })
+            rowMenuRetestItem.title = batchCount > 1 ? "批量 20MiB 加压复测已选 (\(batchCount) 个)" : "单独 20MiB 加压复测此节点"
+            rowMenuRetestItem.isEnabled = ready && !resolvableTargets.isEmpty
+            rowMenuCheckOnlyItem.title = "仅勾选此节点"
+            rowMenuCheckOnlyItem.isEnabled = !busy
+            rowMenuJumpLiveItem.title = batchCount > 1 ? "将已选 \(batchCount) 个同步到实时队列" : "在实时队列中查看"
+            rowMenuJumpLiveItem.isEnabled = !busy && !resolvableTargets.isEmpty
+            rowMenuCopyNameItem.title = batchCount > 1 ? "复制已选节点名称 (\(batchCount) 个)" : "复制节点名称"
+            rowMenuCopySummaryItem.title = batchCount > 1 ? "复制已选测速摘要 (\(batchCount) 个)" : "复制测速摘要"
             rowMenuCopyNameItem.isEnabled = true
             rowMenuCopySummaryItem.isEnabled = true
         } else {
             let row = rows[visibleRows[targetRow]]
+            rowMenuRetestItem.title = "单独 20MiB 加压复测此节点"
+            rowMenuCheckOnlyItem.title = "仅勾选此节点"
+            rowMenuCopyNameItem.title = "复制节点名称"
+            rowMenuCopySummaryItem.title = "复制测速摘要"
             rowMenuSwitchItem.isEnabled = ready && !switchOutcomeUnknown && selectionPreview != nil
             rowMenuRetestItem.isEnabled = ready && selectionPreview != nil
             rowMenuCheckOnlyItem.isEnabled = !busy && nodeSelection != nil
@@ -4567,8 +4750,10 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         selectAllProfilesButton.isEnabled = !busy && selected.count < registry.count
         clearProfilesButton.isEnabled = !busy && !selected.isEmpty
         refreshButton.isEnabled = !busy
-        funnelButton.isEnabled = readyForAction && hasNodes
-        loadTestButton.isEnabled = readyForAction && hasNodes
+        let historyTargets = isHistory ? selectedHistoryTargets().filter { canResolveRegistryOption(for: $0) } : []
+        let hasHistoryBatch = isHistory && (!historySelection.isEmpty || resultTable.selectedRowIndexes.count > 1) && !historyTargets.isEmpty
+        funnelButton.isEnabled = readyForAction && (hasNodes || hasHistoryBatch)
+        loadTestButton.isEnabled = readyForAction && (hasNodes || hasHistoryBatch)
         if isHistory {
             let canActOnHistoryRow = readyForAction && !switchOutcomeUnknown &&
                 historyVisibleIndices.indices.contains(resultTable.selectedRow) &&
@@ -4604,14 +4789,17 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         patrolQuotaPopup.isEnabled = !busy
         scheduleButton.isEnabled = schedule.isArmed || (readyForAction && hasNodes)
         patrolButton.isEnabled = patrolSchedule.isArmed || (readyForAction && hasPreviewRows)
-        startButton.isEnabled = readyForAction && hasNodes; stopButton.isEnabled = busy && !cancelled
+        startButton.isEnabled = readyForAction && (hasNodes || hasHistoryBatch); stopButton.isEnabled = busy && !cancelled
         autoSwitch.isEnabled = !busy && !switchOutcomeUnknown
         copyButton.isEnabled = isHistory ? !historyVisibleIndices.isEmpty : !rows.isEmpty
         liveModeButton.glassStyle = isHistory ? .clearSubtle : .clearPrimary
         historyModeButton.glassStyle = isHistory ? .clearPrimary : .clearSubtle
         tableToolbarView?.isHidden = isHistory
         historyToolbarView?.isHidden = !isHistory
-        historyCountLabel.stringValue = "\(historyVisibleIndices.count) 候选"
+        let histCheckedVisible = historyVisibleIndices.filter { historySelection.contains(historySummaries[$0].identity) }.count
+        historyCountLabel.stringValue = histCheckedVisible > 0 ? "已选 \(histCheckedVisible) / \(historyVisibleIndices.count)" : "\(historyVisibleIndices.count) 候选"
+        historySelectAllButton.isEnabled = !busy && !historyVisibleIndices.isEmpty && histCheckedVisible < historyVisibleIndices.count
+        historyClearSelectionButton.isEnabled = !busy && !historySelection.isEmpty
         for (btn, w) in [(historyWin24hButton, TelemetryWindow.hours24),
                          (historyWin7dButton, .days7),
                          (historyWin30dButton, .days30),
@@ -5078,6 +5266,13 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     @objc private func startLoadTest(_ sender: Any?) {
         window?.makeFirstResponder(nil)
+        if viewMode == .history && (!historySelection.isEmpty || resultTable.selectedRowIndexes.count > 1) {
+            let targets = selectedHistoryTargets()
+            if !targets.isEmpty {
+                launchHistoryBatch(targets, mode: .load20M)
+                return
+            }
+        }
         guard !busy, !groupRefreshInFlight, !closed, !selected.isEmpty,
               selectionPreview != nil, !(nodeSelection?.isEmpty ?? true),
               let sizeIndex = sizeValues.firstIndex(of: 20 * 1_048_576) else { return }
@@ -5093,6 +5288,13 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     @objc private func startFunnelTest(_ sender: Any?) {
         window?.makeFirstResponder(nil)
+        if viewMode == .history && (!historySelection.isEmpty || resultTable.selectedRowIndexes.count > 1) {
+            let targets = selectedHistoryTargets()
+            if !targets.isEmpty {
+                launchHistoryBatch(targets, mode: .funnel)
+                return
+            }
+        }
         guard !busy, !groupRefreshInFlight, !closed, !selected.isEmpty,
               selectionPreview != nil, !(nodeSelection?.isEmpty ?? true),
               let quickIndex = sizeValues.firstIndex(of: 1 * 1_048_576) else { return }
@@ -5165,8 +5367,13 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         let targetRow = resultTable.clickedRow >= 0 ? resultTable.clickedRow : resultTable.selectedRow
         guard !busy, !groupRefreshInFlight, !closed, targetRow >= 0 else { return }
         if viewMode == .history {
-            guard historyVisibleIndices.indices.contains(targetRow) else { return }
-            retestHistorySummary(historySummaries[historyVisibleIndices[targetRow]])
+            let targets = selectedHistoryTargets(preferredRow: targetRow)
+            guard !targets.isEmpty else { return }
+            if targets.count == 1 {
+                retestHistorySummary(targets[0])
+            } else {
+                launchHistoryBatch(targets, mode: .load20M)
+            }
             return
         }
         guard selectionPreview != nil, visibleRows.indices.contains(targetRow),
@@ -5183,6 +5390,18 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     @objc private func contextCheckOnlyRow(_ sender: Any?) {
         let targetRow = resultTable.clickedRow >= 0 ? resultTable.clickedRow : resultTable.selectedRow
+        if viewMode == .history {
+            guard !busy, historyVisibleIndices.indices.contains(targetRow) else { return }
+            let s = historySummaries[historyVisibleIndices[targetRow]]
+            historySelection = [s.identity]
+            let checkCol = resultTable.column(withIdentifier: NSUserInterfaceItemIdentifier("check"))
+            if checkCol >= 0 && resultTable.numberOfRows > 0 {
+                resultTable.reloadData(forRowIndexes: IndexSet(integersIn: 0..<resultTable.numberOfRows), columnIndexes: IndexSet(integer: checkCol))
+            }
+            updateControls()
+            status.stringValue = "长效优选榜已仅勾选节点：\(s.nodeName)"
+            return
+        }
         guard !busy, viewMode == .live, nodeSelection != nil,
               visibleRows.indices.contains(targetRow), rows.indices.contains(visibleRows[targetRow]) else { return }
         let row = rows[visibleRows[targetRow]]
@@ -5208,8 +5427,17 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     @objc private func contextJumpToLiveRow(_ sender: Any?) {
         let targetRow = resultTable.clickedRow >= 0 ? resultTable.clickedRow : resultTable.selectedRow
         guard !busy, viewMode == .history, historyVisibleIndices.indices.contains(targetRow) else { return }
+        let targets = selectedHistoryTargets(preferredRow: targetRow)
+        if targets.count > 1 {
+            launchHistoryBatch(targets, mode: .syncOnly)
+            return
+        }
         let summary = historySummaries[historyVisibleIndices[targetRow]]
         let targetID = MultiIdentity(profile: summary.identity.profile, node: summary.nodeName)
+        if !rows.contains(where: { $0.identity == targetID }) {
+            launchHistoryBatch([summary], mode: .syncOnly)
+            return
+        }
         nodeSearch.stringValue = ""
         statusFilter = .all
         setViewMode(.live, announce: false)
@@ -5227,8 +5455,13 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         guard targetRow >= 0 else { return }
         let name: String
         if viewMode == .history {
-            guard historyVisibleIndices.indices.contains(targetRow) else { return }
-            name = historySummaries[historyVisibleIndices[targetRow]].nodeName
+            let targets = selectedHistoryTargets(preferredRow: targetRow)
+            guard !targets.isEmpty else { return }
+            let joined = targets.map(\.nodeName).joined(separator: "\n")
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(joined, forType: .string)
+            status.stringValue = targets.count == 1 ? "已复制节点名称：\(targets[0].nodeName)" : "已复制 \(targets.count) 个长效节点名称。"
+            return
         } else {
             guard visibleRows.indices.contains(targetRow) else { return }
             name = rows[visibleRows[targetRow]].nodeName
@@ -5243,12 +5476,18 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         guard targetRow >= 0 else { return }
         let summaryLine: String
         if viewMode == .history {
-            guard historyVisibleIndices.indices.contains(targetRow) else { return }
-            let s = historySummaries[historyVisibleIndices[targetRow]]
-            let speed = s.successCount > 0 ? String(format: "%.2f MiB/s", s.weightedMedianSpeedBytesPerSecond / 1_048_576) : "—"
-            let lat = s.successCount > 0 ? String(format: "%.1f ms", s.weightedMedianLatencyMs) : "—"
-            summaryLine = String(format: "[%@] %@ · 吞吐 %@ · 延迟 %@ · 可用 %.0f%% · 长效分 %.1f",
-                                 displayProfileName(for: s), s.nodeName, speed, lat, s.availabilityRate * 100, s.longTermScore)
+            let targets = selectedHistoryTargets(preferredRow: targetRow)
+            guard !targets.isEmpty else { return }
+            let lines = targets.map { s -> String in
+                let speed = s.successCount > 0 ? String(format: "%.2f MiB/s", s.weightedMedianSpeedBytesPerSecond / 1_048_576) : "—"
+                let lat = s.successCount > 0 ? String(format: "%.1f ms", s.weightedMedianLatencyMs) : "—"
+                return String(format: "[%@] %@ · 吞吐 %@ · 延迟 %@ · 可用 %.0f%% · 长效分 %.1f",
+                              displayProfileName(for: s), s.nodeName, speed, lat, s.availabilityRate * 100, s.longTermScore)
+            }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(lines.joined(separator: "\n"), forType: .string)
+            status.stringValue = targets.count == 1 ? "已复制节点测速摘要。" : "已复制 \(targets.count) 个长效节点摘要。"
+            return
         } else {
             guard visibleRows.indices.contains(targetRow), rows.indices.contains(visibleRows[targetRow]) else { return }
             let row = rows[visibleRows[targetRow]]
@@ -5342,6 +5581,13 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     @objc private func startManual(_ sender: Any?) {
         window?.makeFirstResponder(nil)
+        if viewMode == .history && (sender as AnyObject?) !== champRetestButton && (!historySelection.isEmpty || resultTable.selectedRowIndexes.count > 1) {
+            let targets = selectedHistoryTargets()
+            if !targets.isEmpty {
+                launchHistoryBatch(targets, mode: .standard)
+                return
+            }
+        }
         guard !busy, !groupRefreshInFlight, !closed, let token = schedule.beginManualRun() else { return }
         if viewMode == .history { setViewMode(.live, announce: false) }
         if (sender as AnyObject?) !== funnelButton { funnelStage = 0; funnelPromotedSelection = nil }
@@ -5552,7 +5798,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             onProgress: { [weak self] job, progress in self?.receiveProgress(job, progress: progress, token: token) },
             onResult: { [weak self] job, result in self?.receive(job, result: result, token: token) },
             onFinish: { [weak self] summary in self?.finished(summary, token: token) })
-        let stageDesc = funnelStage == 1 ? "一阶段初筛" : (funnelStage == 2 ? "二阶段加压决选" : "测速中")
+        let stageDesc = activeRunKind == .patrol ? "智能巡检" : (funnelStage == 1 ? "一阶段初筛" : (funnelStage == 2 ? "二阶段加压决选" : "测速中"))
         self.runner = runner; status.stringValue = "\(stageDesc)：全局最多 \(batch.parallel) 个节点，可停止。"
         updateControls(); startTestingMotionTimerIfNeeded(); runner.start()
     }
@@ -5591,7 +5837,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         guard !closed, busy, currentBatch != nil, !liveProgressByIdentity.isEmpty else { return }
         lastLiveStatusUpdateAt = ProcessInfo.processInfo.systemUptime
         let done = rows.filter { runIdentities.contains($0.identity) && $0.state != "等待" }.count
-        let stageDesc = funnelStage == 1 ? "一阶段初筛" : (funnelStage == 2 ? "二阶段加压决选" : "测速中")
+        let stageDesc = activeRunKind == .patrol ? "智能巡检" : (funnelStage == 1 ? "一阶段初筛" : (funnelStage == 2 ? "二阶段加压决选" : "测速中"))
         let activeLive = liveProgressByIdentity.values
         let downloading = activeLive.filter { $0.phase == .download }
         if !downloading.isEmpty {
@@ -5753,8 +5999,8 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
         copyButton.isEnabled = true
         let done = rows.filter { runIdentities.contains($0.identity) && $0.state != "等待" }.count
-        let stageDesc = funnelStage == 1 ? "一阶段初筛" : (funnelStage == 2 ? "二阶段加压决选" : "测速中")
-        status.stringValue = "\(stageDesc)：已处理 \(done) / \(runIdentities.count)；完成后按综合评分排序。"
+        let stageDesc = activeRunKind == .patrol ? "智能巡检" : (funnelStage == 1 ? "一阶段初筛" : (funnelStage == 2 ? "二阶段加压决选" : "测速中"))
+        status.stringValue = activeRunKind == .patrol ? "\(stageDesc)：已处理 \(done) / \(runIdentities.count)；结果将归档至长效优选榜。" : "\(stageDesc)：已处理 \(done) / \(runIdentities.count)；完成后按综合评分排序。"
         updateDockAndProgressState()
         updateChampionCard()
     }
@@ -6360,8 +6606,10 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     func buildTSVExportPayload() -> (content: String, filename: String, isHistory: Bool)? {
         if viewMode == .history {
             guard !historyVisibleIndices.isEmpty else { return nil }
+            let checkedIndices = historyVisibleIndices.filter { historySelection.contains(historySummaries[$0].identity) }
+            let exportIndices = checkedIndices.isEmpty ? historyVisibleIndices : checkedIndices
             let header = "排名\t状态\t订阅\t节点\t类型\t稳健吞吐\t典型延迟\t可用率\t样本\t长效稳健分\t基础分\t健康扣分"
-            let lines = historyVisibleIndices.enumerated().map { rankIdx, idx -> String in
+            let lines = exportIndices.enumerated().map { rankIdx, idx -> String in
                 let s = historySummaries[idx]
                 let tier = s.healthPenalty > 0 ? "扣分" : (s.isQualified ? "主力" : "待验")
                 let speed = s.successCount > 0 ? String(format: "%.2f MiB/s", s.weightedMedianSpeedBytesPerSecond / 1_048_576) : "—"
@@ -6427,9 +6675,12 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         guard let table = notification.object as? NSTableView, table === resultTable else { return }
         if !reloadingVisibleRows, !busy, !groupRefreshInFlight {
             if viewMode == .history {
-                if historyVisibleIndices.indices.contains(table.selectedRow) {
+                let countSel = table.selectedRowIndexes.count
+                if countSel > 1 {
+                    status.stringValue = "长效榜已多选 \(countSel) 行；按空格勾选、⌘C 复制名称，或右键 / 点击上方按钮批量测速。"
+                } else if historyVisibleIndices.indices.contains(table.selectedRow) {
                     let s = historySummaries[historyVisibleIndices[table.selectedRow]]
-                    status.stringValue = "长效榜选中：\(displayProfileName(for: s)) / \(s.nodeName)（\(String(format: "%.1f", s.longTermScore)) 分）；点击下方按钮可切换。"
+                    status.stringValue = "长效榜选中：\(displayProfileName(for: s)) / \(s.nodeName)（\(String(format: "%.1f", s.longTermScore)) 分）；按空格可多选，点击下方按钮可切换。"
                 }
             } else if visibleRows.indices.contains(table.selectedRow) {
                 let selected = rows[visibleRows[table.selectedRow]]
@@ -6454,23 +6705,38 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         ])
         return cell
     }
-    private func nodeNameCell(_ name: String, isCurrentActive: Bool, toolTip: String? = nil) -> NSView {
+    private func nodeNameCell(_ name: String, isCurrentActive: Bool, toolTip: String? = nil,
+                              tierBadge: (text: String, textColor: NSColor, fillColor: NSColor)? = nil) -> NSView {
         let field = NSTextField(labelWithString: name)
         field.font = .systemFont(ofSize: 12.5, weight: isCurrentActive ? .semibold : .medium)
         field.textColor = MultiPalette.text
         field.lineBreakMode = .byTruncatingTail
         field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        if !isCurrentActive {
+        if !isCurrentActive && tierBadge == nil {
             field.toolTip = toolTip
             return centeredCell(field, align: .left)
         }
-        let activeLbl = NSTextField(labelWithString: "当前")
-        activeLbl.font = .systemFont(ofSize: 9.5, weight: .bold)
-        activeLbl.textColor = MultiPalette.success
-        let badge = pillBadge(activeLbl, fill: MultiPalette.successSurface, fillAlpha: 1.0, cornerRadius: 5, hPad: 5, vPad: 1.5)
-        badge.setContentHuggingPriority(.required, for: .horizontal)
-        badge.setContentCompressionResistancePriority(.required, for: .horizontal)
-        let stack = row([field, badge], spacing: 6)
+        var views: [NSView] = []
+        if let tier = tierBadge {
+            let tierLbl = NSTextField(labelWithString: tier.text)
+            tierLbl.font = .systemFont(ofSize: 9.5, weight: .semibold)
+            tierLbl.textColor = tier.textColor
+            let tierPill = pillBadge(tierLbl, fill: tier.fillColor, fillAlpha: 1.0, cornerRadius: 5, hPad: 5, vPad: 1.5)
+            tierPill.setContentHuggingPriority(.required, for: .horizontal)
+            tierPill.setContentCompressionResistancePriority(.required, for: .horizontal)
+            views.append(tierPill)
+        }
+        views.append(field)
+        if isCurrentActive {
+            let activeLbl = NSTextField(labelWithString: "当前")
+            activeLbl.font = .systemFont(ofSize: 9.5, weight: .bold)
+            activeLbl.textColor = MultiPalette.success
+            let badge = pillBadge(activeLbl, fill: MultiPalette.successSurface, fillAlpha: 1.0, cornerRadius: 5, hPad: 5, vPad: 1.5)
+            badge.setContentHuggingPriority(.required, for: .horizontal)
+            badge.setContentCompressionResistancePriority(.required, for: .horizontal)
+            views.append(badge)
+        }
+        let stack = row(views, spacing: 5)
         stack.translatesAutoresizingMaskIntoConstraints = false
         let cell = NSTableCellView()
         cell.textField = field
@@ -6585,7 +6851,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         let text = cells(item)[index]
         if id == "type" && text != "—" {
             return badgeCell(text.uppercased(), textColor: MultiPalette.muted, fillColor: MultiPalette.elevated,
-                             font: .monospacedSystemFont(ofSize: 10.5, weight: .semibold), align: .center)
+                             font: .monospacedSystemFont(ofSize: 9.5, weight: .semibold), align: .center)
         }
         if id == "node" {
             let isCurrentActive = (activeClashNodeIdentity() == item.identity)
@@ -6681,8 +6947,9 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     private func syncResultTableColumnsForViewMode() {
+        resultTable.allowsMultipleSelection = (viewMode == .history)
         let titles: [String: String] = (viewMode == .history)
-            ? ["check": "状态", "rank": "#", "profile": "订阅", "node": "节点名称", "type": "协议",
+            ? ["check": "选择", "rank": "#", "profile": "订阅", "node": "节点名称", "type": "协议",
                "speed": "稳健吞吐", "latency": "典型延迟", "failure": "可用率", "jitter": "样本", "score": "长效稳健分"]
             : ["check": "测速", "rank": "#", "profile": "订阅", "node": "节点名称", "type": "协议",
                "speed": "验证吞吐", "latency": "延迟", "failure": "丢包率", "jitter": "抖动", "score": "综合评分"]
@@ -6760,6 +7027,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                 self.patrolLastSummaryText = ""
                 self.historySummaries = []
                 self.historyVisibleIndices = []
+                self.historySelection.removeAll()
                 self.resultTable.reloadData()
                 self.status.stringValue = "已清空全部长效历史记录与健康探测数据。"
                 self.updateControls()
@@ -6796,9 +7064,12 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private func reloadVisibleHistoryRows() {
         reloadingVisibleRows = true
         defer { reloadingVisibleRows = false }
-        let selectedIdentity: TelemetryIdentity? = historyVisibleIndices.indices.contains(resultTable.selectedRow)
-            ? historySummaries[historyVisibleIndices[resultTable.selectedRow]].identity
-            : nil
+        let selectedIdentities = Set(resultTable.selectedRowIndexes.compactMap { rowIdx -> TelemetryIdentity? in
+            guard historyVisibleIndices.indices.contains(rowIdx) else { return nil }
+            return historySummaries[historyVisibleIndices[rowIdx]].identity
+        })
+        let validAll = Set(historySummaries.map(\.identity))
+        historySelection = historySelection.intersection(validAll)
         historyVisibleIndices = multiVisibleHistoryIndices(
             historySummaries,
             query: historySearch.stringValue,
@@ -6809,13 +7080,19 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         )
         if viewMode == .history {
             resultTable.reloadData()
-            if let selectedIdentity,
-               let rowIdx = historyVisibleIndices.firstIndex(where: { historySummaries[$0].identity == selectedIdentity }) {
-                resultTable.selectRowIndexes(IndexSet(integer: rowIdx), byExtendingSelection: false)
+            var restoredRows = IndexSet()
+            for (visIdx, summaryIdx) in historyVisibleIndices.enumerated() {
+                if selectedIdentities.contains(historySummaries[summaryIdx].identity) {
+                    restoredRows.insert(visIdx)
+                }
+            }
+            if !restoredRows.isEmpty {
+                resultTable.selectRowIndexes(restoredRows, byExtendingSelection: false)
             } else {
                 resultTable.deselectAll(nil)
             }
-            historyCountLabel.stringValue = "\(historyVisibleIndices.count) 候选"
+            let checkedVis = historyVisibleIndices.filter { historySelection.contains(historySummaries[$0].identity) }.count
+            historyCountLabel.stringValue = checkedVis > 0 ? "已选 \(checkedVis) / \(historyVisibleIndices.count)" : "\(historyVisibleIndices.count) 候选"
             updateHistoryChampionCard()
         }
     }
@@ -6882,28 +7159,14 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     private func historyTableCell(columnId: String, row: Int, summary: TelemetryNodeSummary) -> NSView? {
         if columnId == "check" {
-            let text: String
-            let textColor: NSColor
-            let fillColor: NSColor
-            if summary.healthPenalty > 0 {
-                text = "扣分"
-                textColor = MultiPalette.danger
-                fillColor = MultiPalette.elevated
-            } else if summary.isQualified {
-                text = "主力"
-                textColor = MultiPalette.success
-                fillColor = MultiPalette.successSurface
-            } else {
-                text = "待验"
-                textColor = MultiPalette.muted
-                fillColor = MultiPalette.elevated
-            }
-            let badge = badgeCell(text, textColor: textColor, fillColor: fillColor,
-                                  font: .systemFont(ofSize: 10, weight: .semibold), align: .center)
-            badge.toolTip = summary.healthPenalty > 0
-                ? String(format: "活跃健康异常：连续异常权重 %.1f，当前扣分 -%.1f", summary.activeFailureStreak, summary.healthPenalty)
-                : (summary.isQualified ? "已满足 ≥3 次成功且可用率 ≥50% 主力资格" : "有效样本不足 3 次或可用率低于 50%")
-            return badge
+            let check = MultiNodeCheckbox(checkboxWithTitle: "", target: self, action: #selector(toggleHistoryNode(_:)))
+            check.imagePosition = .imageOnly
+            check.alignment = .center
+            check.telemetryIdentity = summary.identity
+            check.state = historySelection.contains(summary.identity) ? .on : .off
+            check.isEnabled = !busy
+            check.toolTip = "勾选参与批量复测、同步到实时队列或导出 TSV（也可按 ⌘/⇧ 多选后按空格勾选）"
+            return check
         }
         if columnId == "type" {
             let typeText = summary.nodeType.isEmpty ? "—" : summary.nodeType.uppercased()
@@ -6912,7 +7175,7 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                 return centeredCell(f, align: .center)
             }
             return badgeCell(typeText, textColor: MultiPalette.muted, fillColor: MultiPalette.elevated,
-                             font: .monospacedSystemFont(ofSize: 10.5, weight: .semibold), align: .center)
+                             font: .monospacedSystemFont(ofSize: 9.5, weight: .semibold), align: .center)
         }
         if columnId == "speed" {
             if summary.successCount > 0 {
@@ -6971,10 +7234,20 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             font = .systemFont(ofSize: 12, weight: .regular)
         case "node":
             let isActive = (activeClashNodeIdentity() == MultiIdentity(profile: summary.identity.profile, node: summary.nodeName))
-            let tip = summary.healthPenalty > 0
-                ? String(format: "活跃健康异常：连续异常扣分 -%.1f", summary.healthPenalty)
-                : (isActive ? "当前 Clash Verge 策略组正在使用此节点" : summary.nodeName)
-            return nodeNameCell(summary.nodeName, isCurrentActive: isActive, toolTip: tip)
+            let tier: (text: String, textColor: NSColor, fillColor: NSColor)
+            let tierTip: String
+            if summary.healthPenalty > 0 {
+                tier = ("扣分", MultiPalette.danger, MultiPalette.elevated)
+                tierTip = String(format: "活跃健康异常：连续异常权重 %.1f，当前扣分 -%.1f", summary.activeFailureStreak, summary.healthPenalty)
+            } else if summary.isQualified {
+                tier = ("主力", MultiPalette.success, MultiPalette.successSurface)
+                tierTip = "已满足 ≥3 次成功且可用率 ≥50% 主力资格"
+            } else {
+                tier = ("待验", MultiPalette.muted, MultiPalette.elevated)
+                tierTip = "有效样本不足 3 次或可用率低于 50%"
+            }
+            let tip = isActive ? "\(summary.nodeName)（当前使用中 · \(tierTip)）" : "\(summary.nodeName)（\(tierTip)）"
+            return nodeNameCell(summary.nodeName, isCurrentActive: isActive, toolTip: tip, tierBadge: tier)
         case "latency":
             text = summary.successCount > 0 ? String(format: "%.1f ms", summary.weightedMedianLatencyMs) : "—"
             align = .right
@@ -7090,6 +7363,77 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
     }
 
+    private enum MultiHistoryBatchMode {
+        case standard, load20M, funnel, syncOnly
+    }
+    private func launchHistoryBatch(_ summaries: [TelemetryNodeSummary], mode: MultiHistoryBatchMode) {
+        guard !busy, !groupRefreshInFlight, !closed else { return }
+        let resolvable = summaries.filter { canResolveRegistryOption(for: $0) }
+        guard !resolvable.isEmpty else {
+            status.stringValue = "所选长效节点所属订阅已不存在，请刷新订阅配置。"
+            return
+        }
+        let desiredIDs = Set(resolvable.map { MultiIdentity(profile: $0.identity.profile, node: $0.nodeName) })
+        let neededProfiles = Set(resolvable.map { $0.identity.profile })
+        let firstID = MultiIdentity(profile: resolvable[0].identity.profile, node: resolvable[0].nodeName)
+        func applyAndExecute() {
+            let available = Set(rows.map(\.identity))
+            let matched = desiredIDs.intersection(available)
+            guard !matched.isEmpty else {
+                status.stringValue = "所选长效节点在当前订阅配置中已不存在，请刷新配置。"
+                updateControls()
+                return
+            }
+            nodeSearch.stringValue = ""
+            statusFilter = .all
+            setViewMode(.live, announce: false)
+            disarm(); pendingWinner = nil; pendingManual = nil; funnelStage = 0; funnelPromotedSelection = nil
+            nodeSelection = matched
+            reloadVisibleRows(preserving: firstID)
+            if let visIdx = visibleRows.firstIndex(where: { rows[$0].identity == firstID }) {
+                resultTable.selectRowIndexes(IndexSet(integer: visIdx), byExtendingSelection: false)
+                resultTable.scrollRowToVisible(visIdx)
+            }
+            updateControls()
+            switch mode {
+            case .syncOnly:
+                status.stringValue = "已将 \(matched.count) 个长效节点同步勾选到实时测速队列。"
+            case .standard:
+                startManual(startButton)
+            case .load20M:
+                startLoadTest(loadTestButton)
+            case .funnel:
+                startFunnelTest(funnelButton)
+            }
+        }
+        let previewHasAll = selectionPreview != nil && desiredIDs.isSubset(of: Set(rows.map(\.identity)))
+        if previewHasAll {
+            applyAndExecute()
+            return
+        }
+        for pid in neededProfiles { selected.insert(pid) }
+        setViewMode(.live, announce: false)
+        cancelled = false; busy = true; updateControls()
+        status.stringValue = "正在载入已选长效节点所属的 \(neededProfiles.count) 个订阅…"
+        let root = self.root, reg = self.registry, sel = self.selected
+        let opts = MultiBatchOptions(downloadBytes: 256 * 1024, streams: 2, latencyTimeout: "3s", downloadTimeout: "3s")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let batch = try? multiPrepare(root: root, registry: reg, selected: sel, options: opts, parallel: 1, previewOnly: true)
+            DispatchQueue.main.async {
+                guard let self, !self.closed else { return }
+                self.busy = false
+                guard !self.cancelled, let batch else {
+                    self.status.stringValue = "无法载入所选长效节点所属订阅，请刷新后重试。"
+                    self.updateControls()
+                    return
+                }
+                self.selectionPreview = batch
+                self.rows = multiPreviewRows(batch)
+                applyAndExecute()
+            }
+        }
+    }
+
     @objc private func patrolQuotaChanged(_ sender: Any?) {
 #if !MULTI_UI_TEST
         saveErgonomicPreferences()
@@ -7133,7 +7477,8 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                 self.cachedPatrolBytesToday = self.telemetryStore.patrolBytesUsedToday()
                 self.patrolButton.title = "停止巡检"
                 let intervalMin = Int(interval / 60)
-                self.status.stringValue = "智能巡检已开启：每 \(intervalMin) 分钟最多抽测 8 节点（1MiB/2流，日配额 \(quotaMiB) MiB，不改节点勾选、不自动切换）。"
+                let batchCap = self.currentPatrolMaxPerTick
+                self.status.stringValue = "智能巡检已开启：每 \(intervalMin) 分钟最多抽测 \(batchCap) 节点（1MiB/2流，日配额 \(quotaMiB) MiB，晚高峰预留 25%，不改节点勾选、不自动切换）。"
                 self.updateControls()
             }
         }
@@ -7141,6 +7486,14 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     private func pollPatrolSchedule() {
         guard !closed else { return }
+        if !Calendar.current.isDateInToday(cachedPatrolQuotaDay) {
+            cachedPatrolQuotaDay = Calendar.current.startOfDay(for: Date())
+            cachedPatrolBytesToday = telemetryStore.patrolBytesUsedToday()
+            if patrolLastSummaryText == "今日配额已满" || patrolLastSummaryText == "晚高峰配额预留中" {
+                patrolLastSummaryText = ""
+            }
+            updatePatrolStatusText()
+        }
         switch patrolSchedule.pollDue(now: TestSchedule.monotonicNow(), externalBusy: busy || groupRefreshInFlight) {
         case .started(let token):
             guard let armedPreview = patrolArmedBatch else {
@@ -7170,24 +7523,38 @@ final class MultiAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             activeToken = token; busy = true; updateControls()
             status.stringValue = "智能巡检到期，正在挑选守擂与探索节点…"
             let quotaBytes = currentPatrolQuotaBytes
+            let batchCap = currentPatrolMaxPerTick
             let root = self.root
-            telemetryStore.selectPatrolPlanAsync(candidates: candidates, dailyQuotaBytes: quotaBytes, perNodeBytes: 1_048_576, maxPerTick: 8) { [weak self] plan in
+            telemetryStore.selectPatrolPlanAsync(candidates: candidates, dailyQuotaBytes: quotaBytes, perNodeBytes: 1_048_576, maxPerTick: batchCap, reservePeakRatio: 0.25, overnightThrottle: true) { [weak self] plan in
                 guard let self, !self.closed else { return }
                 guard self.allowed(token, scheduled: true) else {
                     self.abort(token, "智能巡检已停止。")
                     return
                 }
                 self.cachedPatrolBytesToday = max(0, quotaBytes - plan.remainingQuotaBytes)
+                self.cachedPatrolQuotaDay = Calendar.current.startOfDay(for: Date())
                 guard !plan.identities.isEmpty else {
-                    self.patrolLastSummaryText = "今日配额已满"
-                    self.abort(token, "今日智能巡检配额已用完（\(quotaBytes / 1_048_576) MiB/天），明日自动恢复。")
+                    if plan.deferredForPeakQuota {
+                        let reserveMiB = max(1, plan.peakReservedBytes / 1_048_576)
+                        self.patrolLastSummaryText = "晚高峰配额预留中"
+                        self.abort(token, "白天巡检预算已达上限，已为 20:00 晚高峰保留 \(reserveMiB) MiB，到点自动恢复。")
+                    } else if plan.remainingQuotaBytes < 1_048_576 {
+                        self.patrolLastSummaryText = "今日配额已满"
+                        self.abort(token, "今日智能巡检配额已用完（\(quotaBytes / 1_048_576) MiB/天），明日自动恢复。")
+                    } else if plan.skippedCooldownCount > 0 || plan.skippedBackoffCount > 0 {
+                        self.patrolLastSummaryText = "冷却/退避等待中"
+                        self.abort(token, "本轮巡检跳过：\(plan.skippedCooldownCount) 个节点近期已测在冷却期、\(plan.skippedBackoffCount) 个连续失败节点在退避期，稍后自动复查。")
+                    } else {
+                        self.patrolLastSummaryText = "暂无待巡检节点"
+                        self.abort(token, "当前没有待巡检的节点。")
+                    }
                     return
                 }
                 let nodeSet = Set(plan.identities.map { MultiIdentity(profile: $0.profile, node: $0.node) })
                 let selectedProfiles = Set(armedPreview.profiles.map(\.option.id))
                 let inheritedServerURL = self.chosenOptions()?.0.serverURL ?? armedPreview.options.serverURL
                 let patrolOptions = MultiBatchOptions(downloadBytes: 1_048_576, streams: 2, latencyTimeout: "3s", downloadTimeout: "3s", serverURL: inheritedServerURL)
-                let patrolParallel = min(4, max(1, nodeSet.count))
+                let patrolParallel = min(2, max(1, nodeSet.count))
                 DispatchQueue.global(qos: .userInitiated).async {
                     let prepared = try? multiPrepare(root: root, registry: armedPreview.registry, selected: selectedProfiles,
                                                      options: patrolOptions, parallel: patrolParallel, nodeSelection: nodeSet)

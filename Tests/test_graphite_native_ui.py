@@ -46,7 +46,7 @@ extension MultiAppDelegate {
         let groups: [[(String, NSView)]] = [
             [("liveMode", liveModeButton), ("historyMode", historyModeButton), ("export", copyButton), ("funnel", funnelButton), ("load", loadTestButton), ("stop", stopButton), ("start", startButton)],
             [("parallel", parallelBox), ("size", sizePopup), ("mode", modePopup), ("interval", intervalPopup), ("schedule", scheduleButton)],
-            [("patrolQuota", patrolQuotaPopup), ("patrol", patrolButton), ("trayToggle", trayMinimizeButton), ("health", healthStatusPill)],
+            [("patrolQuota", patrolQuotaPopup), ("patrol", patrolButton), ("patrolInfo", patrolInfoButton), ("trayToggle", trayMinimizeButton), ("health", healthStatusPill)],
             [("hideTray", hideToTrayButton), ("switchResult", switchResultButton)],
             [("all", filterAllButton), ("valid", filterValidButton), ("testing", filterTestingButton), ("failed", filterFailedButton), ("search", nodeSearch), ("topN", topNBox), ("choose", selectTopNButton), ("checkAll", selectShownButton), ("clear", clearShownButton)]
         ]
@@ -98,7 +98,7 @@ extension MultiAppDelegate {
             _ = RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02))
         }
         let historyGroups: [[(String, NSView)]] = [
-            [("win24h", historyWin24hButton), ("win7d", historyWin7dButton), ("win30d", historyWin30dButton), ("winPeak", historyWinPeakButton), ("selOnly", historySelectedOnlyButton), ("hSearch", historySearch), ("clearHist", clearHistoryButton)]
+            [("win24h", historyWin24hButton), ("win7d", historyWin7dButton), ("win30d", historyWin30dButton), ("winPeak", historyWinPeakButton), ("hAll", historySelectAllButton), ("hClear", historyClearSelectionButton), ("selOnly", historySelectedOnlyButton), ("hSearch", historySearch), ("clearHist", clearHistoryButton)]
         ]
         for width in [1240.0, 1080.0] {
             try save("native-history-dark-\(Int(width)).png", NSSize(width: width, height: width == 1080 ? 700 : 800), .darkAqua)
@@ -401,6 +401,48 @@ extension MultiAppDelegate {
               livePayload != nil && livePayload!.filename == "clash-speed-results.tsv" && !livePayload!.isHistory && livePayload!.content.contains("原序号\t订阅"))
         exportTSVFile(nil)
         check("exportTSVFile updates status and copies payload", status.stringValue.contains("已导出 TSV 并复制到剪贴板"))
+
+        // Patrol feature explanation tooltip & popover check
+        let patrolTip = patrolButton.toolTip ?? ""
+        check("patrol button tooltip explains feature and daily quota",
+              patrolTip.contains("智能巡检") && patrolTip.contains("分钟") && patrolTip.contains("晚高峰") && patrolTip.contains("不会自动切换"))
+        check("patrol info button shares feature explanation tooltip",
+              (patrolInfoButton.toolTip ?? "").contains("智能巡检"))
+        togglePatrolInfoPopover(nil)
+        check("patrol info popover builds readable explanation view",
+              patrolInfoPopover?.contentViewController?.view != nil && (patrolInfoPopover?.contentSize.width ?? 0) >= 300)
+
+        // History leaderboard multi-selection (native multi-row + checkbox + Space + Cmd+C + context menu + TSV subset)
+        historyModeButton.performClick(nil)
+        let histMultiDeadline = ProcessInfo.processInfo.systemUptime + 5
+        while historySummaries.count < 2 && ProcessInfo.processInfo.systemUptime < histMultiDeadline {
+            _ = RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02))
+        }
+        check("history mode enables native table multiple selection",
+              viewMode == .history && resultTable.allowsMultipleSelection && resultTable.tableColumns.first?.title == "选择")
+        resultTable.selectRowIndexes(IndexSet([0, 1]), byExtendingSelection: false)
+        let toggledHistSpace = toggleSelectedRowWithSpace()
+        check("Space key batch-checks multiple highlighted history rows",
+              toggledHistSpace && historySelection.count == 2 && historyCountLabel.stringValue.contains("已选 2 /"))
+        updateRowContextMenu()
+        check("history context menu shows batch actions for multi-selection",
+              rowMenuRetestItem.title.contains("批量 20MiB") && rowMenuJumpLiveItem.title.contains("同步到实时队列") && rowMenuCopyNameItem.title.contains("(2 个)"))
+        let copiedMultiHist = copySelectedRowWithShortcut()
+        let pbMulti = NSPasteboard.general.string(forType: .string) ?? ""
+        check("Cmd+C copies all multi-selected history node names",
+              copiedMultiHist && pbMulti.split(separator: "\n").count == 2)
+        let histTsv = buildTSVExportPayload()
+        check("history TSV export narrows to checked subset when selected",
+              histTsv != nil && histTsv!.isHistory && histTsv!.content.split(separator: "\n").count == 3)
+        historySelectAllVisible(nil)
+        check("historySelectAllVisible selects every visible candidate",
+              historySelection.count == historyVisibleIndices.count)
+        historyClearSelection(nil)
+        check("historyClearSelection clears all checked history candidates",
+              historySelection.isEmpty && historyCountLabel.stringValue.hasSuffix("候选"))
+        liveModeButton.performClick(nil)
+        check("returning to live mode restores single-row selection policy",
+              viewMode == .live && !resultTable.allowsMultipleSelection)
 
         let termWhileIdle = applicationShouldTerminate(NSApp)
         check("applicationShouldTerminate exits cleanly when idle", termWhileIdle == .terminateNow && closed)

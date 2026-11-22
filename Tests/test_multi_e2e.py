@@ -403,25 +403,48 @@ private extension MultiAppDelegate {
                   !schedule.isArmed else {
                 return fail("patrol-arm-mutex")
             }
-            for tick in 1...3 {
+            // 50 MiB/天 paces at 4 nodes/tick daytime (2 nodes/tick during 01:00-07:00 overnight),
+            // interleaving across profiles from tick 1 and skipping cooled nodes so all 14 nodes are
+            // covered in exact 14 MiB with zero wasted duplicate probes.
+            let expectedStep = telemetryEffectivePatrolBatchCap(maxPerTick: 4, now: Date().timeIntervalSince1970, overnightThrottle: true)
+            var expectedSamples = 0
+            var tickNum = 0
+            while expectedSamples < 14 && tickNum < 10 {
+                tickNum += 1
+                let step = min(expectedStep, 14 - expectedSamples)
+                expectedSamples += step
                 Fixture.clockOffset += 3601
                 pollPatrolSchedule()
                 guard wait(35, { idle() }),
-                      wait(10, { self.telemetryStore.sampleCount() == tick * 8 }) else {
+                      wait(10, { self.telemetryStore.sampleCount() == expectedSamples }) else {
                     return fail("patrol-tick-run")
+                }
+                if tickNum == 1 {
+                    let tick1Profiles = Set(telemetryStore.computeSummaries(window: .days7).map(\.profileUID))
+                    guard tick1Profiles.count == 2 else { return fail("patrol-tick1-multisub-fairness") }
                 }
                 guard patrolSchedule.isArmed, !schedule.isArmed,
                       nodeSelection == expectedSelection,
                       rows.count == 14, noPut(),
-                      cachedPatrolBytesToday == tick * 8 * 1_048_576 else {
+                      cachedPatrolBytesToday == expectedSamples * 1_048_576 else {
                     return fail("patrol-tick-invariants")
                 }
             }
             let covered = Set(telemetryStore.computeSummaries(window: .days7).map(\.identity))
-            guard covered.count == 14 else { return fail("patrol-rotation-coverage") }
+            guard covered.count == 14, expectedSamples == 14 else { return fail("patrol-rotation-coverage") }
+            // Next immediate tick (all 14 freshly tested inside cooldown) must skip cleanly without false quota-full status.
+            Fixture.clockOffset += 3601
+            pollPatrolSchedule()
+            guard wait(10, { idle() }),
+                  patrolLastSummaryText == "冷却/退避等待中",
+                  status.stringValue.contains("冷却期"),
+                  telemetryStore.sampleCount() == 14,
+                  noPut() else {
+                return fail("patrol-cooldown-skip")
+            }
             let nowTs = Date().timeIntervalSince1970
             let aNodes = (1...12).map { String(format: "A%02d", $0) }
-            for idx in 0..<26 {
+            for idx in 0..<36 {
                 let nodeName = aNodes[idx % aNodes.count]
                 telemetryStore.recordSample(TelemetrySampleRecord(
                     timestamp: nowTs, profileUID: "a", profileName: "Synthetic-A",
@@ -1229,7 +1252,7 @@ def check_events(case, worker_events, scenario):
         require(starts == 42 and sizes == [3145728] * 28 + [20971520] * 14 and peak >= 2,
                 'history archive worker count/size mismatch')
     elif scenario == 'patrol-rotation-and-quota':
-        require(starts == 24 and sizes == [1048576] * 24 and peak >= 2 and peak <= 4,
+        require(starts == 14 and sizes == [1048576] * 14 and peak == 2,
                 'patrol worker count/size/peak mismatch')
     elif scenario == 'health-penalty-probe':
         require(starts == 8 and sizes == [3145728] * 8 and peak == 2,

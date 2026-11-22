@@ -213,6 +213,33 @@ public struct TelemetryPatrolSelection: Sendable, Equatable {
     public let defenderCount: Int
     public let explorerCount: Int
     public let remainingQuotaBytes: Int
+    public let deferredForPeakQuota: Bool
+    public let peakReservedBytes: Int
+    public let skippedBackoffCount: Int
+    public let skippedCooldownCount: Int
+    public let effectiveMaxPerTick: Int
+
+    public init(
+        identities: [TelemetryIdentity],
+        defenderCount: Int,
+        explorerCount: Int,
+        remainingQuotaBytes: Int,
+        deferredForPeakQuota: Bool = false,
+        peakReservedBytes: Int = 0,
+        skippedBackoffCount: Int = 0,
+        skippedCooldownCount: Int = 0,
+        effectiveMaxPerTick: Int = 0
+    ) {
+        self.identities = identities
+        self.defenderCount = defenderCount
+        self.explorerCount = explorerCount
+        self.remainingQuotaBytes = remainingQuotaBytes
+        self.deferredForPeakQuota = deferredForPeakQuota
+        self.peakReservedBytes = peakReservedBytes
+        self.skippedBackoffCount = skippedBackoffCount
+        self.skippedCooldownCount = skippedCooldownCount
+        self.effectiveMaxPerTick = effectiveMaxPerTick
+    }
 }
 
 public func telemetryIsPeakHour(timestamp: TimeInterval, calendar: Calendar = .current) -> Bool {
@@ -222,6 +249,36 @@ public func telemetryIsPeakHour(timestamp: TimeInterval, calendar: Calendar = .c
     guard let hour = comps.hour, let minute = comps.minute else { return false }
     let minutes = hour * 60 + minute
     return minutes >= (20 * 60) && minutes < (23 * 60 + 30)
+}
+
+public func telemetryIsBeforePeakHour(timestamp: TimeInterval, calendar: Calendar = .current) -> Bool {
+    guard timestamp.isFinite else { return false }
+    let date = Date(timeIntervalSince1970: timestamp)
+    let comps = calendar.dateComponents([.hour, .minute], from: date)
+    guard let hour = comps.hour, let minute = comps.minute else { return false }
+    return (hour * 60 + minute) < (20 * 60)
+}
+
+public func telemetryIsOvernightHour(timestamp: TimeInterval, calendar: Calendar = .current) -> Bool {
+    guard timestamp.isFinite else { return false }
+    let date = Date(timeIntervalSince1970: timestamp)
+    let comps = calendar.dateComponents([.hour, .minute], from: date)
+    guard let hour = comps.hour, let minute = comps.minute else { return false }
+    let minutes = hour * 60 + minute
+    return minutes >= (1 * 60) && minutes < (7 * 60)
+}
+
+public func telemetryEffectivePatrolBatchCap(
+    maxPerTick: Int,
+    now: TimeInterval = Date().timeIntervalSince1970,
+    calendar: Calendar = .current,
+    overnightThrottle: Bool = false
+) -> Int {
+    guard maxPerTick > 0 else { return 0 }
+    if overnightThrottle && telemetryIsOvernightHour(timestamp: now, calendar: calendar) {
+        return min(maxPerTick, max(2, maxPerTick / 2))
+    }
+    return maxPerTick
 }
 
 public func telemetryPayloadWeight(requestedBytes: Int) -> Double {
@@ -548,7 +605,14 @@ public func telemetryPatrolBytesUsedToday(
     let endTs = nextDay.timeIntervalSince1970
     var total = 0
     for s in samples where s.source == .patrol && s.timestamp >= startTs && s.timestamp < endTs {
-        total += max(0, s.requestedBytes)
+        let req = max(0, s.requestedBytes)
+        if s.isSuccess {
+            total += req
+        } else {
+            // Failed or timed-out probes never completed the full download;
+            // charge a bounded anti-spin cost (<= 256 KiB) instead of full 1 MiB.
+            total += min(req, 262_144)
+        }
     }
     return total
 }
@@ -561,67 +625,281 @@ public func telemetrySelectPatrolIdentities(
     perNodeBytes: Int = 1_048_576,
     maxPerTick: Int = 8,
     now: TimeInterval = Date().timeIntervalSince1970,
-    calendar: Calendar = .current
+    calendar: Calendar = .current,
+    reservePeakRatio: Double = 0.0,
+    defenderCooldownSeconds: TimeInterval = 5400.0,
+    overnightThrottle: Bool = false
 ) -> TelemetryPatrolSelection {
     let usedToday = telemetryPatrolBytesUsedToday(samples: samples, now: now, calendar: calendar)
     let remaining = max(0, dailyQuotaBytes - usedToday)
-    guard perNodeBytes > 0, maxPerTick > 0 else {
-        return TelemetryPatrolSelection(identities: [], defenderCount: 0, explorerCount: 0, remainingQuotaBytes: remaining)
+    let clampedReserveRatio = min(0.5, max(0.0, reservePeakRatio))
+    let isPeakNow = telemetryIsPeakHour(timestamp: now, calendar: calendar)
+    // Reserve peak budget only BEFORE 20:00 (00:00-19:59). Once 20:00 arrives,
+    // unlock remaining quota for both peak (20:00-23:30) and post-peak (23:30-23:59).
+    let isBeforePeak = telemetryIsBeforePeakHour(timestamp: now, calendar: calendar)
+    let peakReservedBytes = (isBeforePeak && clampedReserveRatio > 0)
+        ? Int(Double(max(0, dailyQuotaBytes)) * clampedReserveRatio)
+        : 0
+    let spendableNow = max(0, remaining - peakReservedBytes)
+    let effectiveBatchCap = telemetryEffectivePatrolBatchCap(
+        maxPerTick: maxPerTick,
+        now: now,
+        calendar: calendar,
+        overnightThrottle: overnightThrottle
+    )
+
+    guard perNodeBytes > 0, effectiveBatchCap > 0 else {
+        return TelemetryPatrolSelection(
+            identities: [],
+            defenderCount: 0,
+            explorerCount: 0,
+            remainingQuotaBytes: remaining,
+            deferredForPeakQuota: false,
+            peakReservedBytes: peakReservedBytes,
+            effectiveMaxPerTick: effectiveBatchCap
+        )
     }
 
     var uniqueCandidates: [TelemetryIdentity] = []
     var seen = Set<TelemetryIdentity>()
+    var profileOrderMap: [Data: Int] = [:]
+    var profileCountMap: [Data: Int] = [:]
+    var roundRobinRankByIdentity: [TelemetryIdentity: (withinProfile: Int, profileOrder: Int)] = [:]
     for item in candidates where seen.insert(item).inserted {
         uniqueCandidates.append(item)
-    }
-
-    let affordable = remaining / perNodeBytes
-    let targetCount = min(maxPerTick, affordable, uniqueCandidates.count)
-    guard targetCount > 0 else {
-        return TelemetryPatrolSelection(identities: [], defenderCount: 0, explorerCount: 0, remainingQuotaBytes: remaining)
-    }
-
-    let summaries7d = telemetryComputeSummaries(samples: samples, healthEvents: healthEvents, window: .days7, now: now)
-        .filter { seen.contains($0.identity) && $0.successCount > 0 }
-
-    let defenderCap = targetCount <= 1 ? 0 : min(4, targetCount / 2)
-    var defenders: [TelemetryIdentity] = []
-    var pickedSet = Set<TelemetryIdentity>()
-    for summary in summaries7d {
-        if defenders.count >= defenderCap { break }
-        if pickedSet.insert(summary.identity).inserted {
-            defenders.append(summary.identity)
+        let pOrder: Int
+        if let existing = profileOrderMap[item.profile] {
+            pOrder = existing
+        } else {
+            pOrder = profileOrderMap.count
+            profileOrderMap[item.profile] = pOrder
         }
+        let within = profileCountMap[item.profile, default: 0]
+        profileCountMap[item.profile] = within + 1
+        roundRobinRankByIdentity[item] = (within, pOrder)
     }
 
+    let affordable = spendableNow / perNodeBytes
+    let targetCount = min(effectiveBatchCap, affordable, uniqueCandidates.count)
+    guard targetCount > 0 else {
+        let deferred = (remaining >= perNodeBytes && spendableNow < perNodeBytes && peakReservedBytes > 0)
+        return TelemetryPatrolSelection(
+            identities: [],
+            defenderCount: 0,
+            explorerCount: 0,
+            remainingQuotaBytes: remaining,
+            deferredForPeakQuota: deferred,
+            peakReservedBytes: peakReservedBytes,
+            effectiveMaxPerTick: effectiveBatchCap
+        )
+    }
+
+    // Today's 20:00 peak boundary (DST-safe via calendar components).
+    let nowDate = Date(timeIntervalSince1970: now)
+    var peakStartComps = calendar.dateComponents([.year, .month, .day], from: nowDate)
+    peakStartComps.hour = 20
+    peakStartComps.minute = 0
+    peakStartComps.second = 0
+    let todayPeakStartTs = calendar.date(from: peakStartComps)?.timeIntervalSince1970
+        ?? calendar.startOfDay(for: nowDate).addingTimeInterval(20.0 * 3600.0).timeIntervalSince1970
+
+    // Gather per-candidate recency, recent peak coverage, and trailing consecutive failure streak.
+    let sevenDayCutoff = now - 7.0 * 86400.0
+    var samplesByIdentity: [TelemetryIdentity: [TelemetrySampleRecord]] = [:]
     var lastSampleByIdentity: [TelemetryIdentity: TimeInterval] = [:]
+    var hasRecentPeakSample = Set<TelemetryIdentity>()
     for s in samples where s.timestamp.isFinite && s.timestamp <= now + 60.0 {
+        guard seen.contains(s.identity) else { continue }
+        samplesByIdentity[s.identity, default: []].append(s)
         if let prev = lastSampleByIdentity[s.identity] {
             if s.timestamp > prev { lastSampleByIdentity[s.identity] = s.timestamp }
         } else {
             lastSampleByIdentity[s.identity] = s.timestamp
         }
+        if s.isPeakHour && s.timestamp >= sevenDayCutoff {
+            hasRecentPeakSample.insert(s.identity)
+        }
     }
 
-    let explorerCandidates = uniqueCandidates.enumerated().filter { !pickedSet.contains($0.element) }
-        .sorted { lhs, rhs in
-            let lt = lastSampleByIdentity[lhs.element]
-            let rt = lastSampleByIdentity[rhs.element]
-            switch (lt, rt) {
-            case (nil, nil): return lhs.offset < rhs.offset
-            case (nil, _?): return true
-            case (_?, nil): return false
-            case let (a?, b?):
-                if a != b { return a < b }
-                return lhs.offset < rhs.offset
-            }
+    var consecutiveFailuresByIdentity: [TelemetryIdentity: Int] = [:]
+    for (identity, list) in samplesByIdentity {
+        let ordered = list.sorted { $0.timestamp > $1.timestamp }
+        var streak = 0
+        for item in ordered {
+            if item.isSuccess { break }
+            streak += 1
         }
+        if streak > 0 {
+            consecutiveFailuresByIdentity[identity] = streak
+        }
+    }
+
+    func isInFailureBackoff(_ identity: TelemetryIdentity) -> Bool {
+        guard let streak = consecutiveFailuresByIdentity[identity], streak >= 2,
+              let lastTs = lastSampleByIdentity[identity] else { return false }
+        let backoffHours = min(24.0, pow(2.0, Double(streak - 2)) * 2.0)
+        return (now - lastTs) < (backoffHours * 3600.0)
+    }
+
+    let summaries7d = telemetryComputeSummaries(samples: samples, healthEvents: healthEvents, window: .days7, now: now)
+        .filter { seen.contains($0.identity) && $0.successCount > 0 }
+    var summary7dByIdentity: [TelemetryIdentity: TelemetryNodeSummary] = [:]
+    for s in summaries7d { summary7dByIdentity[s.identity] = s }
+
+    let defenderCap = targetCount <= 1 ? 0 : min(4, targetCount / 2)
+    var defenders: [TelemetryIdentity] = []
+    var pickedSet = Set<TelemetryIdentity>()
+
+    let effectiveCooldown = max(0.0, defenderCooldownSeconds)
+    let recheckCooldown = min(effectiveCooldown, 300.0)
+    let explorerCooldown = min(effectiveCooldown, 900.0)
+    let graduationCooldown = min(effectiveCooldown, 1200.0)
+    let defenderSlotCooldown = isPeakNow ? min(effectiveCooldown, 2700.0) : effectiveCooldown
+
+    // Priority 1: up to 1 fast re-verification slot for the highest base-score node with active
+    // passive health penalty (sorted by baseScore desc so heavy penalties don't hide flagship nodes).
+    if defenderCap > 0 {
+        let penalizedCandidates = summaries7d.filter { s in
+            guard s.healthPenalty > 0, s.baseScore >= 50.0, !isInFailureBackoff(s.identity) else { return false }
+            let lastTs = lastSampleByIdentity[s.identity] ?? s.lastTestedAt
+            return (now - lastTs) >= recheckCooldown
+        }.sorted { lhs, rhs in
+            if abs(lhs.baseScore - rhs.baseScore) > 1e-6 { return lhs.baseScore > rhs.baseScore }
+            if abs(lhs.healthPenalty - rhs.healthPenalty) > 1e-6 { return lhs.healthPenalty > rhs.healthPenalty }
+            let lt = lastSampleByIdentity[lhs.identity] ?? lhs.lastTestedAt
+            let rt = lastSampleByIdentity[rhs.identity] ?? rhs.lastTestedAt
+            return lt < rt
+        }
+        if let topPenalized = penalizedCandidates.first,
+           pickedSet.insert(topPenalized.identity).inserted {
+            defenders.append(topPenalized.identity)
+        }
+    }
+
+    // Priority 2: fill remaining defender slots from qualified 7d leaders outside cooldown.
+    // During evening peak, a leader not yet sampled since today's 20:00 bypasses daytime cooldown
+    // (subject only to the 5-min anti-burst floor) so leaders always get fresh peak verification.
+    for summary in summaries7d where summary.isQualified {
+        if defenders.count >= defenderCap { break }
+        guard !pickedSet.contains(summary.identity), !isInFailureBackoff(summary.identity) else { continue }
+        let lastTs = lastSampleByIdentity[summary.identity] ?? summary.lastTestedAt
+        let needsFirstTodayPeakCheck = isPeakNow && lastTs < todayPeakStartTs
+        let requiredGap = needsFirstTodayPeakCheck ? recheckCooldown : defenderSlotCooldown
+        if requiredGap > 0 && (now - lastTs) < requiredGap { continue }
+        if pickedSet.insert(summary.identity).inserted {
+            defenders.append(summary.identity)
+        }
+    }
+
+    // Explorer selection with strict backoff & cooldown enforcement:
+    //   - Backed-off dead nodes (>=2 consecutive failures within 2h..24h window) are EXCLUDED until backoff expires.
+    //   - Freshly tested nodes (inside cooldown) are EXCLUDED instead of leaking into Tier 2.
+    //   - Tier 0 (cold start): round-robin interleaved across subscriptions so no profile is starved.
+    //   - Tier 1 (promising unqualified, 1..2 successes, avail >= 50%): prioritized after Tier 0, with
+    //     a cold-start graduation assist ahead of Tier 0 when qualified defenders < defenderCap so fresh
+    //     multi-subscription pools graduate their first qualified leaders in 2-3 ticks instead of days.
+    //   - Tier 2 (healthy rotation): during peak hours prioritizes nodes lacking 7d peak coverage, then LRU.
+    struct ExplorerRank {
+        let offset: Int
+        let withinProfile: Int
+        let profileOrder: Int
+        let identity: TelemetryIdentity
+        let tier: Int
+        let needsPeakCoverage: Bool
+        let tieScore: Double
+        let lastTested: TimeInterval
+    }
+
+    var skippedBackoffCount = 0
+    var skippedCooldownCount = 0
+    var tier0: [ExplorerRank] = []
+    var tier1: [ExplorerRank] = []
+    var tier2: [ExplorerRank] = []
+
+    for (offset, identity) in uniqueCandidates.enumerated() {
+        guard !pickedSet.contains(identity) else { continue }
+        let rr = roundRobinRankByIdentity[identity] ?? (offset, 0)
+        guard let lastTs = lastSampleByIdentity[identity] else {
+            tier0.append(ExplorerRank(
+                offset: offset, withinProfile: rr.withinProfile, profileOrder: rr.profileOrder,
+                identity: identity, tier: 0, needsPeakCoverage: false, tieScore: 0, lastTested: -Double.infinity
+            ))
+            continue
+        }
+        if isInFailureBackoff(identity) {
+            skippedBackoffCount += 1
+            continue
+        }
+        let needsFirstTodayPeak = isPeakNow && lastTs < todayPeakStartTs
+        if let s7 = summary7dByIdentity[identity], !s7.isQualified, s7.successCount >= 1, s7.successCount < 3, s7.availabilityRate >= 0.5 {
+            let reqGap = needsFirstTodayPeak ? recheckCooldown : graduationCooldown
+            if reqGap > 0 && (now - lastTs) < reqGap {
+                skippedCooldownCount += 1
+                continue
+            }
+            tier1.append(ExplorerRank(
+                offset: offset, withinProfile: rr.withinProfile, profileOrder: rr.profileOrder,
+                identity: identity, tier: 1, needsPeakCoverage: isPeakNow && !hasRecentPeakSample.contains(identity),
+                tieScore: s7.baseScore, lastTested: lastTs
+            ))
+            continue
+        }
+        let reqGap = needsFirstTodayPeak ? recheckCooldown : explorerCooldown
+        if reqGap > 0 && (now - lastTs) < reqGap {
+            skippedCooldownCount += 1
+            continue
+        }
+        tier2.append(ExplorerRank(
+            offset: offset, withinProfile: rr.withinProfile, profileOrder: rr.profileOrder,
+            identity: identity, tier: 2, needsPeakCoverage: isPeakNow && !hasRecentPeakSample.contains(identity),
+            tieScore: summary7dByIdentity[identity]?.longTermScore ?? 0, lastTested: lastTs
+        ))
+    }
+
+    tier0.sort { lhs, rhs in
+        if lhs.withinProfile != rhs.withinProfile { return lhs.withinProfile < rhs.withinProfile }
+        if lhs.profileOrder != rhs.profileOrder { return lhs.profileOrder < rhs.profileOrder }
+        return lhs.offset < rhs.offset
+    }
+    tier1.sort { lhs, rhs in
+        if lhs.needsPeakCoverage != rhs.needsPeakCoverage { return lhs.needsPeakCoverage }
+        if abs(lhs.tieScore - rhs.tieScore) > 1e-6 { return lhs.tieScore > rhs.tieScore }
+        if lhs.lastTested != rhs.lastTested { return lhs.lastTested < rhs.lastTested }
+        return lhs.offset < rhs.offset
+    }
+    tier2.sort { lhs, rhs in
+        if lhs.needsPeakCoverage != rhs.needsPeakCoverage { return lhs.needsPeakCoverage }
+        if lhs.lastTested != rhs.lastTested { return lhs.lastTested < rhs.lastTested }
+        return lhs.offset < rhs.offset
+    }
 
     var explorers: [TelemetryIdentity] = []
-    let remainingSlots = targetCount - defenders.count
-    for item in explorerCandidates.prefix(max(0, remainingSlots)) {
-        if pickedSet.insert(item.element).inserted {
-            explorers.append(item.element)
+    let remainingSlots = max(0, targetCount - defenders.count)
+
+    // Cold-start graduation assist: when fewer than defenderCap qualified leaders exist,
+    // allow up to half of remaining slots (capped by unfilled defender slots) for high-scoring
+    // Tier 1 candidates (baseScore >= 55) so fresh subscriptions graduate qualified leaders rapidly
+    // while keeping at least half of each tick discovering brand-new Tier 0 nodes.
+    let unfilledDefenderSlots = max(0, defenderCap - defenders.count)
+    if unfilledDefenderSlots > 0 && remainingSlots > 0 && !tier0.isEmpty {
+        let gradBudget = min(unfilledDefenderSlots, max(1, remainingSlots / 2))
+        var gradUsed = 0
+        for item in tier1 where item.tieScore >= 55.0 {
+            if gradUsed >= gradBudget || explorers.count >= remainingSlots { break }
+            if pickedSet.insert(item.identity).inserted {
+                explorers.append(item.identity)
+                gradUsed += 1
+            }
+        }
+    }
+
+    for pool in [tier0, tier1, tier2] {
+        if explorers.count >= remainingSlots { break }
+        for item in pool {
+            if explorers.count >= remainingSlots { break }
+            if pickedSet.insert(item.identity).inserted {
+                explorers.append(item.identity)
+            }
         }
     }
 
@@ -629,7 +907,12 @@ public func telemetrySelectPatrolIdentities(
         identities: defenders + explorers,
         defenderCount: defenders.count,
         explorerCount: explorers.count,
-        remainingQuotaBytes: remaining
+        remainingQuotaBytes: remaining,
+        deferredForPeakQuota: false,
+        peakReservedBytes: peakReservedBytes,
+        skippedBackoffCount: skippedBackoffCount,
+        skippedCooldownCount: skippedCooldownCount,
+        effectiveMaxPerTick: effectiveBatchCap
     )
 }
 
@@ -1099,7 +1382,10 @@ public final class TelemetryHistoryStore: @unchecked Sendable {
         perNodeBytes: Int = 1_048_576,
         maxPerTick: Int = 8,
         now: TimeInterval? = nil,
-        calendar: Calendar = .current
+        calendar: Calendar = .current,
+        reservePeakRatio: Double = 0.0,
+        defenderCooldownSeconds: TimeInterval = 5400.0,
+        overnightThrottle: Bool = false
     ) -> TelemetryPatrolSelection {
         queue.sync {
             let effectiveNow = now ?? self.nowProvider()
@@ -1114,7 +1400,10 @@ public final class TelemetryHistoryStore: @unchecked Sendable {
                 perNodeBytes: perNodeBytes,
                 maxPerTick: maxPerTick,
                 now: effectiveNow,
-                calendar: calendar
+                calendar: calendar,
+                reservePeakRatio: reservePeakRatio,
+                defenderCooldownSeconds: defenderCooldownSeconds,
+                overnightThrottle: overnightThrottle
             )
         }
     }
@@ -1126,6 +1415,9 @@ public final class TelemetryHistoryStore: @unchecked Sendable {
         maxPerTick: Int = 8,
         now: TimeInterval? = nil,
         calendar: Calendar = .current,
+        reservePeakRatio: Double = 0.0,
+        defenderCooldownSeconds: TimeInterval = 5400.0,
+        overnightThrottle: Bool = false,
         completion: @escaping (TelemetryPatrolSelection) -> Void
     ) {
         let cb = TelemetryMainCallback(completion)
@@ -1142,7 +1434,10 @@ public final class TelemetryHistoryStore: @unchecked Sendable {
                 perNodeBytes: perNodeBytes,
                 maxPerTick: maxPerTick,
                 now: effectiveNow,
-                calendar: calendar
+                calendar: calendar,
+                reservePeakRatio: reservePeakRatio,
+                defenderCooldownSeconds: defenderCooldownSeconds,
+                overnightThrottle: overnightThrottle
             )
             cb.deliver(plan)
         }

@@ -206,6 +206,186 @@ func makeSample(
             reopened.clearAll()
             check(reopened.sampleCount() == 0 && reopened.healthEventCount() == 0, "clearAll must empty all tables")
 
+        case "patrol_smart_optimizations":
+            var utcCal = Calendar(identifier: .gregorian)
+            utcCal.timeZone = TimeZone(secondsFromGMT: 0)!
+            let overnightTs = utcCal.date(from: DateComponents(year: 2026, month: 11, day: 10, hour: 3, minute: 0))!.timeIntervalSince1970
+            let dayTs = utcCal.date(from: DateComponents(year: 2026, month: 11, day: 10, hour: 14, minute: 0))!.timeIntervalSince1970
+            let peakTs = utcCal.date(from: DateComponents(year: 2026, month: 11, day: 10, hour: 20, minute: 30))!.timeIntervalSince1970
+            let postPeakTs = utcCal.date(from: DateComponents(year: 2026, month: 11, day: 10, hour: 23, minute: 45))!.timeIntervalSince1970
+
+            // 1) Defender 90-min rotation + penalized flagship sorted by baseScore (not post-penalty score)
+            //    + strict exclusion of cooled & backed-off dead nodes (even with spare maxPerTick slots!)
+            let cands = ["FreshTop", "HourlyCooledTop", "ReadyTop", "PenalizedFlagship", "PenalizedMid", "Promising1", "DeadNode", "SteadyOld"].map {
+                TelemetryIdentity(profileUID: "uid-a", nodeName: $0)
+            }
+            let smartSamples: [TelemetrySampleRecord] = [
+                // FreshTop: tested 2 min ago -> strictly inside 15m/90m cooldown
+                makeSample(ts: dayTs - 7200, node: "FreshTop", score: 96),
+                makeSample(ts: dayTs - 3600, node: "FreshTop", score: 96),
+                makeSample(ts: dayTs - 120, node: "FreshTop", score: 96),
+                // HourlyCooledTop: tested 60 min ago -> inside 90m defender cooldown (yields defender slot to ReadyTop),
+                // and >15m so eligible for Tier 2 only if spare slots remain
+                makeSample(ts: dayTs - 14400, node: "HourlyCooledTop", score: 94),
+                makeSample(ts: dayTs - 10800, node: "HourlyCooledTop", score: 94),
+                makeSample(ts: dayTs - 3600, node: "HourlyCooledTop", score: 94),
+                // ReadyTop: tested 2h ago -> outside 90m cooldown, takes defender slot!
+                makeSample(ts: dayTs - 14400, node: "ReadyTop", score: 89),
+                makeSample(ts: dayTs - 10800, node: "ReadyTop", score: 89),
+                makeSample(ts: dayTs - 7200, node: "ReadyTop", score: 89),
+                // PenalizedFlagship: baseScore 92, heavy -25 penalty -> longTermScore 67, MUST beat PenalizedMid (baseScore 74, -5 penalty -> 69)!
+                makeSample(ts: dayTs - 10800, node: "PenalizedFlagship", score: 92),
+                makeSample(ts: dayTs - 7200, node: "PenalizedFlagship", score: 92),
+                makeSample(ts: dayTs - 3600, node: "PenalizedFlagship", score: 92),
+                // PenalizedMid: baseScore 74, minor penalty
+                makeSample(ts: dayTs - 10800, node: "PenalizedMid", score: 74),
+                makeSample(ts: dayTs - 7200, node: "PenalizedMid", score: 74),
+                makeSample(ts: dayTs - 3600, node: "PenalizedMid", score: 74),
+                // Promising1: 1 high-score success 30m ago -> Tier 1 promising explorer
+                makeSample(ts: dayTs - 1800, node: "Promising1", score: 84),
+                // DeadNode: 3 consecutive failures, latest 30m ago -> strictly excluded in 4h backoff!
+                makeSample(ts: dayTs - 7200, node: "DeadNode", complete: false, bps: 0, latency: 0, jitter: 0, score: nil),
+                makeSample(ts: dayTs - 3600, node: "DeadNode", complete: false, bps: 0, latency: 0, jitter: 0, score: nil),
+                makeSample(ts: dayTs - 1800, node: "DeadNode", complete: false, bps: 0, latency: 0, jitter: 0, score: nil),
+                // SteadyOld: tested 3h ago -> Tier 2 healthy rotation
+                makeSample(ts: dayTs - 20000, node: "SteadyOld", score: 62),
+                makeSample(ts: dayTs - 18000, node: "SteadyOld", score: 62),
+                makeSample(ts: dayTs - 14000, node: "SteadyOld", score: 62),
+                makeSample(ts: dayTs - 10800, node: "SteadyOld", score: 62),
+            ]
+            var penEvents: [TelemetryHealthEvent] = []
+            // 6 failures on PenalizedFlagship (-25 pts) vs 2 failures on PenalizedMid (-5 pts)
+            for i in 0..<6 {
+                penEvents.append(TelemetryHealthEvent(timestamp: dayTs - Double(400 - i * 30), profileUID: "uid-a", nodeName: "PenalizedFlagship", groupName: "PROXY", ok: false, delayMilliseconds: nil, failureKind: "probe_failed"))
+            }
+            for i in 0..<2 {
+                penEvents.append(TelemetryHealthEvent(timestamp: dayTs - Double(300 - i * 30), profileUID: "uid-a", nodeName: "PenalizedMid", groupName: "PROXY", ok: false, delayMilliseconds: nil, failureKind: "probe_failed"))
+            }
+            let smartPlan = telemetrySelectPatrolIdentities(
+                candidates: cands, samples: smartSamples, healthEvents: penEvents,
+                dailyQuotaBytes: 50 * 1_048_576, maxPerTick: 4, now: dayTs, calendar: utcCal
+            )
+            let smartNames = smartPlan.identities.map { String(decoding: $0.node, as: UTF8.self) }
+            check(smartNames.count == 4, "expected 4 picks, got \(smartNames)")
+            check(smartPlan.defenderCount == 2 && Array(smartNames.prefix(2)) == ["PenalizedFlagship", "ReadyTop"],
+                  "penalized flagship (baseScore 92) + uncooled ReadyTop must defend, got \(smartNames)")
+            check(!smartNames.contains("FreshTop"), "FreshTop inside 15m cooldown must be skipped, got \(smartNames)")
+            check(!smartNames.contains("DeadNode"), "DeadNode inside 4h backoff must be strictly excluded, got \(smartNames)")
+            check(smartNames.contains("Promising1"), "Promising1 (Tier 1) must be explored before Tier 2, got \(smartNames)")
+            check(smartPlan.skippedBackoffCount == 1 && smartPlan.skippedCooldownCount == 1,
+                  "expected 1 backoff skip + 1 cooldown skip, got backoff=\(smartPlan.skippedBackoffCount) cooldown=\(smartPlan.skippedCooldownCount)")
+
+            // Even with maxPerTick=8 (more slots than candidates!), FreshTop & DeadNode MUST STILL be strictly excluded!
+            let widePlan = telemetrySelectPatrolIdentities(
+                candidates: cands, samples: smartSamples, healthEvents: penEvents,
+                dailyQuotaBytes: 50 * 1_048_576, maxPerTick: 8, now: dayTs, calendar: utcCal
+            )
+            let wideNames = widePlan.identities.map { String(decoding: $0.node, as: UTF8.self) }
+            check(wideNames.count == 6 && !wideNames.contains("DeadNode") && !wideNames.contains("FreshTop"),
+                  "wide batch must never leak cooled FreshTop or backed-off DeadNode, got \(wideNames)")
+
+            // Once DeadNode's 4h backoff expires (5h later), DeadNode automatically re-enters recovery probing
+            let afterBackoff = telemetrySelectPatrolIdentities(
+                candidates: [TelemetryIdentity(profileUID: "uid-a", nodeName: "DeadNode")],
+                samples: smartSamples, healthEvents: [],
+                dailyQuotaBytes: 50 * 1_048_576, maxPerTick: 4, now: dayTs + 5 * 3600, calendar: utcCal
+            )
+            check(afterBackoff.identities.count == 1 && afterBackoff.skippedBackoffCount == 0,
+                  "DeadNode must re-enter recovery probe once 4h backoff expires, got \(afterBackoff)")
+
+            // 2) First peak-hour check bypasses daytime 90-min defender cooldown at 20:30 for leader tested at 19:50
+            let peakLeaderCand = [TelemetryIdentity(profileUID: "uid-a", nodeName: "PeakHero")]
+            let peakLeaderSamples = [
+                makeSample(ts: peakTs - 10800, node: "PeakHero", score: 90),
+                makeSample(ts: peakTs - 7200, node: "PeakHero", score: 90),
+                makeSample(ts: peakTs - 2400, node: "PeakHero", score: 90), // 19:50 (40m ago, < 90m daytime cooldown, before 20:00!)
+            ]
+            let peakLeaderPlan = telemetrySelectPatrolIdentities(
+                candidates: peakLeaderCand, samples: peakLeaderSamples, healthEvents: [],
+                dailyQuotaBytes: 50 * 1_048_576, maxPerTick: 4, now: peakTs, calendar: utcCal
+            )
+            check(peakLeaderPlan.identities.count == 1,
+                  "leader last tested before 20:00 must immediately qualify for peak-hour check, got \(peakLeaderPlan)")
+
+            // 3) Multi-subscription round-robin cold start + cold-start graduation assist
+            let multiSubCands = [
+                TelemetryIdentity(profileUID: "sub-a", nodeName: "A1"),
+                TelemetryIdentity(profileUID: "sub-a", nodeName: "A2"),
+                TelemetryIdentity(profileUID: "sub-a", nodeName: "A3"),
+                TelemetryIdentity(profileUID: "sub-b", nodeName: "B1"),
+                TelemetryIdentity(profileUID: "sub-b", nodeName: "B2"),
+                TelemetryIdentity(profileUID: "sub-c", nodeName: "C1"),
+            ]
+            let rrPlan = telemetrySelectPatrolIdentities(
+                candidates: multiSubCands, samples: [], healthEvents: [],
+                dailyQuotaBytes: 50 * 1_048_576, maxPerTick: 4, now: dayTs, calendar: utcCal
+            )
+            let rrNames = rrPlan.identities.map { String(decoding: $0.node, as: UTF8.self) }
+            check(rrNames == ["A1", "B1", "C1", "A2"],
+                  "multi-subscription cold start must round-robin across profiles, got \(rrNames)")
+
+            // Cold-start graduation assist: A1 & B1 each got 1 high-score sample 1h ago, 0 qualified yet;
+            // next tick (maxPerTick=4) graduates A1 & B1 while STILL discovering 2 new unsampled nodes (C1, A2)!
+            let gradSamples = [
+                makeSample(ts: dayTs - 3600, uid: "sub-a", profileName: "A", node: "A1", score: 86),
+                makeSample(ts: dayTs - 3600, uid: "sub-b", profileName: "B", node: "B1", score: 82),
+            ]
+            let gradPlan = telemetrySelectPatrolIdentities(
+                candidates: multiSubCands, samples: gradSamples, healthEvents: [],
+                dailyQuotaBytes: 50 * 1_048_576, maxPerTick: 4, now: dayTs, calendar: utcCal
+            )
+            let gradNames = gradPlan.identities.map { String(decoding: $0.node, as: UTF8.self) }
+            check(gradPlan.defenderCount == 0 && gradNames.count == 4 &&
+                  Set(gradNames.prefix(2)) == ["A1", "B1"] && Set(gradNames.suffix(2)) == ["C1", "A2"],
+                  "cold-start must graduate promising Tier 1 nodes while still discovering Tier 0, got \(gradNames)")
+
+            // 4) Fair failure quota accounting: 4 failed 1MiB patrol probes charge 4 * 256KiB = 1MiB
+            let failPatrolSamples = (0..<4).map { i in
+                makeSample(ts: dayTs - Double(600 + i * 10), node: "DeadNode", source: .patrol, bytes: 1_048_576, complete: false, bps: 0, latency: 0, jitter: 0, score: nil)
+            }
+            let usedByFailures = telemetryPatrolBytesUsedToday(samples: failPatrolSamples, now: dayTs, calendar: utcCal)
+            check(usedByFailures == 1_048_576, "4 failed 1M patrol probes must charge 1 MiB anti-spin budget, got \(usedByFailures)")
+
+            // 5) Peak 25% reserve: held at 14:00, unlocked at 20:30, AND stays unlocked at 23:45 (post-peak regression!)
+            var daytimeSpent: [TelemetrySampleRecord] = []
+            for i in 0..<38 {
+                daytimeSpent.append(makeSample(ts: dayTs - Double(1000 + i * 10), node: "ReadyTop", source: .patrol, bytes: 1_048_576, score: 85))
+            }
+            let dayDeferred = telemetrySelectPatrolIdentities(
+                candidates: multiSubCands, samples: daytimeSpent, healthEvents: [],
+                dailyQuotaBytes: 50 * 1_048_576, maxPerTick: 8, now: dayTs, calendar: utcCal, reservePeakRatio: 0.25
+            )
+            check(dayDeferred.identities.isEmpty && dayDeferred.deferredForPeakQuota && dayDeferred.peakReservedBytes > 0,
+                  "daytime (14:00) must hold last 25% quota for evening peak, got \(dayDeferred)")
+            let peakUnlocked = telemetrySelectPatrolIdentities(
+                candidates: multiSubCands, samples: daytimeSpent, healthEvents: [],
+                dailyQuotaBytes: 50 * 1_048_576, maxPerTick: 8, now: peakTs, calendar: utcCal, reservePeakRatio: 0.25
+            )
+            check(peakUnlocked.identities.count == 6 && !peakUnlocked.deferredForPeakQuota && peakUnlocked.peakReservedBytes == 0,
+                  "evening peak (20:30) must unlock reserved quota, got \(peakUnlocked)")
+            let postPeakUnlocked = telemetrySelectPatrolIdentities(
+                candidates: multiSubCands, samples: daytimeSpent, healthEvents: [],
+                dailyQuotaBytes: 50 * 1_048_576, maxPerTick: 8, now: postPeakTs, calendar: utcCal, reservePeakRatio: 0.25
+            )
+            check(postPeakUnlocked.identities.count == 6 && !postPeakUnlocked.deferredForPeakQuota && postPeakUnlocked.peakReservedBytes == 0,
+                  "post-peak (23:45) must NOT re-lock peak reserve, got \(postPeakUnlocked)")
+
+            // 6) Overnight throttle (01:00-07:00) halves batch cap to avoid burning daytime budget while asleep
+            let nightPlan = telemetrySelectPatrolIdentities(
+                candidates: multiSubCands, samples: [], healthEvents: [],
+                dailyQuotaBytes: 50 * 1_048_576, maxPerTick: 6, now: overnightTs, calendar: utcCal,
+                reservePeakRatio: 0.25, overnightThrottle: true
+            )
+            check(nightPlan.effectiveMaxPerTick == 3 && nightPlan.identities.count == 3,
+                  "overnight 03:00 with maxPerTick=6 must throttle to 3, got \(nightPlan)")
+            let dayFullPlan = telemetrySelectPatrolIdentities(
+                candidates: multiSubCands, samples: [], healthEvents: [],
+                dailyQuotaBytes: 50 * 1_048_576, maxPerTick: 6, now: dayTs, calendar: utcCal,
+                reservePeakRatio: 0.25, overnightThrottle: true
+            )
+            check(dayFullPlan.effectiveMaxPerTick == 6 && dayFullPlan.identities.count == 6,
+                  "daytime 14:00 with maxPerTick=6 must use full 6, got \(dayFullPlan)")
+
         case "symlink_rejection_falls_back_to_memory":
             let dirPath = input["dir"] as! String
             let store = TelemetryHistoryStore(directoryURL: URL(fileURLWithPath: dirPath, isDirectory: true), nowProvider: { now })
@@ -293,6 +473,9 @@ class TelemetryHistoryTests(unittest.TestCase):
         forbidden = {'server', 'host', 'ip', 'port', 'uuid', 'password', 'url', 'yaml', 'secret'}
         self.assertTrue(sample_cols.isdisjoint(forbidden), sample_cols)
         self.assertTrue(health_cols.isdisjoint(forbidden), health_cols)
+
+    def test_patrol_smart_optimizations(self):
+        self.run_action({'action': 'patrol_smart_optimizations'})
 
     def test_symlink_rejection_falls_back_to_memory(self):
         real_dir = self.work / 'real-target'
