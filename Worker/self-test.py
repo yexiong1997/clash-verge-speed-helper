@@ -29,6 +29,7 @@ class Target(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     redirected = 0
     mixed_gets = 0
+    cold_heads = 0
     mixed_lock = threading.Lock()
 
     def log_message(self, *_):
@@ -47,6 +48,13 @@ class Target(http.server.BaseHTTPRequestHandler):
             self.send_header("Location", "/forbidden-redirect")
         elif self.path == "/bad-head":
             self.send_response(503)
+        elif self.path == "/cold-first-head":
+            with type(self).mixed_lock:
+                type(self).cold_heads += 1
+                first_cold = type(self).cold_heads == 1
+            if first_cold:
+                time.sleep(0.14)
+            self.send_response(200)
         else:
             if self.path == "/forbidden-redirect":
                 type(self).redirected += 1
@@ -241,6 +249,7 @@ def main():
             try:
                 expected = {
                     "/good": (6, True, SIZE * 2),
+                    "/cold-first-head": (6, True, SIZE * 2),
                     "/good-range": (6, True, SIZE * 2),
                     "/bad-head": (0, True, SIZE * 2),
                     "/redirect": (0, False, 0),
@@ -256,6 +265,8 @@ def main():
                     for path, (heads, complete, received) in expected.items():
                         if path == "/mixed":
                             Target.mixed_gets = 0
+                        if path == "/cold-first-head":
+                            Target.cold_heads = 0
                         p = run_case(command, port, target_port, path, config_arg=config_arg, home=home)
                         assert p.returncode == 0, f"{path}: exit {p.returncode}"
                         assert p.stderr == b"", f"{path}: unexpected stderr"
@@ -269,6 +280,10 @@ def main():
                         assert obj["expected_bytes"] == SIZE * 2 and obj["received_bytes"] == received, (path, obj)
                         assert obj["download_complete"] is complete, (path, obj)
                         assert (obj["download_bytes_per_second"] > 0) == complete, (path, obj)
+                        if path == "/cold-first-head":
+                            assert obj["latency_ms"] < 60.0 and obj["jitter_ms"] < 30.0, (
+                                f"cold first HEAD distorted steady latency/jitter: {obj}"
+                            )
                         print(f"PASS {config_arg} {path}")
                 assert Target.redirected == 0, "a redirect was followed"
                 for regex, config in ((r"\Amissing\z", None), ("[", None),

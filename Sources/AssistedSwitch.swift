@@ -5,8 +5,11 @@ import Darwin
 // may still be chosen explicitly by the user but must never win automatically.
 func multiAutomaticNodeIsCandidate(_ name: String) -> Bool {
     let lowered = name.lowercased()
-    let metadata = ["剩余流量", "到期", "流量重置", "重置时间", "过期时间", "订阅信息",
-                    "traffic remaining", "remaining traffic", "subscription expires", "expiration date"]
+    let metadata = ["剩余流量", "已用流量", "到期", "流量重置", "重置时间", "距离下次重置", "下次重置",
+                    "过期时间", "订阅信息", "订阅地址", "更新订阅", "最新网址", "最新域名", "官方网址", "官网",
+                    "防失联", "套餐余量",
+                    "traffic remaining", "remaining traffic", "used traffic",
+                    "subscription expires", "expiration date", "expire date", "next reset"]
     return !metadata.contains(where: { lowered.contains($0) })
 }
 

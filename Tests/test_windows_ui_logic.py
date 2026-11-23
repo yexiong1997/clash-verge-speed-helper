@@ -24,7 +24,7 @@ class Element {
   constructor(id = '', tag = 'div') {
     this.id = id; this.tagName = tag.toUpperCase(); this.value = ''; this.checked = false;
     this.disabled = false; this.textContent = ''; this.isConnected = true;
-    this.hidden = ['confirm-dialog', 'tun-notice', 'row-menu'].includes(id);
+    this.hidden = ['confirm-dialog', 'tun-notice', 'row-menu', 'patrol-popover'].includes(id);
     this.classList = { set: new Set(), toggle(c, f) { f === undefined ? (this.set.has(c) ? this.set.delete(c) : this.set.add(c)) : (f ? this.set.add(c) : this.set.delete(c)); }, add(c) { this.set.add(c); }, contains(c) { return this.set.has(c); } };
     this.dataset = {}; this.attributes = {}; this.parentElement = null; this.style = {}; this.children = []; this.listeners = {};
   }
@@ -533,6 +533,68 @@ function cancelDialog() { snapDialog(); get('confirm-cancel').onclick(); }
     }));
     return;
   }
+  if (scenario === 'patrol-info-popover') {
+    initial.patrol = {armed: false, minutes: null, remaining: null, quota_bytes: 80 * 1048576, used_bytes: 12 * 1048576, summary: '', interval_minutes: 60, max_per_tick: 5};
+    vm.runInContext('state = JSON.parse(JSON.stringify(initial)); render();', context);
+    const tip80 = get('patrol-info').title;
+    const hiddenBefore = get('patrol-popover').hidden;
+    get('patrol-info').onclick();
+    const hiddenOpen = get('patrol-popover').hidden;
+    const expandedOpen = get('patrol-info').attributes['aria-expanded'];
+    const sub80 = get('patrol-pop-sub').textContent;
+    const bulletCount = get('patrol-pop-list').children.length;
+    initial.patrol.quota_bytes = 150 * 1048576;
+    initial.patrol.interval_minutes = 30;
+    initial.patrol.max_per_tick = 6;
+    vm.runInContext('state = JSON.parse(JSON.stringify(initial)); render();', context);
+    const sub150 = get('patrol-pop-sub').textContent;
+    const tip150 = get('patrol-toggle').title;
+    doc.dispatch('keydown', {key: 'Escape', preventDefault(){ prevented = true; }});
+    const hiddenAfterEsc = get('patrol-popover').hidden;
+    const expandedAfterEsc = get('patrol-info').attributes['aria-expanded'];
+    process.stdout.write(JSON.stringify({tip80, hiddenBefore, hiddenOpen, expandedOpen, sub80, bulletCount, sub150, tip150, hiddenAfterEsc, expandedAfterEsc, activeId: doc.activeElement?.id || null, prevented}));
+    return;
+  }
+  if (scenario === 'history-multi-select') {
+    api.get_history = value => {
+      calls.push({fn: 'get_history', value});
+      return Promise.resolve({ok: true, summaries: [
+        {uid: 'p', profile: 'Fixture', name: 'node', node_type: 'vless', long_term_score: 88.2, base_score: 88.2, health_penalty: 0, weighted_median_score: 89.0, weighted_p20_score: 85.0, weighted_median_speed_bps: 10485760, weighted_median_latency_ms: 42, availability_rate: 1.0, total_count: 5, success_count: 5, is_qualified: true, available: true},
+        {uid: 'p', profile: 'Fixture', name: 'other', node_type: 'ss', long_term_score: 79.4, base_score: 79.4, health_penalty: 0, weighted_median_score: 80.0, weighted_p20_score: 76.0, weighted_median_speed_bps: 6291456, weighted_median_latency_ms: 68, availability_rate: 0.9, total_count: 4, success_count: 4, is_qualified: true, available: true}
+      ]});
+    };
+    get('view-history').onclick();
+    await new Promise(r => setImmediate(r));
+    get('history-select-all').onclick();
+    const countAfterAll = get('count').textContent;
+    const tr0 = get('rows').children[0];
+    get('rows').listeners.contextmenu({target: tr0, clientX: 40, clientY: 50, preventDefault(){}});
+    const menuLabels = {
+      retest: get('menu-retest').textContent,
+      locate: get('menu-locate').textContent,
+      copy: get('menu-copy').textContent,
+      summary: get('menu-copy-summary').textContent
+    };
+    await get('menu-copy').onclick();
+    get('rows').listeners.contextmenu({target: tr0, clientX: 40, clientY: 50, preventDefault(){}});
+    await get('menu-copy-summary').onclick();
+    doc.dispatch('keydown', {key: 'c', ctrlKey: true, shiftKey: false, altKey: false, target: tr0, preventDefault(){}});
+    await new Promise(r => setImmediate(r));
+    await get('export').onclick();
+    get('stress').onclick();
+    const stressDialogMsg = get('confirm-message').textContent;
+    await acceptDialog();
+    const modeAfterStress = get('live-tools').hidden ? 'history' : 'live';
+    get('view-history').onclick();
+    await new Promise(r => setImmediate(r));
+    get('history-clear-sel').onclick();
+    const countAfterClear = get('count').textContent;
+    get('rows').children[0].onclick();
+    doc.dispatch('keydown', {key: ' ', ctrlKey: false, metaKey: false, altKey: false, target: get('rows').children[0], preventDefault(){}});
+    const countAfterSpace = get('count').textContent;
+    process.stdout.write(JSON.stringify({countAfterAll, menuLabels, stressDialogMsg, modeAfterStress, countAfterClear, countAfterSpace, calls}));
+    return;
+  }
   if (scenario === 'bridge-hot-switch-and-history-export') {
     initial.profiles = [
       {uid:'p', name:'SubOne', current:true, compatible:true, selected:true},
@@ -953,6 +1015,67 @@ process.stdin.on('end', () => {
         exp_calls = [c for c in value["calls"] if c["fn"] == "export_tsv"]
         self.assertEqual(len(exp_calls), 1)
         self.assertEqual(exp_calls[0]["value"]["view"], "history")
+
+
+    def test_patrol_info_popover_and_dynamic_tooltip(self):
+        html = (ROOT / "Windows/ui/index.html").read_text(encoding="utf-8")
+        self.assertIn('id="patrol-info"', html)
+        self.assertIn('id="patrol-popover"', html)
+        result = subprocess.run(
+            [NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "patrol-info-popover"],
+            capture_output=True, timeout=5, check=True,
+        )
+        value = json.loads(result.stdout)
+        self.assertTrue(value["hiddenBefore"])
+        self.assertFalse(value["hiddenOpen"])
+        self.assertEqual(value["expandedOpen"], "true")
+        self.assertEqual(value["bulletCount"], 4)
+        self.assertIn("每 60 分钟最多 5 节点", value["sub80"])
+        self.assertIn("晚高峰预留 20 MiB", value["sub80"])
+        self.assertIn("2~24 小时", value["tip80"])
+        self.assertIn("每 30 分钟最多 6 节点", value["sub150"])
+        self.assertIn("晚高峰预留 37 MiB", value["sub150"])
+        self.assertIn("30 分钟", value["tip150"])
+        self.assertTrue(value["hiddenAfterEsc"])
+        self.assertEqual(value["expandedAfterEsc"], "false")
+        self.assertEqual(value["activeId"], "patrol-info")
+        self.assertTrue(value["prevented"])
+
+    def test_history_multi_select_batch_menu_shortcuts_export_and_stress(self):
+        html = (ROOT / "Windows/ui/index.html").read_text(encoding="utf-8")
+        self.assertIn('id="history-select-all"', html)
+        self.assertIn('id="history-clear-sel"', html)
+        result = subprocess.run(
+            [NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "history-multi-select"],
+            capture_output=True, timeout=5, check=True,
+        )
+        value = json.loads(result.stdout)
+        self.assertEqual(value["countAfterAll"], "2 候选 · 已选 2")
+        self.assertEqual(value["menuLabels"], {
+            "retest": "批量 20MiB 加压复测已选 (2 个)",
+            "locate": "将已选 2 个同步到实时队列",
+            "copy": "复制已选节点名称 (2 个)",
+            "summary": "复制已选测速摘要 (2 个)",
+        })
+        self.assertIn("2 个长效优选节点", value["stressDialogMsg"])
+        self.assertIn("40.0 MiB", value["stressDialogMsg"])
+        self.assertEqual(value["modeAfterStress"], "live")
+        self.assertEqual(value["countAfterClear"], "2 候选")
+        self.assertEqual(value["countAfterSpace"], "2 候选 · 已选 1")
+        expected_nodes = [{"uid": "p", "name": "node"}, {"uid": "p", "name": "other"}]
+        copy_name_calls = [c for c in value["calls"] if c["fn"] == "copy_node_name"]
+        self.assertEqual(len(copy_name_calls), 2)
+        self.assertEqual(copy_name_calls[0]["value"], {"nodes": expected_nodes})
+        self.assertEqual(copy_name_calls[1]["value"], {"nodes": expected_nodes})
+        copy_sum_calls = [c for c in value["calls"] if c["fn"] == "copy_node_summary"]
+        self.assertEqual(copy_sum_calls, [{"fn": "copy_node_summary", "value": {"nodes": expected_nodes, "view": "history", "window": "7d"}}])
+        exp_calls = [c for c in value["calls"] if c["fn"] == "export_tsv"]
+        self.assertEqual(exp_calls[0]["value"]["identities"], expected_nodes)
+        sel_calls = [c for c in value["calls"] if c["fn"] == "set_selection"]
+        self.assertEqual(sel_calls[0]["value"]["nodes"], expected_nodes)
+        start_calls = [c for c in value["calls"] if c["fn"] == "start"]
+        self.assertEqual(start_calls[0]["value"]["download_bytes"], 20971520)
+        self.assertEqual(start_calls[0]["value"]["mode"], "accurate")
 
 
 if __name__ == "__main__":

@@ -367,7 +367,9 @@ public func telemetryComputeHealthState(
         }
         switch item.kind {
         case .healthFailure:
-            streak += 1.0
+            // Saturate failure streak so prolonged overnight outages do not accumulate
+            // unbounded debt that blocks verified recovery (max -25 penalty is reached at 5.0).
+            streak = min(7.0, streak + 1.0)
         case .healthOK:
             streak = max(0.0, streak * 0.35 - 0.8)
         case .speedSuccess:
@@ -545,7 +547,7 @@ public func telemetryComputeSummaries(
             now: now
         )
         let finalScore = item.successCount > 0 ? max(0.0, min(100.0, baseScore - health.penalty)) : 0.0
-        let qualified = (item.successCount >= 3 && item.availabilityRate >= 0.5)
+        let qualified = (item.successCount >= 3 && item.weightedAvailability >= 0.5)
 
         summaries.append(TelemetryNodeSummary(
             identity: item.identity,
@@ -831,7 +833,7 @@ public func telemetrySelectPatrolIdentities(
             continue
         }
         let needsFirstTodayPeak = isPeakNow && lastTs < todayPeakStartTs
-        if let s7 = summary7dByIdentity[identity], !s7.isQualified, s7.successCount >= 1, s7.successCount < 3, s7.availabilityRate >= 0.5 {
+        if let s7 = summary7dByIdentity[identity], !s7.isQualified, s7.successCount >= 1, s7.successCount < 3, s7.weightedAvailabilityRate >= 0.5 {
             let reqGap = needsFirstTodayPeak ? recheckCooldown : graduationCooldown
             if reqGap > 0 && (now - lastTs) < reqGap {
                 skippedCooldownCount += 1

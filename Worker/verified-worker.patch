@@ -11,7 +11,7 @@
  	PacketLoss    float64        `json:"packet_loss"`
 --- /dev/null
 +++ b/cmd/verified-worker/main.go
-@@ -0,0 +1,702 @@
+@@ -0,0 +1,709 @@
 +// Verified JSON worker, derived from faceair/clash-speedtest v1.8.6
 +// (GPL-3.0); see the accompanying source patch and provenance notice.
 +package main
@@ -225,17 +225,24 @@
 +	latencies := testHeads(p, target, o.latency)
 +	res.HeadSuccesses = len(latencies)
 +	if len(latencies) > 0 {
++		// Drop the single cold TCP/proxy/TLS handshake sample (latencies[0])
++		// when at least two warm follow-up HEADs succeeded, preventing one-time
++		// connection setup overhead from inflating steady-state RTT and jitter.
++		steady := latencies
++		if len(steady) >= 3 {
++			steady = steady[1:]
++		}
 +		var sum float64
-+		for _, d := range latencies {
++		for _, d := range steady {
 +			sum += float64(d) / float64(time.Millisecond)
 +		}
-+		res.LatencyMS = sum / float64(len(latencies))
++		res.LatencyMS = sum / float64(len(steady))
 +		var variance float64
-+		for _, d := range latencies {
++		for _, d := range steady {
 +			diff := float64(d)/float64(time.Millisecond) - res.LatencyMS
 +			variance += diff * diff
 +		}
-+		res.JitterMS = math.Sqrt(variance / float64(len(latencies)))
++		res.JitterMS = math.Sqrt(variance / float64(len(steady)))
 +	}
 +	var progressBytes atomic.Int64
 +	emitProgress(progressOut, "download", 0, res.ExpectedBytes, 0)

@@ -1002,8 +1002,9 @@ private func multiNormalizedGroupKey(_ name: String) -> String {
 }
 
 private let multiPrimarySelectorKeys: Set<String> = [
-    "proxy", "proxies", "select", "selector", "main", "default",
-    "节点选择", "手动切换", "手动选择", "选择节点", "代理", "主节点", "默认", "默认节点", "节点", "全局选择"
+    "proxy", "proxies", "select", "selector", "nodeselect", "proxyselect", "main", "default", "manual",
+    "节点选择", "手动切换", "手动选择", "节点切换", "选择节点", "代理选择", "手动节点",
+    "代理", "主节点", "主代理", "默认", "默认节点", "默认代理", "国外流量", "国外代理", "节点", "全局选择"
 ]
 
 func multiSmartGroupIndex(candidates: [ProxyGroup], testedNames: [String]) -> Int? {
@@ -1029,6 +1030,21 @@ func multiSmartGroupIndex(candidates: [ProxyGroup], testedNames: [String]) -> In
         multiPrimarySelectorKeys.contains(multiNormalizedGroupKey(candidates[$0].name))
     }
     if primaryMatches.count == 1 { return primaryMatches[0] }
+    // Structural parent disambiguation for ACL4SSR/Subconverter configs where the
+    // top-level primary selector (e.g. "🚀 节点选择") embeds a sub-selector ("✋ 手动切换"):
+    // pick the unique primary match that references another primary match and is not referenced back.
+    if primaryMatches.count > 1 {
+        let primaryNames: [Int: Data] = Dictionary(uniqueKeysWithValues: primaryMatches.map { ($0, Data(candidates[$0].name.utf8)) })
+        let primaryMembers: [Int: Set<Data>] = Dictionary(uniqueKeysWithValues: primaryMatches.map { ($0, Set(candidates[$0].all.map { Data($0.utf8) })) })
+        let parents = primaryMatches.filter { idx in
+            let myMembers = primaryMembers[idx] ?? []
+            let myName = primaryNames[idx]!
+            let refsOther = primaryMatches.contains { other in other != idx && myMembers.contains(primaryNames[other]!) }
+            let refdByOther = primaryMatches.contains { other in other != idx && (primaryMembers[other]?.contains(myName) ?? false) }
+            return refsOther && !refdByOther
+        }
+        if parents.count == 1 { return parents[0] }
+    }
     if testedSet.count >= 2 {
         let dominant = nonGlobal.filter { (overlapCounts[$0] ?? 0) * 5 >= testedSet.count * 4 }
         if dominant.count == 1 {

@@ -1,5 +1,7 @@
 """Local SQLite telemetry archive, long-term scoring, patrol planner, and health decay."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import math
@@ -133,6 +135,11 @@ class TelemetryPatrolSelection:
     defender_count: int
     explorer_count: int
     remaining_quota_bytes: int
+    deferred_for_peak_quota: bool = False
+    peak_reserved_bytes: int = 0
+    skipped_backoff_count: int = 0
+    skipped_cooldown_count: int = 0
+    effective_max_per_tick: int = 0
 
 
 def telemetry_is_peak_hour(timestamp):
@@ -144,6 +151,36 @@ def telemetry_is_peak_hour(timestamp):
         return False
     minutes = dt.hour * 60 + dt.minute
     return 20 * 60 <= minutes < (23 * 60 + 30)
+
+
+def telemetry_is_before_peak_hour(timestamp):
+    if not math.isfinite(timestamp):
+        return False
+    try:
+        dt = datetime.fromtimestamp(timestamp)
+    except (OverflowError, OSError, ValueError):
+        return False
+    return (dt.hour * 60 + dt.minute) < (20 * 60)
+
+
+def telemetry_is_overnight_hour(timestamp):
+    if not math.isfinite(timestamp):
+        return False
+    try:
+        dt = datetime.fromtimestamp(timestamp)
+    except (OverflowError, OSError, ValueError):
+        return False
+    minutes = dt.hour * 60 + dt.minute
+    return (1 * 60) <= minutes < (7 * 60)
+
+
+def telemetry_effective_patrol_batch_cap(max_per_tick, now=None, overnight_throttle=False):
+    if max_per_tick <= 0:
+        return 0
+    ts = time.time() if now is None else float(now)
+    if overnight_throttle and telemetry_is_overnight_hour(ts):
+        return min(max_per_tick, max(2, max_per_tick // 2))
+    return max_per_tick
 
 
 def telemetry_payload_weight(requested_bytes):
@@ -222,7 +259,9 @@ def telemetry_compute_health_state(health_events, success_sample_timestamps, now
         if prev_ts is not None and ts > prev_ts:
             streak *= math.exp(-decay_lambda * (ts - prev_ts))
         if kind == 0:
-            streak += 1.0
+            # Saturate failure streak so prolonged overnight outages do not accumulate
+            # unbounded debt that blocks verified recovery (max -25 penalty is reached at 5.0).
+            streak = min(7.0, streak + 1.0)
         elif kind == 1:
             streak = max(0.0, streak * 0.35 - 0.8)
         else:
@@ -361,7 +400,7 @@ def telemetry_compute_summaries(samples, health_events, window="7d", now=None):
             now,
         )
         final_score = max(0.0, min(100.0, base_score - health.penalty)) if item["success_count"] > 0 else 0.0
-        qualified = (item["success_count"] >= 3 and item["availability_rate"] >= 0.5)
+        qualified = (item["success_count"] >= 3 and item["weighted_availability"] >= 0.5)
 
         summaries.append(TelemetryNodeSummary(
             profile_uid=item["profile_uid"],
@@ -414,11 +453,17 @@ def telemetry_patrol_bytes_used_today(samples, now=None):
     next_day = start_of_day + timedelta(days=1)
     start_ts = start_of_day.timestamp()
     end_ts = next_day.timestamp()
-    return sum(
-        max(0, s.requested_bytes)
-        for s in samples
-        if s.source == "patrol" and start_ts <= s.timestamp < end_ts
-    )
+    total = 0
+    for s in samples:
+        if s.source == "patrol" and start_ts <= s.timestamp < end_ts:
+            req = max(0, int(s.requested_bytes))
+            if s.is_success:
+                total += req
+            else:
+                # Failed or timed-out probes never completed the full download;
+                # charge a bounded anti-spin cost (<= 256 KiB) instead of full 1 MiB.
+                total += min(req, 262_144)
+    return total
 
 
 def telemetry_select_patrol_identities(
@@ -429,70 +474,234 @@ def telemetry_select_patrol_identities(
     per_node_bytes=1_048_576,
     max_per_tick=8,
     now=None,
+    reserve_peak_ratio=0.0,
+    defender_cooldown_seconds=5400.0,
+    overnight_throttle=False,
 ):
     now = time.time() if now is None else float(now)
     used_today = telemetry_patrol_bytes_used_today(samples, now=now)
     remaining = max(0, int(daily_quota_bytes) - used_today)
-    if per_node_bytes <= 0 or max_per_tick <= 0:
-        return TelemetryPatrolSelection((), 0, 0, remaining)
+    clamped_reserve = min(0.5, max(0.0, float(reserve_peak_ratio)))
+    is_peak_now = telemetry_is_peak_hour(now)
+    is_before_peak = telemetry_is_before_peak_hour(now)
+    peak_reserved_bytes = (
+        int(max(0, int(daily_quota_bytes)) * clamped_reserve)
+        if (is_before_peak and clamped_reserve > 0)
+        else 0
+    )
+    spendable_now = max(0, remaining - peak_reserved_bytes)
+    effective_batch_cap = telemetry_effective_patrol_batch_cap(
+        max_per_tick, now=now, overnight_throttle=overnight_throttle
+    )
+
+    if per_node_bytes <= 0 or effective_batch_cap <= 0:
+        return TelemetryPatrolSelection(
+            (), 0, 0, remaining,
+            deferred_for_peak_quota=False,
+            peak_reserved_bytes=peak_reserved_bytes,
+            effective_max_per_tick=effective_batch_cap,
+        )
 
     unique_candidates = []
     seen = set()
+    profile_order_map = {}
+    profile_count_map = {}
+    round_robin_rank = {}
     for item in candidates:
-        if item not in seen:
-            seen.add(item)
-            unique_candidates.append(item)
+        if item in seen:
+            continue
+        seen.add(item)
+        unique_candidates.append(item)
+        p_uid = item[0]
+        if p_uid not in profile_order_map:
+            profile_order_map[p_uid] = len(profile_order_map)
+        within = profile_count_map.get(p_uid, 0)
+        profile_count_map[p_uid] = within + 1
+        round_robin_rank[item] = (within, profile_order_map[p_uid])
 
-    affordable = remaining // per_node_bytes
-    target_count = min(max_per_tick, affordable, len(unique_candidates))
+    affordable = spendable_now // per_node_bytes
+    target_count = min(effective_batch_cap, affordable, len(unique_candidates))
     if target_count <= 0:
-        return TelemetryPatrolSelection((), 0, 0, remaining)
+        deferred = (remaining >= per_node_bytes and spendable_now < per_node_bytes and peak_reserved_bytes > 0)
+        return TelemetryPatrolSelection(
+            (), 0, 0, remaining,
+            deferred_for_peak_quota=deferred,
+            peak_reserved_bytes=peak_reserved_bytes,
+            effective_max_per_tick=effective_batch_cap,
+        )
+
+    dt_now = datetime.fromtimestamp(now)
+    today_peak_start_ts = dt_now.replace(hour=20, minute=0, second=0, microsecond=0).timestamp()
+
+    seven_day_cutoff = now - 7.0 * 86400.0
+    samples_by_id = {}
+    last_sample_by_id = {}
+    has_recent_peak_sample = set()
+    for s in samples:
+        if not math.isfinite(s.timestamp) or s.timestamp > now + 60.0:
+            continue
+        ident = s.identity
+        if ident not in seen:
+            continue
+        samples_by_id.setdefault(ident, []).append(s)
+        prev = last_sample_by_id.get(ident)
+        if prev is None or s.timestamp > prev:
+            last_sample_by_id[ident] = s.timestamp
+        if s.is_peak_hour and s.timestamp >= seven_day_cutoff:
+            has_recent_peak_sample.add(ident)
+
+    consecutive_failures = {}
+    for ident, slist in samples_by_id.items():
+        ordered = sorted(slist, key=lambda x: x.timestamp, reverse=True)
+        streak = 0
+        for item in ordered:
+            if item.is_success:
+                break
+            streak += 1
+        if streak > 0:
+            consecutive_failures[ident] = streak
+
+    def is_in_failure_backoff(ident):
+        streak = consecutive_failures.get(ident, 0)
+        last_ts = last_sample_by_id.get(ident)
+        if streak < 2 or last_ts is None:
+            return False
+        backoff_hours = min(24.0, (2.0 ** (streak - 2)) * 2.0)
+        return (now - last_ts) < (backoff_hours * 3600.0)
 
     summaries_7d = [
         s for s in telemetry_compute_summaries(samples, health_events, window="7d", now=now)
         if s.identity in seen and s.success_count > 0
     ]
+    summary_7d_by_id = {s.identity: s for s in summaries_7d}
+
     defender_cap = 0 if target_count <= 1 else min(4, target_count // 2)
     defenders = []
     picked = set()
+
+    effective_cooldown = max(0.0, float(defender_cooldown_seconds))
+    recheck_cooldown = min(effective_cooldown, 300.0)
+    explorer_cooldown = min(effective_cooldown, 900.0)
+    graduation_cooldown = min(effective_cooldown, 1200.0)
+    defender_slot_cooldown = min(effective_cooldown, 2700.0) if is_peak_now else effective_cooldown
+
+    # Priority 1: up to 1 fast re-verification slot for the highest base-score node with active
+    # passive health penalty (sorted by base_score desc so heavy penalties don't hide flagship nodes).
+    if defender_cap > 0:
+        penalized = [
+            s for s in summaries_7d
+            if s.health_penalty > 0 and s.base_score >= 50.0 and not is_in_failure_backoff(s.identity)
+            and (now - last_sample_by_id.get(s.identity, s.last_tested_at)) >= recheck_cooldown
+        ]
+        penalized.sort(
+            key=lambda s: (
+                -round(s.base_score, 6),
+                -round(s.health_penalty, 6),
+                last_sample_by_id.get(s.identity, s.last_tested_at),
+            )
+        )
+        if penalized:
+            top_pen = penalized[0].identity
+            picked.add(top_pen)
+            defenders.append(top_pen)
+
+    # Priority 2: qualified 7d leaders outside cooldown (evening peak bypasses daytime cooldown on first check).
     for summary in summaries_7d:
         if len(defenders) >= defender_cap:
             break
-        if summary.identity not in picked:
-            picked.add(summary.identity)
-            defenders.append(summary.identity)
+        if not summary.is_qualified:
+            continue
+        ident = summary.identity
+        if ident in picked or is_in_failure_backoff(ident):
+            continue
+        last_ts = last_sample_by_id.get(ident, summary.last_tested_at)
+        needs_first_peak = is_peak_now and last_ts < today_peak_start_ts
+        required_gap = recheck_cooldown if needs_first_peak else defender_slot_cooldown
+        if required_gap > 0 and (now - last_ts) < required_gap:
+            continue
+        picked.add(ident)
+        defenders.append(ident)
 
-    last_sample_by_id = {}
-    for s in samples:
-        if math.isfinite(s.timestamp) and s.timestamp <= now + 60.0:
-            prev = last_sample_by_id.get(s.identity)
-            if prev is None or s.timestamp > prev:
-                last_sample_by_id[s.identity] = s.timestamp
+    # Explorer selection with strict backoff & cooldown enforcement + multi-sub round-robin + graduation assist
+    skipped_backoff = 0
+    skipped_cooldown = 0
+    tier0 = []
+    tier1 = []
+    tier2 = []
 
-    explorers_pool = [
-        (idx, ident)
-        for idx, ident in enumerate(unique_candidates)
-        if ident not in picked
-    ]
-    explorers_pool.sort(
-        key=lambda pair: (
-            0 if pair[1] not in last_sample_by_id else 1,
-            last_sample_by_id.get(pair[1], 0.0),
-            pair[0],
-        )
-    )
-    remaining_slots = max(0, target_count - len(defenders))
+    for offset, ident in enumerate(unique_candidates):
+        if ident in picked:
+            continue
+        within_p, p_order = round_robin_rank.get(ident, (offset, 0))
+        last_ts = last_sample_by_id.get(ident)
+        if last_ts is None:
+            tier0.append((within_p, p_order, offset, ident))
+            continue
+        if is_in_failure_backoff(ident):
+            skipped_backoff += 1
+            continue
+        needs_first_peak = is_peak_now and last_ts < today_peak_start_ts
+        s7 = summary_7d_by_id.get(ident)
+        if (
+            s7 is not None
+            and not s7.is_qualified
+            and 1 <= s7.success_count < 3
+            and s7.weighted_availability_rate >= 0.5
+        ):
+            req_gap = recheck_cooldown if needs_first_peak else graduation_cooldown
+            if req_gap > 0 and (now - last_ts) < req_gap:
+                skipped_cooldown += 1
+                continue
+            needs_peak = is_peak_now and (ident not in has_recent_peak_sample)
+            tier1.append((0 if needs_peak else 1, -round(s7.base_score, 6), last_ts, offset, s7.base_score, ident))
+            continue
+        req_gap = recheck_cooldown if needs_first_peak else explorer_cooldown
+        if req_gap > 0 and (now - last_ts) < req_gap:
+            skipped_cooldown += 1
+            continue
+        needs_peak = is_peak_now and (ident not in has_recent_peak_sample)
+        tier2.append((0 if needs_peak else 1, last_ts, offset, ident))
+
+    tier0.sort(key=lambda x: (x[0], x[1], x[2]))
+    tier1.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
+    tier2.sort(key=lambda x: (x[0], x[1], x[2]))
+
     explorers = []
-    for _, ident in explorers_pool[:remaining_slots]:
-        if ident not in picked:
-            picked.add(ident)
-            explorers.append(ident)
+    remaining_slots = max(0, target_count - len(defenders))
+
+    unfilled_defenders = max(0, defender_cap - len(defenders))
+    if unfilled_defenders > 0 and remaining_slots > 0 and tier0:
+        grad_budget = min(unfilled_defenders, max(1, remaining_slots // 2))
+        grad_used = 0
+        for item in tier1:
+            if grad_used >= grad_budget or len(explorers) >= remaining_slots:
+                break
+            if item[4] >= 55.0 and item[5] not in picked:
+                picked.add(item[5])
+                explorers.append(item[5])
+                grad_used += 1
+
+    for pool, idx_pos in ((tier0, 3), (tier1, 5), (tier2, 3)):
+        if len(explorers) >= remaining_slots:
+            break
+        for item in pool:
+            if len(explorers) >= remaining_slots:
+                break
+            ident = item[idx_pos]
+            if ident not in picked:
+                picked.add(ident)
+                explorers.append(ident)
 
     return TelemetryPatrolSelection(
         identities=tuple(defenders + explorers),
         defender_count=len(defenders),
         explorer_count=len(explorers),
         remaining_quota_bytes=remaining,
+        deferred_for_peak_quota=False,
+        peak_reserved_bytes=peak_reserved_bytes,
+        skipped_backoff_count=skipped_backoff,
+        skipped_cooldown_count=skipped_cooldown,
+        effective_max_per_tick=effective_batch_cap,
     )
 
 
@@ -758,7 +967,17 @@ class TelemetryHistoryStore:
                 now=effective_now,
             )
 
-    def select_patrol_plan(self, candidates, daily_quota_bytes, per_node_bytes=1_048_576, max_per_tick=8, now=None):
+    def select_patrol_plan(
+        self,
+        candidates,
+        daily_quota_bytes,
+        per_node_bytes=1_048_576,
+        max_per_tick=8,
+        now=None,
+        reserve_peak_ratio=0.0,
+        defender_cooldown_seconds=5400.0,
+        overnight_throttle=False,
+    ):
         with self._lock:
             effective_now = self.now_provider() if now is None else float(now)
             cutoff = effective_now - self.retention_days * 86400.0
@@ -770,6 +989,9 @@ class TelemetryHistoryStore:
                 per_node_bytes=per_node_bytes,
                 max_per_tick=max_per_tick,
                 now=effective_now,
+                reserve_peak_ratio=reserve_peak_ratio,
+                defender_cooldown_seconds=defender_cooldown_seconds,
+                overnight_throttle=overnight_throttle,
             )
 
     def patrol_bytes_used_today(self, now=None):

@@ -450,6 +450,7 @@ private func fixtureRows(_ rows: [MultiRow]) -> [[String: Any]] {
             let customFullA = ProxyGroup(name: "Alpha", now: "N1", all: nodes)
             let customFullB = ProxyGroup(name: "Beta", now: "N1", all: nodes)
             let manualAlt = ProxyGroup(name: "手动切换", now: "N1", all: nodes)
+            let parentSelect = ProxyGroup(name: "🚀 节点选择", now: "手动切换", all: ["手动切换"] + nodes)
             out = [
                 "globalAndProxy": pick([global, proxyFull]),
                 "globalFullAndPartial": pick([global, partialHK, customFullA]),
@@ -457,6 +458,7 @@ private func fixtureRows(_ rows: [MultiRow]) -> [[String: Any]] {
                 "dominantMainOverPartial": pick([global, partialHK, dominantMain]),
                 "ambiguousTie": pick([global, customFullA, customFullB]),
                 "ambiguousTwoPrimaries": pick([global, emojiSelect, manualAlt]),
+                "parentSelectOverChildManual": pick([global, parentSelect, manualAlt]),
                 "globalOnly": pick([global]),
             ]
         case "groups":
@@ -778,6 +780,7 @@ class MultiAppHeadlessTests(unittest.TestCase):
             "dominantMainOverPartial": "自定义主组",
             "ambiguousTie": "none",
             "ambiguousTwoPrimaries": "none",
+            "parentSelectOverChildManual": "🚀 节点选择",
             "globalOnly": "none",
         })
 

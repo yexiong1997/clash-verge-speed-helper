@@ -4,6 +4,7 @@ let state = {profiles: [], rows: [], groups: [], running: false, status: "准备
 let active = null, busy = false, sortColumn = "score", sortAscending = false, groupToRestore = null, lastSelectedGroup = "";
 let viewMode = "live", historyWindow = "7d", historySelectedOnly = true, historySortColumn = "rank", historySortAscending = false;
 let historySummaries = [], historyActiveKey = null;
+const historySelectedKeys = new Set();
 let refreshSeq = 0, actionEpoch = 0, refreshInFlight = false, historySeq = 0;
 let pendingConfirm = null;
 let lastProfilesSig = null, lastGroupsSig = null;
@@ -148,6 +149,78 @@ function selectedNodes() {
 }
 function selectionSignature() { return JSON.stringify(selectedNodes().map(key)); }
 function groupsSignature() { return JSON.stringify((state.groups || []).map(g => [g.name, g.now])); }
+
+function checkedVisibleHistory() {
+  return visibleHistory().filter(s => historySelectedKeys.has(key(s)));
+}
+
+function selectedHistoryTargets(preferredRow = null) {
+  const visChecked = checkedVisibleHistory();
+  if (visChecked.length) return visChecked;
+  const allChecked = historySummaries.filter(s => historySelectedKeys.has(key(s)));
+  if (allChecked.length) return allChecked;
+  if (preferredRow) return [preferredRow];
+  const actRow = visibleHistory().find(s => key(s) === historyActiveKey);
+  return actRow ? [actRow] : [];
+}
+
+function isResolvableLiveTarget(row) {
+  if (!row || row.available === false) return false;
+  const compatProf = state.profiles.some(p => p.uid === row.uid && p.compatible !== false);
+  return compatProf && state.rows.some(r => r.uid === row.uid && r.name === row.name);
+}
+
+function resolvableHistoryTargets(targets) {
+  return (targets || []).filter(isResolvableLiveTarget);
+}
+
+function historySelectionSignature(targets) {
+  return JSON.stringify((targets || []).map(key));
+}
+
+function pruneHistorySelection() {
+  const valid = new Set(historySummaries.map(key));
+  for (const k of Array.from(historySelectedKeys)) {
+    if (!valid.has(k)) historySelectedKeys.delete(k);
+  }
+}
+
+function updateHistorySelectionUi(announce = false) {
+  const items = visibleHistory();
+  const checkedCount = items.filter(s => historySelectedKeys.has(key(s))).length;
+  if (viewMode === "history") {
+    $("count").textContent = checkedCount > 0 ? (items.length + " 候选 · 已选 " + checkedCount) : (items.length + " 候选");
+  }
+  const selAllBtn = $("history-select-all");
+  const clrSelBtn = $("history-clear-sel");
+  const blocked = state.running || busy;
+  if (selAllBtn) selAllBtn.disabled = blocked || items.length === 0;
+  if (clrSelBtn) clrSelBtn.disabled = blocked || historySelectedKeys.size === 0;
+  if (announce) {
+    notify(checkedCount > 0
+      ? ("长效优选榜已勾选 " + checkedCount + " / " + items.length + " 个节点；可直接点击上方开始测速、加压复测或右键批量操作")
+      : "已取消勾选长效候选节点");
+  }
+}
+
+async function syncHistoryTargetsToLiveRaw(targets) {
+  const resolvable = resolvableHistoryTargets(targets);
+  if (!resolvable.length) {
+    notify("已勾选的历史节点不在当前已加载的订阅列表中", true);
+    return false;
+  }
+  const profs = [...new Set([
+    ...state.profiles.filter(p => p.selected && p.compatible !== false).map(p => p.uid),
+    ...resolvable.map(r => r.uid)
+  ])];
+  const ok = await call("set_selection", {
+    profiles: profs,
+    nodes: resolvable.map(r => ({uid: r.uid, name: r.name}))
+  });
+  if (!ok) return false;
+  await refreshState();
+  return true;
+}
 function formatBytes(bytes) {
   const mib = Number(bytes || 0) / 1048576;
   return mib >= 1 ? `${mib.toFixed(1)} MiB` : `${Math.max(0, Math.round(Number(bytes || 0) / 1024))} KiB`;
@@ -581,7 +654,7 @@ function renderEmptyState(mode, itemsLength) {
 function renderHistoryRows() {
   const host = $("rows");
   const items = visibleHistory();
-  $("count").textContent = `${items.length} 候选`;
+  updateHistorySelectionUi(false);
   renderEmptyState("history", items.length);
   rowCache.clear();
   host.replaceChildren();
@@ -593,14 +666,36 @@ function renderHistoryRows() {
     const rk = key(s);
     const isCurrent = isActiveUsingRow(s);
     const isTopRank = idx === 0 && historySortColumn === "rank" && s.long_term_score > 0;
+    const isChecked = historySelectedKeys.has(rk);
     tr.classList.toggle("active", historyActiveKey === rk);
+    tr.classList.toggle("hist-checked", isChecked);
     tr.classList.toggle("is-current-node", isCurrent);
     tr.classList.toggle("is-rank-1", isTopRank);
     tr.onclick = () => { historyActiveKey = rk; renderHistoryRows(); updateChampion(); };
     tr.ondblclick = () => { historyActiveKey = rk; renderHistoryRows(); confirmManual(tr); };
 
     const tdRank = document.createElement("td");
-    tdRank.textContent = isTopRank ? "#1" : String(idx + 1);
+    const rankWrap = document.createElement("div");
+    rankWrap.className = "hist-rank-cell";
+    const rankSpan = document.createElement("span");
+    rankSpan.className = "hist-rank-text";
+    rankSpan.textContent = isTopRank ? "#1" : String(idx + 1);
+    const hbox = document.createElement("input");
+    hbox.type = "checkbox";
+    hbox.className = "hist-check";
+    hbox.checked = isChecked;
+    hbox.disabled = Boolean(state.running || busy);
+    hbox.setAttribute("aria-label", "勾选历史节点 " + s.name);
+    hbox.onclick = e => e.stopPropagation();
+    hbox.ondblclick = e => e.stopPropagation();
+    hbox.onchange = () => {
+      if (hbox.checked) historySelectedKeys.add(rk);
+      else historySelectedKeys.delete(rk);
+      tr.classList.toggle("hist-checked", hbox.checked);
+      updateHistorySelectionUi(true);
+    };
+    rankWrap.append(rankSpan, hbox);
+    tdRank.append(rankWrap);
     tr.append(tdRank);
 
     if (s.health_penalty > 0) tr.append(makeBadgeCell("扣分", "badge-penalty"));
@@ -1102,6 +1197,91 @@ function renderGroups() {
   }
 }
 
+function buildPatrolMeta() {
+  const patrol = state.patrol || {};
+  const quotaBytes = Number(patrol.quota_bytes || $("patrol-quota")?.value || 80 * 1048576);
+  const quotaMib = Math.max(1, Math.round(quotaBytes / 1048576));
+  const usedMib = Math.ceil((patrol.used_bytes || 0) / 1048576);
+  const intervalMin = Number(patrol.interval_minutes || (quotaBytes >= 150 * 1048576 ? 30 : 60));
+  const defaultBatch = quotaBytes >= 300 * 1048576 ? 8 : (quotaBytes >= 150 * 1048576 ? 6 : (quotaBytes >= 80 * 1048576 ? 5 : 4));
+  const batchCap = Number(patrol.max_per_tick || defaultBatch);
+  const nightCap = Math.max(2, Math.floor(batchCap / 2));
+  const peakReserveMib = Math.max(1, Math.floor(quotaMib / 4));
+  const stateLine = $("patrol-note")?.textContent || (patrol.armed ? "巡检已启用" : "巡检未启用");
+  return {quotaBytes, quotaMib, usedMib, intervalMin, batchCap, nightCap, peakReserveMib, stateLine};
+}
+
+function buildPatrolToolTip() {
+  const m = buildPatrolMeta();
+  return [
+    "智能巡检（后台低干扰积累长效评分）",
+    "• 按配额自动配速：每 " + m.intervalMin + " 分钟以 2 并发抽测最多 " + m.batchCap + " 节点（深夜 01:00–07:00 减半至 " + m.nightCap + " 节点，每节点 1 MiB / 2 流），结果归档至「长效优选榜」。",
+    "• 智能轮换挑点：健康扣分旗舰 5 分钟快复核 + 合格守擂 90 分钟轮换（晚高峰 45 分钟且首轮直测）+ 多订阅轮询冷启动与潜力节点快速毕业。",
+    "• 死节点退避与晚高峰保护：连续失败节点严格退避 2~24 小时不重复探测（失败仅计 ≤256 KiB）；20:00 前预留 25%（约 " + m.peakReserveMib + " MiB）供晚高峰及夜间采样。",
+    "• 只测速不改动节点勾选，也不会自动切换代理节点；支持托盘后台运行。",
+    "当前状态：" + m.stateLine + "（今日 " + m.usedMib + "/" + m.quotaMib + " MiB）"
+  ].join("\n");
+}
+
+function renderPatrolPopoverContent() {
+  const m = buildPatrolMeta();
+  if ($("patrol-pop-sub")) {
+    $("patrol-pop-sub").textContent = "每 " + m.intervalMin + " 分钟最多 " + m.batchCap + " 节点 · 今日 " + m.usedMib + "/" + m.quotaMib + " MiB（晚高峰预留 " + m.peakReserveMib + " MiB）";
+  }
+  const list = $("patrol-pop-list");
+  if (list) {
+    const bullets = [
+      "全天均衡配速：按日配额自动控速（深夜 01:00–07:00 减半至 " + m.nightCap + " 节点），20:00 前预留 25% 给晚高峰采样，避免通宵或午前耗尽预算。",
+      "守擂轮换与冷启动：健康扣分旗舰 5 分钟快复核；合格主力 90 分钟轮换（晚高峰 45 分钟）；多订阅交错探索并优先助推 1–2 样本潜力节点达标。",
+      "死节点严格退避：连续失败节点自动跳过 2~24 小时指数退避窗口，失败探针仅计低额防空转成本（≤256 KiB）。",
+      "低干扰且安全：仅 2 并发 1 MiB 轻量采样，绝不改勾选、不会自动切换节点，支持托盘后台运行。"
+    ];
+    list.replaceChildren();
+    for (const line of bullets) {
+      const li = document.createElement("li");
+      li.textContent = line;
+      list.append(li);
+    }
+  }
+}
+
+function closePatrolPopover(restoreFocus = false) {
+  const pop = $("patrol-popover");
+  if (!pop || pop.hidden) return;
+  pop.hidden = true;
+  if ($("patrol-info")) {
+    $("patrol-info").setAttribute("aria-expanded", "false");
+    if (restoreFocus && typeof $("patrol-info").focus === "function") $("patrol-info").focus();
+  }
+}
+
+function openPatrolPopover() {
+  const pop = $("patrol-popover");
+  const btn = $("patrol-info");
+  if (!pop || !btn) return;
+  closeRowMenu();
+  renderPatrolPopoverContent();
+  pop.hidden = false;
+  btn.setAttribute("aria-expanded", "true");
+  const rect = btn.getBoundingClientRect();
+  const popRect = pop.getBoundingClientRect();
+  const popW = popRect.width || 360;
+  const popH = popRect.height || 230;
+  const vw = typeof window !== "undefined" ? (window.innerWidth || 1240) : 1240;
+  const vh = typeof window !== "undefined" ? (window.innerHeight || 800) : 800;
+  const left = Math.max(12, Math.min(rect.left - popW + 24, vw - popW - 12));
+  const top = Math.max(12, Math.min(rect.bottom + 8, vh - popH - 12));
+  pop.style.left = left + "px";
+  pop.style.top = top + "px";
+}
+
+function togglePatrolPopover() {
+  const pop = $("patrol-popover");
+  if (!pop) return;
+  if (pop.hidden) openPatrolPopover();
+  else closePatrolPopover(true);
+}
+
 function renderPatrolAndHealth() {
   const patrol = state.patrol || {};
   const quotaSelect = $("patrol-quota");
@@ -1132,6 +1312,14 @@ function renderPatrolAndHealth() {
       patrolNote.textContent = patrol.summary || `今日 ${usedMib}/${quotaMib} MiB`;
     }
     patrolNote.classList.toggle("armed", Boolean(patrol.armed));
+  }
+  const patrolHelp = buildPatrolToolTip();
+  if (toggleBtn) toggleBtn.title = patrolHelp;
+  if (quotaSelect) quotaSelect.title = patrolHelp;
+  if ($("patrol-info")) $("patrol-info").title = patrolHelp;
+  if (patrolNote) patrolNote.title = patrolHelp;
+  if ($("patrol-popover") && !$("patrol-popover").hidden) {
+    renderPatrolPopoverContent();
   }
   const health = state.health_probe || {};
   const pill = $("health-pill");
@@ -1195,6 +1383,7 @@ function render() {
   $("undo").disabled = blocked || !state.undo || unknown;
   $("continue").disabled = blocked || !state.pending?.ready || unknown;
   if ($("clear-history")) $("clear-history").disabled = blocked;
+  if (viewMode === "history") updateHistorySelectionUi(false);
   const tunNotice = $("tun-notice");
   if (tunNotice) tunNotice.hidden = state.tun_enabled !== true;
   if ($("minimize-to-tray") && state.minimize_to_tray !== undefined) {
@@ -1222,6 +1411,7 @@ async function fetchHistory() {
     const res = await api().get_history({window: historyWindow});
     if (seq !== historySeq || !res?.ok) return;
     historySummaries = res.summaries || [];
+    pruneHistorySelection();
     if (viewMode === "history") renderHistoryRows();
   } catch (_) {}
 }
@@ -1364,6 +1554,24 @@ if ($("history-selected-only")) {
     renderHistoryRows();
   };
 }
+if ($("history-select-all")) {
+  $("history-select-all").onclick = () => {
+    if (busy || state.running) return;
+    const items = visibleHistory();
+    if (!items.length) return;
+    for (const item of items) historySelectedKeys.add(key(item));
+    renderHistoryRows();
+    updateHistorySelectionUi(true);
+  };
+}
+if ($("history-clear-sel")) {
+  $("history-clear-sel").onclick = () => {
+    if (busy || state.running || !historySelectedKeys.size) return;
+    historySelectedKeys.clear();
+    renderHistoryRows();
+    notify("已清空长效优选榜勾选");
+  };
+}
 if ($("history-search")) $("history-search").oninput = renderHistoryRows;
 if ($("clear-history")) {
   $("clear-history").onclick = async () => {
@@ -1376,6 +1584,7 @@ if ($("clear-history")) {
       const ok = await runBusy(async () => await call("clear_history"));
       if (ok) {
         historySummaries = [];
+        historySelectedKeys.clear();
         renderHistoryRows();
       }
       return;
@@ -1408,9 +1617,13 @@ if ($("patrol-quota")) {
       runBusy(async () => {
         await call("set_patrol", {enabled: false, quota_bytes: quotaVal});
       });
+    } else {
+      renderPatrolAndHealth();
     }
   };
 }
+if ($("patrol-info")) $("patrol-info").onclick = () => togglePatrolPopover();
+if ($("patrol-pop-close")) $("patrol-pop-close").onclick = () => closePatrolPopover(true);
 
 if ($("health-pill")) {
   $("health-pill").onclick = async () => {
@@ -1449,8 +1662,51 @@ $("mode").onchange = () => { persistPreferences({mode: $("mode").value}); return
 $("interval").onchange = () => { persistPreferences({interval: Number($("interval").value)}); return parametersChanged(); };
 $("auto").onchange = parametersChanged;
 
+function confirmBatchHistoryStress(targets, trigger) {
+  if (busy || state.running) return;
+  const resolvable = resolvableHistoryTargets(targets);
+  if (!resolvable.length) { notify("已勾选的历史节点不在当前已加载的订阅列表中", true); return; }
+  const count = resolvable.length;
+  const locked = Boolean(state.outcome_unknown);
+  const auto = locked ? false : $("auto").checked;
+  const group = locked ? "" : $("group").value;
+  const estimate = (count * 20).toFixed(1);
+  const snap = {
+    optionsSig: optionsSignature(),
+    histSig: historySelectionSignature(resolvable),
+    outcomeUnknown: locked
+  };
+  openConfirm({
+    title: "确认加压验证 · 20M",
+    message: "对已勾选的 " + count + " 个长效优选节点执行加压验证（并发 2 / 每节点 20 MiB / 精确模式），预计产生约 " + estimate + " MiB 实际流量。自动切换" + (auto ? "已开启" : "未开启") + (auto && group ? ("，目标策略组“" + group + "”") : "") + "。",
+    trigger,
+    validate: () => Boolean(state.outcome_unknown) === snap.outcomeUnknown &&
+      optionsSignature() === snap.optionsSig &&
+      historySelectionSignature(resolvableHistoryTargets(selectedHistoryTargets())) === snap.histSig,
+    onAccept: async () => {
+      await runBusy(async () => {
+        const synced = await syncHistoryTargetsToLiveRaw(resolvable);
+        if (!synced) return;
+        setViewMode("live");
+        $("parallel").value = "2";
+        $("size").value = "20971520";
+        $("mode").value = "accurate";
+        if (state.schedule_minutes) await call("set_schedule", {minutes: 0});
+        await call("start", options());
+      });
+    }
+  });
+}
+
 $("stress").onclick = () => {
   if (busy || state.running) return;
+  if (viewMode === "history") {
+    const histChecked = checkedVisibleHistory();
+    if (histChecked.length) {
+      confirmBatchHistoryStress(histChecked, $("stress"));
+      return;
+    }
+  }
   const count = selectedNodes().length;
   if (!count) { notify("请先选择要测速的节点", true); return; }
   const locked = Boolean(state.outcome_unknown);
@@ -1464,7 +1720,7 @@ $("stress").onclick = () => {
   };
   openConfirm({
     title: "确认加压验证 · 20M",
-    message: `对已勾选的 ${count} 个节点执行加压验证（并发 2 / 每节点 20 MiB / 精确模式），预计产生约 ${estimate} MiB 实际流量。自动切换${auto ? "已开启" : "未开启"}${auto && group ? `，目标策略组“${group}”` : ""}。`,
+    message: "对已勾选的 " + count + " 个节点执行加压验证（并发 2 / 每节点 20 MiB / 精确模式），预计产生约 " + estimate + " MiB 实际流量。自动切换" + (auto ? "已开启" : "未开启") + (auto && group ? ("，目标策略组“" + group + "”") : "") + "。",
     trigger: $("stress"),
     validate: () => Boolean(state.outcome_unknown) === snap.outcomeUnknown &&
       optionsSignature() === snap.optionsSig &&
@@ -1483,7 +1739,14 @@ $("stress").onclick = () => {
 
 $("funnel").onclick = () => {
   if (busy || state.running) return;
-  const count = selectedNodes().length;
+  const histChecked = viewMode === "history" ? checkedVisibleHistory() : [];
+  const histResolvable = histChecked.length ? resolvableHistoryTargets(histChecked) : [];
+  if (histChecked.length && !histResolvable.length) {
+    notify("已勾选的历史节点不在当前已加载的订阅列表中", true);
+    return;
+  }
+  const usingHist = histResolvable.length > 0;
+  const count = usingHist ? histResolvable.length : selectedNodes().length;
   if (!count) { notify("请先选择要测速的节点", true); return; }
   const top = 10, estimate = count + Math.min(count, top) * 20;
   const locked = Boolean(state.outcome_unknown);
@@ -1491,19 +1754,27 @@ $("funnel").onclick = () => {
   const group = locked ? "" : $("group").value;
   const snap = {
     top,
+    usingHist,
     optionsSig: optionsSignature(),
-    selectionSig: selectionSignature(),
+    selectionSig: usingHist ? historySelectionSignature(histResolvable) : selectionSignature(),
     outcomeUnknown: locked
   };
   openConfirm({
     title: "确认智能两段优选",
-    message: `先以每节点 1 MiB 初筛，再对综合分前 ${top} 名以 20 MiB 复测。预计最多约 ${estimate} MiB（不是流量上限）。自动切换${auto ? "已开启" : "未开启"}${auto && group ? `，目标策略组“${group}”` : ""}。`,
+    message: "先以每节点 1 MiB 初筛，再对综合分前 " + top + " 名以 20 MiB 复测。预计最多约 " + estimate + " MiB（不是流量上限）。自动切换" + (auto ? "已开启" : "未开启") + (auto && group ? ("，目标策略组“" + group + "”") : "") + "。",
     trigger: $("funnel"),
     validate: () => Boolean(state.outcome_unknown) === snap.outcomeUnknown &&
       optionsSignature() === snap.optionsSig &&
-      selectionSignature() === snap.selectionSig,
+      (snap.usingHist
+        ? historySelectionSignature(resolvableHistoryTargets(checkedVisibleHistory())) === snap.selectionSig
+        : selectionSignature() === snap.selectionSig),
     onAccept: async () => {
       await runBusy(async () => {
+        if (snap.usingHist) {
+          const synced = await syncHistoryTargetsToLiveRaw(histResolvable);
+          if (!synced) return;
+          setViewMode("live");
+        }
         await call("start_funnel", {...options(), top_count: top});
       });
     }
@@ -1629,7 +1900,14 @@ $("switch-best").onclick = () => {
   confirmManual($("switch-best"));
 };
 $("start").onclick = () => runBusy(async () => {
-  if (viewMode === "history") setViewMode("live");
+  if (viewMode === "history") {
+    const histChecked = checkedVisibleHistory();
+    if (histChecked.length) {
+      const synced = await syncHistoryTargetsToLiveRaw(histChecked);
+      if (!synced) return;
+    }
+    setViewMode("live");
+  }
   await call("start", options());
 });
 $("stop").onclick = async () => { await call("stop"); await refreshState(); };
@@ -1712,6 +1990,7 @@ function locateInLiveQueue(row) {
 }
 function openRowMenu(row, x, y, trigger = null) {
   if (!row || busy) return;
+  closePatrolPopover();
   const isHist = viewMode === "history";
   if (isHist) historyActiveKey = key(row);
   else active = key(row);
@@ -1719,6 +1998,9 @@ function openRowMenu(row, x, y, trigger = null) {
   menuTrigger = trigger;
   const menu = $("row-menu");
   menu.hidden = false;
+  const targets = isHist ? selectedHistoryTargets(row) : [row];
+  const batchCount = isHist ? targets.length : 1;
+  const resolvable = isHist ? resolvableHistoryTargets(targets) : (isResolvableLiveTarget(row) ? [row] : []);
   const isCurrentProf = state.profiles.some(p => p.uid === row.uid && p.current);
   const isCompatProf = state.profiles.some(p => p.uid === row.uid && p.compatible !== false);
   const inLiveCatalog = state.rows.some(r => r.uid === row.uid && r.name === row.name);
@@ -1727,25 +2009,33 @@ function openRowMenu(row, x, y, trigger = null) {
     ? Boolean($("group").value)
     : Boolean(bridgeReady && isCompatProf);
   $("menu-switch").disabled = state.running || Boolean(state.outcome_unknown) || !canSwitchRow || (isHist && row.available === false);
-  $("menu-retest").disabled = state.running || !isCompatProf || (isHist && row.available === false);
+  $("menu-retest").textContent = batchCount > 1 ? ("批量 20MiB 加压复测已选 (" + batchCount + " 个)") : "单独 20MiB 加压复测此节点";
+  $("menu-retest").disabled = isHist
+    ? (state.running || resolvable.length === 0)
+    : (state.running || !isCompatProf);
   if ($("menu-locate")) {
     $("menu-locate").hidden = !isHist;
-    $("menu-locate").disabled = !inLiveCatalog;
+    $("menu-locate").textContent = batchCount > 1 ? ("将已选 " + batchCount + " 个同步到实时队列") : "在实时队列中查看";
+    $("menu-locate").disabled = batchCount > 1 ? (state.running || resolvable.length === 0) : !inLiveCatalog;
   }
-  if ($("menu-live-sep")) $("menu-live-sep").hidden = isHist;
+  if ($("menu-live-sep")) $("menu-live-sep").hidden = false;
   if ($("menu-only-node")) {
-    $("menu-only-node").hidden = isHist;
+    $("menu-only-node").hidden = false;
     $("menu-only-node").disabled = state.running;
   }
   if ($("menu-filter-profile")) {
     $("menu-filter-profile").hidden = isHist;
-    $("menu-filter-profile").textContent = row.profile ? `仅筛选「${row.profile}」` : "仅筛选「同订阅」";
+    $("menu-filter-profile").textContent = row.profile ? ("仅筛选「" + row.profile + "」") : "仅筛选「同订阅」";
     $("menu-filter-profile").disabled = !row.profile;
   }
-  if ($("menu-copy-summary")) $("menu-copy-summary").disabled = false;
+  $("menu-copy").textContent = batchCount > 1 ? ("复制已选节点名称 (" + batchCount + " 个)") : "复制节点名称";
+  if ($("menu-copy-summary")) {
+    $("menu-copy-summary").textContent = batchCount > 1 ? ("复制已选测速摘要 (" + batchCount + " 个)") : "复制测速摘要";
+    $("menu-copy-summary").disabled = false;
+  }
   const bounds = menu.getBoundingClientRect();
-  menu.style.left = `${Math.max(0, Math.min(x, window.innerWidth - bounds.width - 8))}px`;
-  menu.style.top = `${Math.max(0, Math.min(y, window.innerHeight - bounds.height - 8))}px`;
+  menu.style.left = Math.max(0, Math.min(x, window.innerWidth - bounds.width - 8)) + "px";
+  menu.style.top = Math.max(0, Math.min(y, window.innerHeight - bounds.height - 8)) + "px";
   $("menu-copy").focus();
 }
 function menuRow() { return findLiveOrHistoryRow(menuTarget); }
@@ -1757,13 +2047,59 @@ function eventRow(target) {
 $("rows").addEventListener("contextmenu", event => { const row = eventRow(event.target); if (!row) return; event.preventDefault(); openRowMenu(row, event.clientX, event.clientY, event.target); });
 $("rows").addEventListener("keydown", event => { if (event.key !== "ContextMenu" && !(event.shiftKey && event.key === "F10")) return; const row = eventRow(event.target); if (!row) return; event.preventDefault(); const bounds = event.target.getBoundingClientRect(); openRowMenu(row, bounds.left, bounds.bottom, event.target); });
 $("menu-switch").onclick = () => { const row = menuRow(); const trigger = menuTrigger; closeRowMenu(); if (!row || busy || state.running || state.outcome_unknown) return; if (viewMode === "history") { historyActiveKey = key(row); renderHistoryRows(); } else { active = key(row); renderRows(); } confirmManual(trigger || $("manual")); };
-$("menu-retest").onclick = () => { const row = menuRow(); const trigger = menuTrigger; closeRowMenu(); retestRow(row, trigger || $("retest-best")); };
-if ($("menu-locate")) $("menu-locate").onclick = () => { const row = menuRow(); closeRowMenu(); locateInLiveQueue(row); };
+$("menu-retest").onclick = () => {
+  const row = menuRow();
+  const trigger = menuTrigger;
+  closeRowMenu();
+  if (!row) return;
+  if (viewMode === "history") {
+    const targets = selectedHistoryTargets(row);
+    if (targets.length > 1) {
+      confirmBatchHistoryStress(targets, trigger || $("stress"));
+      return;
+    }
+  }
+  retestRow(row, trigger || $("retest-best"));
+};
+if ($("menu-locate")) {
+  $("menu-locate").onclick = async () => {
+    const row = menuRow();
+    closeRowMenu();
+    if (!row) return;
+    const targets = viewMode === "history" ? selectedHistoryTargets(row) : [row];
+    if (viewMode === "history" && targets.length > 1) {
+      const resolvable = resolvableHistoryTargets(targets);
+      if (!resolvable.length) {
+        notify("已勾选的历史节点不在当前已加载的订阅列表中", true);
+        return;
+      }
+      const ok = await runBusy(async () => await syncHistoryTargetsToLiveRaw(resolvable));
+      if (!ok) return;
+      if ($("search")) $("search").value = "";
+      if ($("status-filter")) $("status-filter").value = "all";
+      updateFilterPills();
+      setViewMode("live");
+      active = key(resolvable[0]);
+      renderRows();
+      notify("已将 " + resolvable.length + " 个长效节点同步勾选到实时队列");
+      return;
+    }
+    locateInLiveQueue(row);
+  };
+}
 if ($("menu-only-node")) {
   $("menu-only-node").onclick = () => {
     const row = menuRow();
     closeRowMenu();
     if (!row || busy || state.running) return;
+    if (viewMode === "history") {
+      historySelectedKeys.clear();
+      historySelectedKeys.add(key(row));
+      historyActiveKey = key(row);
+      renderHistoryRows();
+      updateHistorySelectionUi(true);
+      return;
+    }
     const profs = [...new Set([...state.profiles.filter(p => p.selected).map(p => p.uid), row.uid])];
     updateSelection(profs, new Set([key(row)]));
   };
@@ -1777,19 +2113,35 @@ if ($("menu-filter-profile")) {
     renderRows();
   };
 }
-$("menu-copy").onclick = async () => { const row = menuRow(); closeRowMenu(); if (row && await call("copy_node_name", {uid: row.uid, name: row.name})) notify("已复制节点名称"); };
+$("menu-copy").onclick = async () => {
+  const row = menuRow();
+  closeRowMenu();
+  if (!row) return;
+  const targets = viewMode === "history" ? selectedHistoryTargets(row) : [row];
+  if (targets.length > 1) {
+    if (await call("copy_node_name", {nodes: targets.map(t => ({uid: t.uid, name: t.name}))})) {
+      notify("已复制 " + targets.length + " 个节点名称");
+    }
+    return;
+  }
+  if (await call("copy_node_name", {uid: row.uid, name: row.name})) notify("已复制节点名称");
+};
 if ($("menu-copy-summary")) {
   $("menu-copy-summary").onclick = async () => {
     const row = menuRow();
     closeRowMenu();
     if (!row) return;
+    const targets = viewMode === "history" ? selectedHistoryTargets(row) : [row];
     if (typeof api().copy_node_summary === "function") {
-      if (await call("copy_node_summary", {uid: row.uid, name: row.name, view: viewMode, window: historyWindow})) {
-        notify("已复制测速摘要");
+      const payload = targets.length > 1
+        ? {nodes: targets.map(t => ({uid: t.uid, name: t.name})), view: viewMode, window: historyWindow}
+        : {uid: row.uid, name: row.name, view: viewMode, window: historyWindow};
+      if (await call("copy_node_summary", payload)) {
+        notify(targets.length > 1 ? ("已复制 " + targets.length + " 个节点测速摘要") : "已复制测速摘要");
       }
     } else if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(formatSummaryFallback(row));
-      notify("已复制测速摘要");
+      await navigator.clipboard.writeText(targets.map(formatSummaryFallback).join("\n"));
+      notify(targets.length > 1 ? ("已复制 " + targets.length + " 个节点测速摘要") : "已复制测速摘要");
     }
   };
 }
@@ -1811,7 +2163,13 @@ if ($("confirm-dialog") && typeof $("confirm-dialog").addEventListener === "func
   });
 }
 
-document.addEventListener("pointerdown", event => { if (!$("row-menu").hidden && !$("row-menu").contains(event.target)) closeRowMenu(); });
+document.addEventListener("pointerdown", event => {
+  if (!$("row-menu").hidden && !$("row-menu").contains(event.target)) closeRowMenu();
+  const pop = $("patrol-popover");
+  if (pop && !pop.hidden && !pop.contains(event.target) && event.target !== $("patrol-info") && !$("patrol-info")?.contains(event.target)) {
+    closePatrolPopover();
+  }
+});
 function isEditableTarget(el) {
   if (!el) return false;
   const tag = (el.tagName || "").toUpperCase();
@@ -1826,6 +2184,12 @@ document.addEventListener("keydown", event => {
       if (document.activeElement === cancelBtn && event.shiftKey) { event.preventDefault(); acceptBtn.focus(); }
       else if (document.activeElement === acceptBtn && !event.shiftKey) { event.preventDefault(); cancelBtn.focus(); }
     }
+    return;
+  }
+  const pop = $("patrol-popover");
+  if (pop && !pop.hidden && event.key === "Escape") {
+    event.preventDefault();
+    closePatrolPopover(true);
     return;
   }
   const menu = $("row-menu");
@@ -1882,32 +2246,60 @@ document.addEventListener("keydown", event => {
       const selText = typeof window !== "undefined" && typeof window.getSelection === "function"
         ? String(window.getSelection() || "") : "";
       if (!selText) {
-        const targetKey = viewMode === "history" ? historyActiveKey : active;
-        const row = findLiveOrHistoryRow(targetKey);
-        if (row) {
-          event.preventDefault();
-          call("copy_node_name", {uid: row.uid, name: row.name}).then(ok => {
-            if (ok) notify("已复制节点名称");
-          });
+        if (viewMode === "history") {
+          const targets = selectedHistoryTargets();
+          if (targets.length > 1) {
+            event.preventDefault();
+            call("copy_node_name", {nodes: targets.map(t => ({uid: t.uid, name: t.name}))}).then(ok => {
+              if (ok) notify("已复制 " + targets.length + " 个节点名称");
+            });
+            return;
+          }
+          const single = targets[0] || findLiveOrHistoryRow(historyActiveKey);
+          if (single) {
+            event.preventDefault();
+            call("copy_node_name", {uid: single.uid, name: single.name}).then(ok => {
+              if (ok) notify("已复制节点名称");
+            });
+          }
+        } else {
+          const row = findLiveOrHistoryRow(active);
+          if (row) {
+            event.preventDefault();
+            call("copy_node_name", {uid: row.uid, name: row.name}).then(ok => {
+              if (ok) notify("已复制节点名称");
+            });
+          }
         }
       }
       return;
     }
   }
-  if (event.key === " " && !mod && !event.altKey && viewMode === "live" && !busy && !state.running && !isEditableTarget(event.target)) {
+  if (event.key === " " && !mod && !event.altKey && !busy && !state.running && !isEditableTarget(event.target)) {
     const tag = (event.target?.tagName || "").toUpperCase();
-    if (tag !== "BUTTON" && active) {
-      const row = state.rows.find(r => key(r) === active);
-      if (row) {
-        event.preventDefault();
-        const nodes = new Set(state.rows.filter(r => r.selected).map(key));
-        row.selected ? nodes.delete(active) : nodes.add(active);
-        updateSelection(state.profiles.filter(p => p.selected).map(p => p.uid), nodes);
+    if (tag !== "BUTTON") {
+      if (viewMode === "live" && active) {
+        const row = state.rows.find(r => key(r) === active);
+        if (row) {
+          event.preventDefault();
+          const nodes = new Set(state.rows.filter(r => r.selected).map(key));
+          row.selected ? nodes.delete(active) : nodes.add(active);
+          updateSelection(state.profiles.filter(p => p.selected).map(p => p.uid), nodes);
+        }
+      } else if (viewMode === "history" && historyActiveKey) {
+        const row = visibleHistory().find(r => key(r) === historyActiveKey);
+        if (row) {
+          event.preventDefault();
+          if (historySelectedKeys.has(historyActiveKey)) historySelectedKeys.delete(historyActiveKey);
+          else historySelectedKeys.add(historyActiveKey);
+          renderHistoryRows();
+          updateHistorySelectionUi(true);
+        }
       }
     }
   }
 });
-window.addEventListener("blur", () => closeRowMenu());
+window.addEventListener("blur", () => { closeRowMenu(); closePatrolPopover(); });
 
 $("continue").onclick = () => {
   if (busy || state.running || state.outcome_unknown) return;
@@ -1977,14 +2369,17 @@ $("export").onclick = async () => {
   actionEpoch += 1;
   try {
     const isHist = viewMode === "history";
-    const res = isHist
-      ? await api().export_tsv({
-          view: "history",
-          window: historyWindow,
-          selected_only: historySelectedOnly,
-          query: $("history-search") ? $("history-search").value : ""
-        })
-      : await api().export_tsv();
+    const checkedHist = isHist ? checkedVisibleHistory() : [];
+    const exportReq = isHist ? {
+      view: "history",
+      window: historyWindow,
+      selected_only: historySelectedOnly,
+      query: $("history-search") ? $("history-search").value : ""
+    } : null;
+    if (isHist && checkedHist.length > 0) {
+      exportReq.identities = checkedHist.map(r => ({uid: r.uid, name: r.name}));
+    }
+    const res = isHist ? await api().export_tsv(exportReq) : await api().export_tsv();
     if (!res?.ok) {
       notify(res?.error || "导出失败", true);
       return;
@@ -2003,7 +2398,7 @@ $("export").onclick = async () => {
         }
       }, 1500);
     }
-    notify(isHist ? "已导出长效优选 TSV 并复制到剪贴板" : "已导出 TSV 并复制到剪贴板");
+    notify(isHist ? (checkedHist.length > 0 ? ("已导出已选 " + checkedHist.length + " 个长效节点 TSV 并复制到剪贴板") : "已导出长效优选 TSV 并复制到剪贴板") : "已导出 TSV 并复制到剪贴板");
   } catch (_) {
     notify("导出失败，请检查本地状态", true);
   }

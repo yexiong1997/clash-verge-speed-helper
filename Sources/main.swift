@@ -80,7 +80,13 @@ private func inspect(_ args: [String], data: Data? = nil) -> [String: Any]? {
 // Subscription metadata can be returned as if it were a proxy. Never let an
 // obvious informational entry become an automatic-switch candidate.
 private func isInformationalNodeName(_ name: String) -> Bool {
-    name.contains("剩余流量") || name.contains("到期")
+    let lowered = name.lowercased()
+    let metadata = ["剩余流量", "已用流量", "到期", "流量重置", "重置时间", "距离下次重置", "下次重置",
+                    "过期时间", "订阅信息", "订阅地址", "更新订阅", "最新网址", "最新域名", "官方网址", "官网",
+                    "防失联", "套餐余量",
+                    "traffic remaining", "remaining traffic", "used traffic",
+                    "subscription expires", "expiration date", "expire date", "next reset"]
+    return metadata.contains(where: { lowered.contains($0) })
 }
 
 private func usableNames(_ info: [String: Any]) -> [String]? {

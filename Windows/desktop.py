@@ -1,6 +1,7 @@
 """Desktop application state and explicit, validated webview bridge."""
 
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 import csv
 import inspect
@@ -29,9 +30,25 @@ from .settings import AppSettingsStore, SettingsSecurityError
 from .telemetry_history import (TelemetryHealthEvent, TelemetryHistoryStore,
                                 TelemetrySampleRecord, WINDOW_SPECS)
 
-_METADATA = ("剩余流量", "到期", "流量重置", "重置时间", "过期时间", "订阅信息",
-             "traffic remaining", "remaining traffic", "subscription expires", "expiration date")
+_METADATA = (
+    "剩余流量", "已用流量", "到期", "流量重置", "重置时间", "距离下次重置", "下次重置",
+    "过期时间", "订阅信息", "订阅地址", "更新订阅", "最新网址", "最新域名", "官方网址", "官网",
+    "防失联", "套餐余量",
+    "traffic remaining", "remaining traffic", "used traffic",
+    "subscription expires", "expiration date", "expire date", "next reset",
+)
 _PATROL_QUOTAS = frozenset((50 * 1_048_576, 80 * 1_048_576, 150 * 1_048_576, 300 * 1_048_576))
+_PATROL_BATCH_BY_QUOTA = {
+    50 * 1_048_576: 4,
+    80 * 1_048_576: 5,
+    150 * 1_048_576: 6,
+    300 * 1_048_576: 8,
+}
+_PRIMARY_SELECTOR_KEYS = frozenset((
+    "proxy", "proxies", "select", "selector", "nodeselect", "proxyselect", "main", "default", "manual",
+    "节点选择", "手动切换", "手动选择", "节点切换", "选择节点", "代理选择", "手动节点",
+    "代理", "主节点", "主代理", "默认", "默认节点", "默认代理", "国外流量", "国外代理", "节点", "全局选择",
+))
 
 
 @dataclass
@@ -115,6 +132,7 @@ class Desktop:
         self.patrol_snapshots = None
         self.patrol_last_summary = ""
         self.cached_patrol_bytes_today = self.telemetry_store.patrol_bytes_used_today()
+        self.cached_patrol_quota_day = date.today()
         self.active_run_kind = "normal"
         self.health_probe_status = "● 活跃探测 待命"
         self.health_probe_level = "idle"
@@ -294,6 +312,8 @@ class Desktop:
                     "patrol": {
                         "armed": patrol_minutes is not None,
                         "minutes": patrol_minutes,
+                        "interval_minutes": 30 if self.patrol_quota_bytes >= 150 * 1_048_576 else 60,
+                        "max_per_tick": _PATROL_BATCH_BY_QUOTA.get(self.patrol_quota_bytes, 5),
                         "remaining": patrol_remaining,
                         "active": patrol_active,
                         "quota_bytes": self.patrol_quota_bytes,
@@ -704,17 +724,47 @@ class Desktop:
             return {"ok": False, "error": self.status}
 
     @staticmethod
-    def _compute_suggested_group(groups, snapshot_names):
-        names = set(snapshot_names)
-        full = [g.name for g in groups if g.name != "GLOBAL" and names <= set(g.all)]
-        if len(full) == 1:
-            return full[0]
-        non_global = [g.name for g in groups if g.name != "GLOBAL"]
-        return non_global[0] if len(non_global) == 1 else None
-
-    @staticmethod
     def _group_core_name(name):
         return "".join(ch for ch in str(name or "").lower() if ch.isalnum())
+
+    @staticmethod
+    def _compute_suggested_group(groups, snapshot_names):
+        non_global = [g for g in groups if g.name != "GLOBAL"]
+        if not non_global:
+            return None
+        if len(non_global) == 1:
+            return non_global[0].name
+        tested_set = set(snapshot_names)
+        if not tested_set:
+            return None
+        overlap = {g.name: len(set(g.all) & tested_set) for g in non_global}
+        full = [g for g in non_global if overlap[g.name] == len(tested_set)]
+        if len(full) == 1:
+            return full[0].name
+        if full:
+            name_pool = full
+        else:
+            high = [g for g in non_global if overlap[g.name] * 5 >= len(tested_set) * 4]
+            name_pool = high if high else non_global
+        primary = [g for g in name_pool if Desktop._group_core_name(g.name) in _PRIMARY_SELECTOR_KEYS]
+        if len(primary) == 1:
+            return primary[0].name
+        if len(primary) > 1:
+            p_members = {g.name: set(g.all) for g in primary}
+            parents = [
+                g for g in primary
+                if any(o.name != g.name and o.name in p_members[g.name] for o in primary)
+                and not any(o.name != g.name and g.name in p_members[o.name] for o in primary)
+            ]
+            if len(parents) == 1:
+                return parents[0].name
+        if len(tested_set) >= 2:
+            dominant = [g for g in non_global if overlap[g.name] * 5 >= len(tested_set) * 4]
+            if len(dominant) == 1:
+                winner = dominant[0]
+                if all(g.name == winner.name or overlap[g.name] * 2 < len(tested_set) for g in non_global):
+                    return winner.name
+        return None
 
     @staticmethod
     def _resolve_target_group(groups, preferred_group, target_node, snapshot_names):
@@ -730,14 +780,10 @@ class Desktop:
                 ]
                 if len(core_matches) == 1:
                     return core_matches[0]
-        names = set(snapshot_names)
-        full = [g.name for g in groups if g.name != "GLOBAL" and target_node in g.all and names <= set(g.all)]
-        if len(full) == 1:
-            return full[0]
-        containing = [g.name for g in groups if g.name != "GLOBAL" and target_node in g.all]
-        if len(containing) == 1:
-            return containing[0]
-        return None
+        containing = [g for g in groups if g.name != "GLOBAL" and target_node in g.all]
+        if not containing:
+            return None
+        return Desktop._compute_suggested_group(containing, snapshot_names)
 
     def _wait_controller_for_profile(self, target_uid, target_node, timeout=12.0, is_cancelled=None):
         deadline = time.monotonic() + max(1.0, float(timeout))
@@ -935,10 +981,10 @@ class Desktop:
         if run_kind == "patrol":
             streams = 2
             latency, download = "3s", "3s"
-            parallel = min(4, max(1, len(chosen)))
+            parallel = min(2, max(1, len(chosen)))
         else:
             streams = 2 if options["mode"] == "fast" else 4
-            latency, download = ("2s", "12s") if streams == 2 else ("5s", "30s")
+            latency, download = "3s", "3s"
             parallel = options["parallel"]
         if source is None:
             if run_kind == "patrol":
@@ -1242,11 +1288,11 @@ class Desktop:
                         return
                     selected = {(r.uid, r.name) for r in promoted}
                     jobs = [Job(r.uid, r.name, snapshots[r.uid].data, 20 * 1_048_576,
-                                4, "5s", "30s") for r in promoted]
+                                4, "3s", "3s") for r in promoted]
                     cascade_exp = time.monotonic() + 1.0
                     for row in self.rows:
-                        row.selected = (row.uid, row.name) in selected
-                        if row.selected:
+                        is_promoted = (row.uid, row.name) in selected
+                        if is_promoted:
                             row.stage1_score = None
                             row.measurement = None
                             row.samples = []
@@ -1452,8 +1498,10 @@ class Desktop:
                 self.patrol_schedule.arm(interval_min)
                 self.patrol_snapshots = dict(snapshots)
                 self.cached_patrol_bytes_today = self.telemetry_store.patrol_bytes_used_today()
+                self.cached_patrol_quota_day = date.today()
                 quota_mib = quota // 1_048_576
-                self.status = f"智能巡检已开启：每 {interval_min} 分钟最多抽测 8 节点（1MiB/2流，日配额 {quota_mib} MiB，不改节点勾选、不自动切换）"
+                batch_cap = _PATROL_BATCH_BY_QUOTA.get(quota, 5)
+                self.status = f"智能巡检已开启：每 {interval_min} 分钟最多抽测 {batch_cap} 节点（1MiB/2流，日配额 {quota_mib} MiB，晚高峰预留 25%，不改节点勾选、不自动切换）"
             return {"ok": True}
         except (KeyError, TypeError, ValueError, ProfileError) as exc:
             message = str(exc) if isinstance(exc, ValueError) and str(exc) else "无法开启智能巡检"
@@ -1641,7 +1689,13 @@ class Desktop:
             self._notify_tray()
 
     def _poll_patrol(self):
+        today = date.today()
         with self.lock:
+            if today != self.cached_patrol_quota_day:
+                self.cached_patrol_quota_day = today
+                self.cached_patrol_bytes_today = self.telemetry_store.patrol_bytes_used_today()
+                if self.patrol_last_summary in ("今日配额已满", "晚高峰配额预留中"):
+                    self.patrol_last_summary = ""
             p_state, p_token = self.patrol_schedule.poll(
                 external_busy=self.running or self.refreshing or self.schedule.active is not None or self.closed.is_set()
             )
@@ -1663,14 +1717,35 @@ class Desktop:
                     (r.uid, r.name) for r in self.rows
                     if r.uid in snapshots and _eligible_name(r.name)
                 ]
+            batch_cap = _PATROL_BATCH_BY_QUOTA.get(quota, 5)
             plan = self.telemetry_store.select_patrol_plan(
-                candidates, daily_quota_bytes=quota, per_node_bytes=1_048_576, max_per_tick=8
+                candidates,
+                daily_quota_bytes=quota,
+                per_node_bytes=1_048_576,
+                max_per_tick=batch_cap,
+                reserve_peak_ratio=0.25,
+                overnight_throttle=True,
             )
             with self.lock:
                 self.cached_patrol_bytes_today = max(0, quota - plan.remaining_quota_bytes)
+                self.cached_patrol_quota_day = today
                 if not plan.identities:
-                    self.patrol_last_summary = "今日配额已满"
-                    self.status = f"今日智能巡检配额已用完（{quota // 1_048_576} MiB/天），明日自动恢复"
+                    if plan.deferred_for_peak_quota:
+                        reserve_mib = max(1, plan.peak_reserved_bytes // 1_048_576)
+                        self.patrol_last_summary = "晚高峰配额预留中"
+                        self.status = f"白天巡检预算已达上限，已为 20:00 晚高峰保留 {reserve_mib} MiB，到点自动恢复"
+                    elif plan.remaining_quota_bytes < 1_048_576:
+                        self.patrol_last_summary = "今日配额已满"
+                        self.status = f"今日智能巡检配额已用完（{quota // 1_048_576} MiB/天），明日自动恢复"
+                    elif plan.skipped_cooldown_count > 0 or plan.skipped_backoff_count > 0:
+                        self.patrol_last_summary = "冷却/退避等待中"
+                        self.status = (
+                            f"本轮巡检跳过：{plan.skipped_cooldown_count} 个节点近期已测在冷却期、"
+                            f"{plan.skipped_backoff_count} 个连续失败节点在退避期，稍后自动复查"
+                        )
+                    else:
+                        self.patrol_last_summary = "暂无待巡检节点"
+                        self.status = "当前没有待巡检的节点"
                     self.patrol_schedule.finish(p_token)
                     return
                 id_set = set(plan.identities)
@@ -1678,7 +1753,7 @@ class Desktop:
                 if not chosen:
                     self.patrol_schedule.finish(p_token)
                     return
-                options = {"parallel": min(4, len(chosen)), "download_bytes": 1_048_576,
+                options = {"parallel": min(2, len(chosen)), "download_bytes": 1_048_576,
                            "mode": "fast", "auto_switch": False, "group": ""}
                 self.status = f"智能巡检：守擂 {plan.defender_count} + 探索 {plan.explorer_count}（1MiB/2流）…"
                 self._start_validated_launch(options, p_token, True, chosen, snapshots, None,
@@ -1898,15 +1973,26 @@ class Desktop:
                 window = "7d"
             selected_only = bool(req.get("selected_only", False))
             query = str(req.get("query") or "").strip().lower()
+            raw_ids = req.get("identities")
+            identity_filter = None
+            if isinstance(raw_ids, list) and raw_ids:
+                parsed_ids = set()
+                for entry in raw_ids:
+                    if isinstance(entry, dict) and isinstance(entry.get("uid"), str) and isinstance(entry.get("name"), str):
+                        parsed_ids.add((entry["uid"], entry["name"]))
+                if parsed_ids:
+                    identity_filter = parsed_ids
             with self.lock:
                 selected_profiles = set(self.selected_profiles)
                 known_nodes = {(r.uid, r.name) for r in self.rows}
             summaries = self.telemetry_store.compute_summaries(window=window)
             filtered = []
             for item in summaries:
-                if selected_only and selected_profiles and item.profile_uid not in selected_profiles:
+                if identity_filter is not None and (item.profile_uid, item.node_name) not in identity_filter:
                     continue
-                if query and query not in item.node_name.lower() and query not in item.profile_name.lower():
+                if identity_filter is None and selected_only and selected_profiles and item.profile_uid not in selected_profiles:
+                    continue
+                if identity_filter is None and query and query not in item.node_name.lower() and query not in item.profile_name.lower():
                     continue
                 filtered.append(item)
             output = io.StringIO(newline="")
@@ -1980,23 +2066,42 @@ class Desktop:
 
     def copy_node_name(self, value):
         try:
-            with self.lock:
-                uid, name = value["uid"], value["name"]
-                if self.closed.is_set() or not isinstance(uid, str) or not isinstance(name, str):
-                    raise ValueError("节点已变化")
-                known = any(row.uid == uid and row.name == name for row in self.rows)
-            if not known:
-                summaries = self.telemetry_store.compute_summaries(window="30d")
-                known = any(s.profile_uid == uid and s.node_name == name for s in summaries)
-            if not known:
+            if not isinstance(value, dict):
                 raise ValueError("节点已变化")
+            if isinstance(value.get("nodes"), list):
+                pairs = []
+                for entry in value["nodes"]:
+                    if not isinstance(entry, dict) or not isinstance(entry.get("uid"), str) or not isinstance(entry.get("name"), str):
+                        raise ValueError("节点已变化")
+                    pairs.append((entry["uid"], entry["name"]))
+                if not pairs:
+                    raise ValueError("节点已变化")
+            else:
+                uid, name = value["uid"], value["name"]
+                if not isinstance(uid, str) or not isinstance(name, str):
+                    raise ValueError("节点已变化")
+                pairs = [(uid, name)]
+            with self.lock:
+                if self.closed.is_set():
+                    raise ValueError("应用已关闭")
+                live_set = {(row.uid, row.name) for row in self.rows}
+            hist_set = None
+            valid_names = []
+            for uid, name in pairs:
+                if (uid, name) not in live_set:
+                    if hist_set is None:
+                        hist_set = {(it.profile_uid, it.node_name) for it in self.telemetry_store.compute_summaries(window="30d")}
+                    if (uid, name) not in hist_set:
+                        raise ValueError("节点已变化")
+                valid_names.append(name)
+            payload = "\n".join(valid_names)
             win32clipboard.OpenClipboard()
             try:
                 win32clipboard.EmptyClipboard()
-                win32clipboard.SetClipboardText(name, win32clipboard.CF_UNICODETEXT)
+                win32clipboard.SetClipboardText(payload, win32clipboard.CF_UNICODETEXT)
             finally:
                 win32clipboard.CloseClipboard()
-            return {"ok": True}
+            return {"ok": True, "count": len(valid_names)}
         except Exception:
             return {"ok": False, "error": "复制失败，请重新选择节点"}
 
@@ -2004,32 +2109,48 @@ class Desktop:
         try:
             if not isinstance(value, dict):
                 raise ValueError("参数无效")
-            uid, name = value["uid"], value["name"]
             view = value.get("view", "live")
             window = value.get("window", "7d")
-            if not isinstance(uid, str) or not isinstance(name, str) or view not in ("live", "history"):
+            if view not in ("live", "history"):
                 raise ValueError("参数无效")
+            if isinstance(value.get("nodes"), list):
+                pairs = []
+                for entry in value["nodes"]:
+                    if not isinstance(entry, dict) or not isinstance(entry.get("uid"), str) or not isinstance(entry.get("name"), str):
+                        raise ValueError("参数无效")
+                    pairs.append((entry["uid"], entry["name"]))
+                if not pairs:
+                    raise ValueError("参数无效")
+            else:
+                uid, name = value["uid"], value["name"]
+                if not isinstance(uid, str) or not isinstance(name, str):
+                    raise ValueError("参数无效")
+                pairs = [(uid, name)]
             if view == "history":
                 if window not in WINDOW_SPECS:
                     window = "7d"
                 with self.lock:
                     if self.closed.is_set():
                         raise ValueError("应用已关闭")
-                summaries = self.telemetry_store.compute_summaries(window=window)
-                item = next((s for s in summaries if s.profile_uid == uid and s.node_name == name), None)
-                if item is None:
-                    raise ValueError("历史节点不存在")
-                proto = (item.node_type or "—").upper()
-                speed = f"{item.weighted_median_speed_bps / 1_048_576:.2f} MiB/s" if item.success_count > 0 else "—"
-                lat = f"{item.weighted_median_latency_ms:.0f} ms" if item.success_count > 0 else "—"
-                avail = f"{round(item.availability_rate * 100)}%"
-                penalty = f" · 扣分 -{item.health_penalty:.1f}" if item.health_penalty > 0 else ""
-                summary = (
-                    f"[{item.profile_name}] {item.node_name} ({proto}) · "
-                    f"稳健吞吐 {speed} · 典型延迟 {lat} · 可用率 {avail} · "
-                    f"样本 {item.success_count}/{item.total_count} · 长效分 {item.long_term_score:.1f}{penalty}"
-                )
+                by_id = {(it.profile_uid, it.node_name): it for it in self.telemetry_store.compute_summaries(window=window)}
+                lines = []
+                for uid, name in pairs:
+                    item = by_id.get((uid, name))
+                    if item is None:
+                        raise ValueError("历史节点不存在")
+                    proto = (item.node_type or "—").upper()
+                    speed = f"{item.weighted_median_speed_bps / 1_048_576:.2f} MiB/s" if item.success_count > 0 else "—"
+                    lat = f"{item.weighted_median_latency_ms:.0f} ms" if item.success_count > 0 else "—"
+                    avail = f"{round(item.availability_rate * 100)}%"
+                    penalty = f" · 扣分 -{item.health_penalty:.1f}" if item.health_penalty > 0 else ""
+                    lines.append(
+                        f"[{item.profile_name}] {item.node_name} ({proto}) · "
+                        f"稳健吞吐 {speed} · 典型延迟 {lat} · 可用率 {avail} · "
+                        f"样本 {item.success_count}/{item.total_count} · 长效分 {item.long_term_score:.1f}{penalty}"
+                    )
+                summary = "\n".join(lines)
             else:
+                uid, name = pairs[0]
                 with self.lock:
                     if self.closed.is_set():
                         raise ValueError("应用已关闭")

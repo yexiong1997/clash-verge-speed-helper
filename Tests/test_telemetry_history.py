@@ -153,6 +153,40 @@ func makeSample(
             let capped = telemetryComputeSummaries(samples: baseSamples, healthEvents: twentyFails, window: .days7, now: now)
             check(capped.first(where: { $0.nodeName == "A" })!.healthPenalty == 25.0, "penalty must be capped at 25.0")
 
+            // Overnight 90-failure outage must saturate streak so 1 verified OK still clears penalty cleanly
+            let ninetyFails = (0..<90).map { i in
+                TelemetryHealthEvent(timestamp: now - Double(10800 - i * 120), profileUID: "uid-a", nodeName: "A", groupName: "PROXY", ok: false, delayMilliseconds: nil, failureKind: "probe_failed")
+            }
+            let afterOvernightRecover = telemetryComputeSummaries(
+                samples: baseSamples,
+                healthEvents: ninetyFails + [TelemetryHealthEvent(timestamp: now - 10, profileUID: "uid-a", nodeName: "A", groupName: "PROXY", ok: true, delayMilliseconds: 28, failureKind: nil)],
+                window: .days7, now: now
+            )
+            check(afterOvernightRecover.first(where: { $0.nodeName == "A" })!.healthPenalty == 0.0,
+                  "saturated overnight streak must recover on verified OK instead of staying poisoned")
+
+            // Time-weighted availability qualification: old 20d outage + recent 4 wins re-qualifies; old 25d wins + recent 4 fails disqualifies
+            let weightedQualSamples = [
+                makeSample(ts: now - 22 * 86400, node: "Recovered", complete: false, bps: 0, latency: 0, jitter: 0, score: nil),
+                makeSample(ts: now - 21 * 86400, node: "Recovered", complete: false, bps: 0, latency: 0, jitter: 0, score: nil),
+                makeSample(ts: now - 20 * 86400, node: "Recovered", complete: false, bps: 0, latency: 0, jitter: 0, score: nil),
+                makeSample(ts: now - 19 * 86400, node: "Recovered", complete: false, bps: 0, latency: 0, jitter: 0, score: nil),
+                makeSample(ts: now - 18 * 86400, node: "Recovered", complete: false, bps: 0, latency: 0, jitter: 0, score: nil),
+                makeSample(ts: now - 3 * 3600, node: "Recovered", score: 86.0),
+                makeSample(ts: now - 2 * 3600, node: "Recovered", score: 87.0),
+                makeSample(ts: now - 1 * 3600, node: "Recovered", score: 88.0),
+                makeSample(ts: now - 26 * 86400, node: "RecentlyDead", score: 90.0),
+                makeSample(ts: now - 25 * 86400, node: "RecentlyDead", score: 90.0),
+                makeSample(ts: now - 24 * 86400, node: "RecentlyDead", score: 90.0),
+                makeSample(ts: now - 23 * 86400, node: "RecentlyDead", score: 90.0),
+                makeSample(ts: now - 3 * 3600, node: "RecentlyDead", complete: false, bps: 0, latency: 0, jitter: 0, score: nil),
+                makeSample(ts: now - 2 * 3600, node: "RecentlyDead", complete: false, bps: 0, latency: 0, jitter: 0, score: nil),
+                makeSample(ts: now - 1 * 3600, node: "RecentlyDead", complete: false, bps: 0, latency: 0, jitter: 0, score: nil),
+            ]
+            let wq = telemetryComputeSummaries(samples: weightedQualSamples, healthEvents: [], window: .days30, now: now)
+            check(wq.first(where: { $0.nodeName == "Recovered" })!.isQualified == true, "recently healthy node must qualify via weightedAvailability")
+            check(wq.first(where: { $0.nodeName == "RecentlyDead" })!.isQualified == false, "recently dead node must lose qualification via weightedAvailability")
+
         case "patrol_rotation_and_quota":
             var utcCal = Calendar(identifier: .gregorian)
             utcCal.timeZone = TimeZone(secondsFromGMT: 0)!

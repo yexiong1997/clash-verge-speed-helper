@@ -67,7 +67,7 @@
       <label class="param-pill"><span>包大小</span><select id="size" aria-label="每节点下载量"><option value="262144">256 KiB</option><option value="524288">512 KiB</option><option value="1048576">1 MiB</option><option value="2097152">2 MiB</option><option value="3145728" selected>3 MiB</option><option value="5242880">5 MiB</option><option value="20971520">20 MiB</option><option value="52428800">50 MiB</option></select></label>
       <label class="param-pill"><span>模式</span><select id="mode" aria-label="测速模式"><option value="fast">快速</option><option value="accurate">精确</option></select></label>
       <div class="param-pill param-schedule"><span>定时</span><select id="interval" aria-label="定时间隔"><option value="0">关闭</option><option value="15">15 分钟</option><option value="30">30 分钟</option><option value="60">1 小时</option><option value="120">2 小时</option><option value="360">6 小时</option><option value="720">12 小时</option><option value="1440">24 小时</option></select><button id="arm" class="pill">启用定时</button></div>
-      <div class="param-pill param-patrol"><span>巡检</span><select id="patrol-quota" aria-label="巡检日配额"><option value="52428800">50 MiB/天</option><option value="83886080" selected>80 MiB/天</option><option value="157286400">150 MiB/天</option><option value="314572800">300 MiB/天</option></select><button id="patrol-toggle" class="pill">开启巡检</button></div>
+      <div class="param-pill param-patrol"><span>巡检</span><select id="patrol-quota" aria-label="巡检日配额"><option value="52428800">50 MiB/天</option><option value="83886080" selected>80 MiB/天</option><option value="157286400">150 MiB/天</option><option value="314572800">300 MiB/天</option></select><button id="patrol-toggle" class="pill">开启巡检</button><button type="button" id="patrol-info" class="patrol-info-btn" aria-label="智能巡检功能说明" aria-expanded="false" aria-controls="patrol-popover">?</button></div>
       <div class="setting-notes"><span class="setting-note" id="schedule-note">支持托盘后台运行，退出应用后停止</span><span class="patrol-note" id="patrol-note">今日 0/80 MiB</span></div>
     </section>
     <section class="table-card card">
@@ -94,6 +94,8 @@
         <div id="history-tools" class="table-tools" hidden>
           <div class="win-pills" role="group" aria-label="历史时间窗"><button class="win-pill" data-hwin="24h">24小时</button><button class="win-pill active" data-hwin="7d">7天</button><button class="win-pill" data-hwin="30d">30天</button><button class="win-pill" data-hwin="peak">晚高峰</button></div>
           <button id="history-selected-only" class="quiet toggle-pill selected" aria-pressed="true">仅已选订阅</button>
+          <button id="history-select-all" class="quiet">全选</button>
+          <button id="history-clear-sel" class="quiet">清空</button>
           <input id="history-search" type="search" placeholder="搜索历史 (Ctrl+F)" aria-label="搜索历史节点或订阅">
           <button id="clear-history" class="danger quiet">清空记录</button>
         </div>
@@ -124,6 +126,14 @@
     <div class="menu-sep" role="separator"></div>
     <button id="menu-copy" role="menuitem">复制节点名称</button>
     <button id="menu-copy-summary" role="menuitem">复制测速摘要</button>
+  </div>
+  <div id="patrol-popover" class="patrol-popover card" role="dialog" aria-modal="false" aria-labelledby="patrol-pop-title" hidden>
+    <div class="patrol-pop-head">
+      <strong id="patrol-pop-title">智能巡检功能说明</strong>
+      <button type="button" id="patrol-pop-close" class="patrol-pop-close" aria-label="关闭说明">×</button>
+    </div>
+    <div id="patrol-pop-sub" class="patrol-pop-sub"></div>
+    <ul id="patrol-pop-list" class="patrol-pop-list"></ul>
   </div>
   <div id="confirm-dialog" class="confirm-backdrop" role="dialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-message" hidden>
     <div class="confirm-card card">

@@ -367,9 +367,11 @@ class DesktopTests(unittest.TestCase):
         self.assertEqual([(j.name, j.download_bytes, j.streams) for j in phases[1].jobs],
                          [("beta", 20 * 1_048_576, 4)])
         self.assertEqual(phases[1].parallel, 2)
+        self.assertEqual((phases[0].jobs[0].head_timeout, phases[0].jobs[0].download_timeout), (3, 3))
+        self.assertEqual((phases[1].jobs[0].head_timeout, phases[1].jobs[0].download_timeout), (3, 3))
         state = self.app.get_state()
         self.assertEqual([(r["name"], r["selected"], r["score"] is not None) for r in state["rows"]],
-                         [("alpha", False, False), ("beta", True, True)])
+                         [("alpha", True, False), ("beta", True, True)])
 
     def test_funnel_stop_before_promotion_does_not_start_second_stage(self):
         self.assertTrue(self.app.refresh()["ok"])
@@ -955,6 +957,79 @@ class DesktopTests(unittest.TestCase):
         self.assertIn("'=second", lines[1])
         self.assertIn("gamma", lines[1])
         self.assertIn("已认证", lines[1])
+
+    def test_smart_group_suggestion_and_expanded_metadata_filter(self):
+        from Windows.controller import ProxyGroup
+        from Windows.desktop import Desktop, _eligible_name
+        # Emoji primary wins over streaming/region groups
+        groups_emoji = [
+            ProxyGroup(name="📺 流媒体", now="alpha", all=("alpha", "beta")),
+            ProxyGroup(name="🚀 节点选择", now="alpha", all=("alpha", "beta", "gamma")),
+        ]
+        self.assertEqual(Desktop._compute_suggested_group(groups_emoji, {"alpha", "beta", "gamma"}), "🚀 节点选择")
+        # ACL4SSR parent-over-child disambiguation: 节点选择 embeds 手动切换
+        groups_nested = [
+            ProxyGroup(name="🚀 节点选择", now="✋ 手动切换", all=("♻️ 自动选择", "✋ 手动切换", "alpha", "beta")),
+            ProxyGroup(name="✋ 手动切换", now="alpha", all=("alpha", "beta")),
+        ]
+        self.assertEqual(Desktop._compute_suggested_group(groups_nested, {"alpha", "beta"}), "🚀 节点选择")
+        # Flat ambiguous two primaries remain fail-closed (None)
+        groups_ambig = [
+            ProxyGroup(name="代理选择", now="alpha", all=("alpha", "beta")),
+            ProxyGroup(name="手动切换", now="alpha", all=("alpha", "beta")),
+        ]
+        self.assertIsNone(Desktop._compute_suggested_group(groups_ambig, {"alpha", "beta"}))
+        # Expanded metadata pseudo-nodes rejected; real proxy names accepted
+        for pseudo in ("流量重置：15天", "订阅地址：https://example.com", "最新域名防失联",
+                       "Remaining Traffic: 120 GB", "Expire Date: 2027-01-01", "套餐余量 88GB"):
+            self.assertFalse(_eligible_name(pseudo), pseudo)
+        for real in ("香港 IEPL 01", "Japan Tokyo 02", "US Los Angeles Premium"):
+            self.assertTrue(_eligible_name(real), real)
+
+    def test_batch_copy_history_subset_export_and_patrol_meta(self):
+        from Windows.telemetry_history import TelemetrySampleRecord
+        self.assertTrue(self.app.refresh()["ok"])
+        st = self.app.get_state()
+        self.assertEqual(st["patrol"]["interval_minutes"], 60)
+        self.assertEqual(st["patrol"]["max_per_tick"], 5)
+        now = time.time()
+        for node, bps, score in (("alpha", 12 * 1_048_576, 92.0), ("beta", 6 * 1_048_576, 78.0)):
+            for i in range(3):
+                self.app.telemetry_store.record_sample(TelemetrySampleRecord(
+                    timestamp=now - i * 10, profile_uid="u1", profile_name="first",
+                    node_name=node, node_type="vless", source="manual",
+                    requested_bytes=3 * 1_048_576, streams=2, download_complete=True,
+                    download_bytes_per_second=bps, latency_ms=30.0, jitter_ms=2.0,
+                    head_attempts=6, head_successes=6, composite_score=score,
+                ))
+        copied = []
+        with patch("Windows.desktop.win32clipboard") as clip:
+            clip.CF_UNICODETEXT = 13
+            clip.SetClipboardText.side_effect = lambda txt, _fmt: copied.append(txt)
+            res_names = self.app.copy_node_name({"nodes": [{"uid": "u1", "name": "alpha"}, {"uid": "u1", "name": "beta"}]})
+            self.assertTrue(res_names["ok"])
+            self.assertEqual(res_names["count"], 2)
+            self.assertEqual(copied[-1], "alpha\nbeta")
+            res_sum = self.app.copy_node_summary({
+                "nodes": [{"uid": "u1", "name": "alpha"}, {"uid": "u1", "name": "beta"}],
+                "view": "history", "window": "7d",
+            })
+            self.assertTrue(res_sum["ok"])
+            self.assertEqual(res_sum["count"], 2)
+            self.assertEqual(len(copied[-1].splitlines()), 2)
+            self.assertIn("alpha", copied[-1])
+            self.assertIn("beta", copied[-1])
+        tsv, filename, is_hist = self.app._build_tsv_export({
+            "view": "history", "window": "7d",
+            "identities": [{"uid": "u1", "name": "alpha"}],
+        })
+        self.assertTrue(is_hist)
+        self.assertEqual(filename, "clash-history-results.tsv")
+        lines = tsv.splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn("alpha", lines[1])
+        self.assertNotIn("beta", tsv)
+
 
 if __name__ == "__main__":
     unittest.main()
