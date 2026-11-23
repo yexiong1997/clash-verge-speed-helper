@@ -2150,31 +2150,34 @@ class Desktop:
                     )
                 summary = "\n".join(lines)
             else:
-                uid, name = pairs[0]
                 with self.lock:
                     if self.closed.is_set():
                         raise ValueError("应用已关闭")
-                    row = next((r for r in self.rows if r.uid == uid and r.name == name), None)
-                    if row is None:
-                        raise ValueError("节点已变化")
-                    m = row.measurement
-                    proto = (row.node_type or (m.node_type if m else "") or "—").upper()
-                    speed = f"{m.download_bytes_per_second / 1_048_576:.2f} MiB/s" if m else "—"
-                    lat = f"{m.latency_ms:.0f} ms" if m else "—"
-                    jitter = f"{m.jitter_ms:.0f} ms" if m else "—"
-                    loss = f"{round((6 - m.head_successes) * 100 / 6)}%" if m else "—"
-                    score = f"{m.score:.1f}" if m and m.score is not None else row.state
-                    summary = (
-                        f"[{row.profile}] {row.name} ({proto}) · "
-                        f"吞吐 {speed} · 延迟 {lat} · 抖动 {jitter} · 丢包 {loss} · 评分 {score}"
-                    )
+                    by_row = {(r.uid, r.name): r for r in self.rows}
+                    lines = []
+                    for uid, name in pairs:
+                        row = by_row.get((uid, name))
+                        if row is None:
+                            raise ValueError("节点已变化")
+                        m = row.measurement
+                        proto = (row.node_type or (m.node_type if m else "") or "—").upper()
+                        speed = f"{m.download_bytes_per_second / 1_048_576:.2f} MiB/s" if m else "—"
+                        lat = f"{m.latency_ms:.0f} ms" if m else "—"
+                        jitter = f"{m.jitter_ms:.0f} ms" if m else "—"
+                        loss = f"{round((6 - m.head_successes) * 100 / 6)}%" if m else "—"
+                        score = f"{m.score:.1f}" if m and m.score is not None else row.state
+                        lines.append(
+                            f"[{row.profile}] {row.name} ({proto}) · "
+                            f"吞吐 {speed} · 延迟 {lat} · 抖动 {jitter} · 丢包 {loss} · 评分 {score}"
+                        )
+                    summary = "\n".join(lines)
             win32clipboard.OpenClipboard()
             try:
                 win32clipboard.EmptyClipboard()
                 win32clipboard.SetClipboardText(summary, win32clipboard.CF_UNICODETEXT)
             finally:
                 win32clipboard.CloseClipboard()
-            return {"ok": True, "text": summary}
+            return {"ok": True, "text": summary, "count": len(lines)}
         except Exception:
             return {"ok": False, "error": "复制摘要失败，请重新选择节点"}
 

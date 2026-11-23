@@ -582,14 +582,38 @@ class DesktopCrossProfileHotSwitchTests(unittest.TestCase):
             ProxyGroup("GLOBAL", "DIRECT", ("DIRECT", "X", "Y")),
             ProxyGroup("🚀 节点选择", "X", ("X", "Y")),
             ProxyGroup("🐟 漏网之鱼", "DIRECT", ("DIRECT", "X", "Y")),
+            ProxyGroup("📺 流媒体", "X", ("X", "Y")),
         )
         self.assertEqual(
             Desktop._resolve_target_group(groups, "🔰 节点选择", "Y", ("X", "Y")),
             "🚀 节点选择",
         )
-        # Ambiguous without matching core name must stay None (never guess)
+        # Core-name match takes precedence over smart primary fallback
+        self.assertEqual(
+            Desktop._resolve_target_group(groups, "🎬 流媒体", "Y", ("X", "Y")),
+            "📺 流媒体",
+        )
+        # Unmatched preferred group falls back to unique smart primary selector
+        self.assertEqual(
+            Desktop._resolve_target_group(groups, "完全无关组", "Y", ("X", "Y")),
+            "🚀 节点选择",
+        )
+        # Flat ambiguous primaries or non-primaries without core match must stay None (fail-closed)
+        ambiguous_primaries = (
+            ProxyGroup("GLOBAL", "DIRECT", ("DIRECT", "X", "Y")),
+            ProxyGroup("代理选择", "X", ("X", "Y")),
+            ProxyGroup("手动切换", "X", ("X", "Y")),
+        )
         self.assertIsNone(
-            Desktop._resolve_target_group(groups, "完全无关组", "Y", ("X", "Y"))
+            Desktop._resolve_target_group(ambiguous_primaries, "完全无关组", "Y", ("X", "Y"))
+        )
+        ambiguous_non_primaries = (
+            ProxyGroup("GLOBAL", "DIRECT", ("DIRECT", "X", "Y")),
+            ProxyGroup("📺 流媒体", "X", ("X", "Y")),
+            ProxyGroup("🐟 漏网之鱼", "DIRECT", ("DIRECT", "X", "Y")),
+        )
+        self.assertIsNone(
+            Desktop._resolve_target_group(ambiguous_non_primaries, "完全无关组", "Y", ("X", "Y"))
         )
 
 

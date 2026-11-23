@@ -367,8 +367,8 @@ class DesktopTests(unittest.TestCase):
         self.assertEqual([(j.name, j.download_bytes, j.streams) for j in phases[1].jobs],
                          [("beta", 20 * 1_048_576, 4)])
         self.assertEqual(phases[1].parallel, 2)
-        self.assertEqual((phases[0].jobs[0].head_timeout, phases[0].jobs[0].download_timeout), (3, 3))
-        self.assertEqual((phases[1].jobs[0].head_timeout, phases[1].jobs[0].download_timeout), (3, 3))
+        self.assertEqual((phases[0].jobs[0].latency_timeout, phases[0].jobs[0].download_timeout), ("3s", "3s"))
+        self.assertEqual((phases[1].jobs[0].latency_timeout, phases[1].jobs[0].download_timeout), ("3s", "3s"))
         state = self.app.get_state()
         self.assertEqual([(r["name"], r["selected"], r["score"] is not None) for r in state["rows"]],
                          [("alpha", True, False), ("beta", True, True)])
