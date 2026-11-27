@@ -11,7 +11,7 @@ import time
 import win32clipboard
 
 from .batch import Job, MultiBatchRunner
-from .controller import (AssistedSwitch, ControllerError, PipeController, ProbeError,
+from .controller import (AssistedSwitch, ControllerError, PipeController, ProbeError, ProxyGroup,
                          SwitchLatch, read_settings, read_tun_enabled)
 from .profile_registry import ProfileError, default_root, load_registry, revalidate, snapshot_profile
 from .runtime_bridge import (
@@ -62,6 +62,10 @@ class Row:
     stage1_score: object = None
     node_type: str = ""
     samples: list = field(default_factory=list)
+    eligible: bool = field(init=False)
+
+    def __post_init__(self):
+        self.eligible = _eligible_name(self.name)
 
 
 def _registry_signature(registry):
@@ -276,6 +280,7 @@ class Desktop:
             profiles = [] if not self.registry else [
                 {"uid": p.uid, "name": p.name, "current": p.current,
                  "compatible": p.uid in self.snapshots,
+                 "node_count": len(self.snapshots[p.uid].names) if p.uid in self.snapshots else 0,
                  "selected": p.uid in self.selected_profiles} for p in self.registry.profiles]
             rows = []
             for row in self.rows:
@@ -284,7 +289,7 @@ class Desktop:
                 live = self.live_progress.get(ident) if self.running else None
                 rows.append({"uid": row.uid, "profile": row.profile, "name": row.name,
                              "selected": row.selected, "state": row.state,
-                             "eligible": _eligible_name(row.name),
+                             "eligible": row.eligible,
                              "node_type": row.node_type or (m.node_type if m else ""),
                              "score": m.score if m else None,
                              "stage1_score": row.stage1_score,
@@ -554,7 +559,9 @@ class Desktop:
                     raise
                 snapshots[profile.uid] = snapshot
                 total += len(snapshot.data)
-                rows.extend(Row(profile.uid, profile.name, name) for name in snapshot.names)
+                for idx, name in enumerate(snapshot.names):
+                    ntype = snapshot.node_types[idx] if idx < len(snapshot.node_types) else ""
+                    rows.append(Row(profile.uid, profile.name, name, node_type=ntype))
                 if total > 8 * 1024 * 1024 or len(rows) > 2000:
                     raise ProfileError("too many nodes")
             if registry.profiles and not snapshots:
@@ -585,6 +592,8 @@ class Desktop:
                         self.selected_profiles = {current.uid} if current is not None else set()
                     else:
                         self.selected_profiles = set()
+                for row in rows:
+                    row.selected = row.uid in self.selected_profiles
                 self.tun_enabled = tun_enabled
                 if not registry.profiles:
                     self.status = "没有可用的本地订阅"
@@ -631,12 +640,15 @@ class Desktop:
                 if not nodes <= available or any(uid not in profiles for uid, _ in nodes):
                     raise ValueError()
                 old_nodes = {(r.uid, r.name) for r in self.rows if r.selected and r.uid in self.selected_profiles}
-                if profiles != self.selected_profiles or nodes != old_nodes:
+                profiles_changed = profiles != self.selected_profiles
+                if profiles_changed or nodes != old_nodes:
                     self._invalidate()
                     self._disarm_patrol()
-                    self.capture, self.groups = None, []
-                    self.suggested_group = None
-                    self.probe_group = None
+                    current_uid = next((p.uid for p in self.registry.profiles if p.current), None)
+                    if profiles_changed and (not current_uid or current_uid not in profiles):
+                        self.capture, self.groups = None, []
+                        self.suggested_group = None
+                        self.probe_group = None
                 self.selected_profiles = profiles
                 for row in self.rows:
                     row.selected = (row.uid, row.name) in nodes
@@ -676,7 +688,24 @@ class Desktop:
                     raise ControllerError("unavailable")
                 snapshot = self.snapshots[current.uid]
                 generation = self.generation
-            revalidate(registry, [snapshot])
+            try:
+                revalidate(registry, [snapshot])
+            except ProfileError:
+                if preserve_schedule:
+                    raise
+                status_code, _ = self._sync_stale_registry_for_manual_action(need_groups=False)
+                if status_code not in ("fresh", "synced"):
+                    raise
+                with self.lock:
+                    if self.running or self.refreshing or not self.registry:
+                        raise ControllerError("unavailable")
+                    registry = self.registry
+                    current = next((p for p in registry.profiles if p.current), None)
+                    if not current or current.uid not in self.snapshots:
+                        raise ControllerError("unavailable")
+                    snapshot = self.snapshots[current.uid]
+                    generation = self.generation
+                revalidate(registry, [snapshot])
             tun_enabled = read_tun_enabled(registry)
             tun_updated = True
             settings = read_settings(registry)
@@ -692,19 +721,14 @@ class Desktop:
                 self.tun_enabled = tun_enabled
                 self.capture = (registry, snapshot, settings, controller.identity, tuple(groups))
                 self.groups = [{"name": g.name, "now": g.now} for g in groups]
-                names = set(snapshot.names)
-                full = [g.name for g in groups if g.name != "GLOBAL" and names <= set(g.all)]
-                if len(full) == 1:
-                    suggested = full[0]
-                else:
-                    non_global = [g.name for g in groups if g.name != "GLOBAL"]
-                    suggested = non_global[0] if len(non_global) == 1 else None
+                suggested = self._compute_suggested_group(groups, snapshot.names)
                 self.suggested_group = suggested
                 if suggested:
                     self.probe_group = suggested
-                elif self.probe_group not in {g.name for g in groups}:
-                    non_global = [g.name for g in groups if g.name != "GLOBAL"]
-                    self.probe_group = non_global[0] if non_global else (groups[0].name if groups else None)
+                else:
+                    current_probe = next((g for g in groups if g.name == self.probe_group), None)
+                    if current_probe is None or current_probe.now not in snapshot.names:
+                        self.probe_group = self._default_probe_group(groups, snapshot.names)
                 self.status = f"策略组已刷新，已智能选中“{suggested}”" if suggested else "策略组已刷新，请选择目标组"
             self._trigger_health_probe_async()
             return {"ok": True}
@@ -726,6 +750,176 @@ class Desktop:
     @staticmethod
     def _group_core_name(name):
         return "".join(ch for ch in str(name or "").lower() if ch.isalnum())
+
+    def _sync_group_now_locked(self, group_name, new_now):
+        self.groups = [
+            {"name": g["name"], "now": new_now if g["name"] == group_name else g["now"]}
+            for g in self.groups
+        ]
+        if self.capture is not None:
+            registry, snapshot, settings, identity, groups = self.capture
+            updated = tuple(
+                ProxyGroup(g.name, new_now if g.name == group_name else g.now, g.all)
+                for g in groups
+            )
+            self.capture = (registry, snapshot, settings, identity, updated)
+
+    @staticmethod
+    def _default_probe_group(groups, snapshot_names):
+        """Pick a read-only health-probe group, preferring one whose current target is a real node."""
+        if not groups:
+            return None
+        non_global = [g for g in groups if g.name != "GLOBAL"]
+        pool = non_global if non_global else list(groups)
+        node_set = set(snapshot_names)
+        direct_node = [g for g in pool if g.now in node_set]
+        if direct_node:
+            return max(direct_node, key=lambda g: len(set(g.all) & node_set)).name
+        return pool[0].name
+
+    def _reload_registry_and_snapshots(self):
+        registry = load_registry(self.root)
+        if len(registry.profiles) > 32:
+            raise ProfileError("too many profiles")
+        snapshots = {}
+        rows = []
+        total = 0
+        skipped = 0
+        for profile in registry.profiles:
+            try:
+                snapshot = snapshot_profile(registry, profile)
+            except ProfileError as exc:
+                if str(exc) in ("invalid profile", "invalid YAML"):
+                    skipped += 1
+                    continue
+                raise
+            snapshots[profile.uid] = snapshot
+            total += len(snapshot.data)
+            for idx, name in enumerate(snapshot.names):
+                ntype = snapshot.node_types[idx] if idx < len(snapshot.node_types) else ""
+                rows.append(Row(profile.uid, profile.name, name, node_type=ntype))
+            if total > 8 * 1024 * 1024 or len(rows) > 2000:
+                raise ProfileError("too many nodes")
+        if registry.profiles and not snapshots:
+            raise ProfileError("invalid profile")
+        revalidate(registry, snapshots.values())
+        tun_enabled = read_tun_enabled(registry)
+        return registry, snapshots, rows, skipped, tun_enabled
+
+    def _sync_stale_registry_for_manual_action(self, *, need_groups=False, requested_group=""):
+        """Auto-sync if Clash Verge updated profiles.yaml while the helper stayed open."""
+        with self.lock:
+            if self.running or self.refreshing or self.closed.is_set() or not self.registry:
+                return "skip", None
+            registry = self.registry
+            generation = self.generation
+            selected_profiles = set(self.selected_profiles)
+            check_uids = set(selected_profiles)
+            old_current = next((p.uid for p in registry.profiles if p.current), None)
+            if old_current:
+                check_uids.add(old_current)
+            check_snaps = [self.snapshots[uid] for uid in check_uids if uid in self.snapshots]
+        if not check_snaps:
+            return "skip", None
+        try:
+            revalidate(registry, check_snaps)
+            return "fresh", None
+        except ProfileError:
+            pass
+
+        new_registry, new_snapshots, new_rows, _skipped, new_tun = self._reload_registry_and_snapshots()
+        new_current = next((p for p in new_registry.profiles if p.current and p.uid in new_snapshots), None)
+        new_current_uid = new_current.uid if new_current else None
+        fresh_capture = None
+        fresh_groups = None
+        if need_groups and new_current is not None and not self.latch.outcome_unknown:
+            try:
+                snap_cur = new_snapshots[new_current.uid]
+                settings = read_settings(new_registry)
+                controller = PipeController(settings)
+                groups = controller.groups(snap_cur.names)
+                revalidate(new_registry, [snap_cur])
+                if read_settings(new_registry) == settings:
+                    fresh_capture = (new_registry, snap_cur, settings, controller.identity, tuple(groups))
+                    fresh_groups = tuple(groups)
+            except Exception:
+                fresh_capture = None
+                fresh_groups = None
+
+        with self.lock:
+            if generation != self.generation or self.running or self.refreshing or self.closed.is_set():
+                return "skip", None
+            prev_selected_profiles = set(self.selected_profiles)
+            prev_selected_nodes = {(r.uid, r.name) for r in self.rows if r.selected and r.uid in prev_selected_profiles}
+            prev_uids_with_nodes = {uid for uid, _ in prev_selected_nodes}
+            prev_row_meta = {
+                (r.uid, r.name): (r.measurement, list(r.samples), r.state, r.stage1_score)
+                for r in self.rows
+                if r.uid in self.snapshots and r.uid in new_snapshots
+                and new_snapshots[r.uid].data == self.snapshots[r.uid].data
+            }
+            self.registry = new_registry
+            self.snapshots = new_snapshots
+            self.rows = new_rows
+            self.tun_enabled = new_tun
+            kept_profiles = prev_selected_profiles & set(new_snapshots)
+            if kept_profiles:
+                self.selected_profiles = kept_profiles
+            elif new_current_uid:
+                self.selected_profiles = {new_current_uid}
+            elif new_snapshots:
+                self.selected_profiles = {next(iter(new_snapshots))}
+            else:
+                self.selected_profiles = set()
+            for row in new_rows:
+                if row.uid in self.selected_profiles:
+                    row.selected = (row.uid, row.name) in prev_selected_nodes if row.uid in prev_uids_with_nodes else True
+                else:
+                    row.selected = False
+                meta = prev_row_meta.get((row.uid, row.name))
+                if meta is not None:
+                    row.measurement, row.samples, row.state, row.stage1_score = meta
+            if self.schedule.minutes is not None:
+                self.schedule.disarm()
+                self.scheduled_options = None
+            if self.patrol_schedule.minutes is not None:
+                self._disarm_patrol()
+            self.undo = None
+            self.score_revision += 1
+
+            if fresh_capture is not None and fresh_groups is not None:
+                self.capture = fresh_capture
+                self.groups = [{"name": g.name, "now": g.now} for g in fresh_groups]
+                suggested = self._compute_suggested_group(fresh_groups, new_snapshots[new_current.uid].names)
+                self.suggested_group = suggested
+                if suggested:
+                    self.probe_group = suggested
+                else:
+                    self.probe_group = self._default_probe_group(fresh_groups, new_snapshots[new_current.uid].names)
+            elif old_current != new_current_uid or need_groups:
+                self.capture = None
+                self.groups = []
+                self.suggested_group = None
+                self.probe_group = None
+
+            if need_groups:
+                if fresh_capture is None or fresh_groups is None:
+                    self.status = "已自动同步 Clash Verge 最新配置，但无法读取当前策略组；请确认 Clash Verge 正在运行"
+                    return "abort", self.status
+                group_exists = bool(requested_group) and any(g.name == requested_group for g in fresh_groups)
+                if old_current != new_current_uid and not group_exists:
+                    hint = f"（建议“{self.suggested_group}”）" if self.suggested_group else ""
+                    self.status = f"检测到 Clash Verge 已切换订阅，已自动同步最新配置与策略组{hint}，请确认策略组后再开始测速"
+                    return "abort", self.status
+                if not group_exists:
+                    self.status = "已自动同步 Clash Verge 最新配置，原策略组已不可用，请重新选择策略组后再测速"
+                    return "abort", self.status
+                return "synced", None
+
+            if not any(r.selected and r.uid in self.selected_profiles for r in self.rows):
+                self.status = "已自动同步 Clash Verge 最新订阅，请重新勾选节点后再测速"
+                return "abort", self.status
+            return "synced", None
 
     @staticmethod
     def _compute_suggested_group(groups, snapshot_names):
@@ -898,8 +1092,7 @@ class Desktop:
             if suggested:
                 self.probe_group = suggested
             elif fresh_groups:
-                non_global = [g.name for g in fresh_groups if g.name != "GLOBAL"]
-                self.probe_group = non_global[0] if non_global else fresh_groups[0].name
+                self.probe_group = self._default_probe_group(fresh_groups, fresh_snapshot.names)
             self.undo = None
 
         if resolved_group is None:
@@ -933,10 +1126,7 @@ class Desktop:
                 elif outcome in ("switched", "confirmed_noop"):
                     self.pending = None
                     if outcome == "switched":
-                        self.groups = [
-                            {"name": g["name"], "now": target_node if g["name"] == resolved_group else g["now"]}
-                            for g in self.groups
-                        ]
+                        self._sync_group_now_locked(resolved_group, target_node)
                         if expected.now in fresh_snapshot.names and expected.now in expected.all and expected.now != target_node:
                             self.undo = (target_uid, expected.now, resolved_group, target_node,
                                          fresh_registry, fresh_snapshot, fresh_settings, fresh_identity)
@@ -983,7 +1173,11 @@ class Desktop:
             latency, download = "3s", "3s"
             parallel = min(2, max(1, len(chosen)))
         else:
-            streams = 2 if options["mode"] == "fast" else 4
+            base_streams = 2 if options["mode"] == "fast" else 4
+            max_chunk = 5 * 1_048_576
+            # Cloudflare /__down rejects >5 MiB chunks (e.g. 50MiB/4=13107200B) with HTTP 403 on proxy IPs.
+            min_streams = (options["download_bytes"] + max_chunk - 1) // max_chunk
+            streams = max(base_streams, min_streams)
             latency, download = "3s", "3s"
             parallel = options["parallel"]
         if source is None:
@@ -1054,6 +1248,15 @@ class Desktop:
         token = None
         try:
             options = self._options(value)
+            if self.registry and self.executable.is_file() and not self.running:
+                try:
+                    sync_code, sync_msg = self._sync_stale_registry_for_manual_action(
+                        need_groups=options["auto_switch"], requested_group=options["group"]
+                    )
+                except ProfileError:
+                    sync_code, sync_msg = "abort", "Clash Verge 订阅配置已变更且无法读取，请点击“刷新”重新加载"
+                if sync_code == "abort":
+                    return {"ok": False, "error": sync_msg}
             with self.lock:
                 chosen, snapshots, capture = self._validate_launch(options, False)
                 token = self.schedule.begin_manual()
@@ -1082,6 +1285,13 @@ class Desktop:
             auto, group = value["auto_switch"], value["group"]
             if not isinstance(uid, str) or not isinstance(node, str) or type(auto) is not bool or not isinstance(group, str):
                 raise ValueError("复测参数无效")
+            if not auto and not group and self.registry and self.executable.is_file() and not self.running:
+                try:
+                    sync_code, sync_msg = self._sync_stale_registry_for_manual_action(need_groups=False)
+                except ProfileError:
+                    sync_code, sync_msg = "abort", "Clash Verge 订阅配置已变更且无法读取，请点击“刷新”重新加载"
+                if sync_code == "abort":
+                    return {"ok": False, "error": sync_msg}
             options = {"parallel": 1, "download_bytes": 20 * 1_048_576, "mode": "accurate",
                        "auto_switch": auto, "group": group}
             with self.lock:
@@ -1149,6 +1359,15 @@ class Desktop:
                 raise ValueError("晋级数须为 1 至 10")
             options.update(parallel=10, download_bytes=1_048_576, mode="fast",
                            funnel_top=top_count)
+            if self.registry and self.executable.is_file() and not self.running:
+                try:
+                    sync_code, sync_msg = self._sync_stale_registry_for_manual_action(
+                        need_groups=options["auto_switch"], requested_group=options["group"]
+                    )
+                except ProfileError:
+                    sync_code, sync_msg = "abort", "Clash Verge 订阅配置已变更且无法读取，请点击“刷新”重新加载"
+                if sync_code == "abort":
+                    return {"ok": False, "error": sync_msg}
             with self.lock:
                 chosen, snapshots, capture = self._validate_launch(options, False)
                 token = self.schedule.begin_manual()
@@ -1188,6 +1407,17 @@ class Desktop:
             received_results = set()
             current_source = [source]
             current_jobs = {(job.uid, job.name): job for job in runner.jobs}
+            buffered_samples = []
+
+            def flush_telemetry():
+                if runner.cancelled.is_set() or self.closed.is_set() or fatal:
+                    return
+                for rec in buffered_samples:
+                    try:
+                        self.telemetry_store.record_sample(rec)
+                    except Exception:
+                        pass
+                buffered_samples.clear()
 
             def on_progress(job, update):
                 identity = (job.uid, job.name)
@@ -1218,6 +1448,7 @@ class Desktop:
                     runner.cancel()
                     return
                 received_results.add(identity)
+                effective_state = "cancelled" if (state == "cancelled" or runner.cancelled.is_set()) else state
                 sample_to_record = None
                 with self.lock:
                     prev_live = self.live_progress.pop(identity, None)
@@ -1236,10 +1467,10 @@ class Desktop:
                         if measurement and measurement.node_type:
                             row.node_type = measurement.node_type
                         row.state = {"ok": "完成" if measurement and measurement.download_complete else "下载未完成", "cancelled": "已停止", "timeout": "超时",
-                                     "profile_changed": "配置已变更"}.get(state, "失败")
+                                     "profile_changed": "配置已变更"}.get(effective_state, "失败")
                         self.recently_scored[identity] = time.monotonic() + 1.4
                         self.score_revision += 1
-                        if state != "cancelled" and _eligible_name(row.name):
+                        if effective_state in ("ok", "timeout") and not runner.cancelled.is_set() and row.eligible:
                             sample_to_record = TelemetrySampleRecord(
                                 timestamp=time.time(),
                                 profile_uid=row.uid,
@@ -1258,12 +1489,9 @@ class Desktop:
                                 composite_score=measurement.score if measurement else None,
                             )
                 if sample_to_record is not None:
-                    try:
-                        self.telemetry_store.record_sample(sample_to_record)
-                    except Exception:
-                        pass
-                if options.get("funnel_top") and state in ("worker_failed", "invalid_job", "invalid_output", "profile_changed"):
-                    fatal.append(state)
+                    buffered_samples.append(sample_to_record)
+                if options.get("funnel_top") and effective_state in ("worker_failed", "invalid_job", "invalid_output", "profile_changed"):
+                    fatal.append(effective_state)
                     runner.cancel()
             self._invoke_runner(runner, result, on_progress)
             if options.get("funnel_top"):
@@ -1285,7 +1513,10 @@ class Desktop:
                     promoted = candidates[:options["funnel_top"]]
                     if not promoted:
                         self.status = "初筛没有合格节点，未开始加压复测"
-                        return
+                if not promoted:
+                    flush_telemetry()
+                    return
+                with self.lock:
                     selected = {(r.uid, r.name) for r in promoted}
                     jobs = [Job(r.uid, r.name, snapshots[r.uid].data, 20 * 1_048_576,
                                 4, "3s", "3s") for r in promoted]
@@ -1330,6 +1561,7 @@ class Desktop:
                             self.status = "加压复测失败或配置已变更，未自动切换"
                     return
                 revalidate(self.registry, snapshots.values())
+            flush_telemetry()
             if run_kind == "patrol":
                 with self.lock:
                     self.cached_patrol_bytes_today = self.telemetry_store.patrol_bytes_used_today()
@@ -1359,9 +1591,17 @@ class Desktop:
                         self.status = f"单节点复测完成（{winner.name}）" if winner else "单节点复测完成，未能取得有效评分"
                     else:
                         self.status = "测速完成" if winner else "测速完成，无可评分节点"
-        except Exception:
+        except Exception as exc:
             with self.lock:
-                self.status = "测速失败或配置已变更"
+                aborted_state = "配置已变更" if isinstance(exc, ProfileError) else "已停止"
+                for row in self.rows:
+                    if row.state == "等待":
+                        row.state = aborted_state
+                self.score_revision += 1
+                if isinstance(exc, ProfileError):
+                    self.status = "测速中途检测到 Clash Verge 配置已变更，请重新点“刷新”后再测速"
+                else:
+                    self.status = "测速失败或配置已变更"
                 self._invalidate()
         finally:
             with self.lock:
@@ -1414,10 +1654,7 @@ class Desktop:
                     self.undo = (snapshot.profile.uid, expected.now, group_name, winner.name,
                                  registry, snapshot, settings, identity)
                 if outcome == "switched":
-                    self.groups = [
-                        {"name": g["name"], "now": winner.name if g["name"] == group_name else g["now"]}
-                        for g in self.groups
-                    ]
+                    self._sync_group_now_locked(group_name, winner.name)
                 self.status = {"switched": "已切换并复核", "confirmed_noop": "当前已是最优节点",
                                "outcome_unknown": "切换结果未知，请到 Clash Verge 手动核验；自动切换已锁定"}.get(outcome, "切换条件已变化，未自动切换")
                 if outcome == "outcome_unknown":
@@ -1428,9 +1665,9 @@ class Desktop:
 
     def stop(self):
         with self.lock:
-            self._invalidate()
             if self.runner:
                 self.runner.cancel()
+            self._invalidate()
             self.status = "正在停止；已发出的切换无法撤回"
         return {"ok": True}
 
@@ -1630,8 +1867,7 @@ class Desktop:
                 registry, snapshot, settings, _identity, groups = self.capture
                 group_name = self.probe_group or self.suggested_group
                 if not group_name or not any(g.name == group_name for g in groups):
-                    non_global = [g.name for g in groups if g.name != "GLOBAL"]
-                    group_name = non_global[0] if non_global else (groups[0].name if groups else None)
+                    group_name = self._default_probe_group(groups, snapshot.names)
                 if not group_name:
                     return
             controller = PipeController(settings)
@@ -1852,10 +2088,7 @@ class Desktop:
                         expected.now in expected.all and expected.now != node):
                     self.undo = (uid, expected.now, group, node, registry, snapshot, settings, identity)
                 if outcome == "switched":
-                    self.groups = [
-                        {"name": g["name"], "now": node if g["name"] == group else g["now"]}
-                        for g in self.groups
-                    ]
+                    self._sync_group_now_locked(group, node)
                 if outcome == "outcome_unknown":
                     self._invalidate()
                 self.status = {"switched": "已切换并复核", "confirmed_noop": "该节点已被选中",
@@ -1900,10 +2133,7 @@ class Desktop:
                 elif outcome in ("switched", "confirmed_noop"):
                     self.undo = None
                     if outcome == "switched":
-                        self.groups = [
-                            {"name": g["name"], "now": node if g["name"] == group else g["now"]}
-                            for g in self.groups
-                        ]
+                        self._sync_group_now_locked(group, node)
                 self.status = {"switched": "已切回原节点并复核", "confirmed_noop": "当前已是原节点",
                                "outcome_unknown": "切换结果未知，请手动核验；切换已锁定"}.get(outcome, "未切回：条件已变化")
             return {"ok": outcome in ("switched", "confirmed_noop"), "error": self.status}
@@ -1945,10 +2175,7 @@ class Desktop:
                         expected.now in expected.all and expected.now != node):
                     self.undo = (uid, expected.now, group, node, registry, snapshot, settings, identity)
                 if outcome == "switched":
-                    self.groups = [
-                        {"name": g["name"], "now": node if g["name"] == group else g["now"]}
-                        for g in self.groups
-                    ]
+                    self._sync_group_now_locked(group, node)
                 if outcome == "outcome_unknown":
                     self._invalidate()
                 elif outcome in ("switched", "confirmed_noop"):

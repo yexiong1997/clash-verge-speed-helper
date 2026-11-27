@@ -12,7 +12,7 @@
 <body>
   <main class="app">
     <header class="command">
-      <div class="brand"><span class="brand-icon" aria-hidden="true">ϟ</span><div class="brand-title-row"><strong>Clash 测速工作台</strong><span class="brand-pill">Mihomo · Clear Prism Glass</span></div></div>
+      <div class="brand"><span class="brand-icon" aria-hidden="true">ϟ</span><div class="brand-title-row"><strong>Clash 测速工作台</strong><span class="brand-pill">Mihomo · Graphite</span></div></div>
       <div class="actions"><label class="switch tray-switch" title="开启后点击右上角 × 会最小化到系统托盘，后台继续运行"><input type="checkbox" id="minimize-to-tray" checked><span>关闭时最小化到托盘</span></label><button id="hide-tray" class="tray-btn">隐藏到托盘</button><button id="export">导出 TSV</button><button id="funnel">智能两段优选</button><button id="stress">加压验证 · 20M</button><button id="stop" class="danger">停止</button><button id="start" class="primary">开始测速</button></div>
     </header>
     <div id="tun-notice" class="tun-notice" role="status" aria-live="polite" hidden>检测到 Clash Verge 已开启 TUN 模式，可能影响测速准确率；建议先手动关闭 TUN，测速结束后再恢复（不阻断本次测速）。</div>
@@ -37,8 +37,8 @@
             <title id="best-sparkline-title">下载吞吐曲线</title>
             <defs>
               <linearGradient id="spark-grad" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stop-color="#34d399" stop-opacity="0.34"></stop>
-                <stop offset="100%" stop-color="#34d399" stop-opacity="0"></stop>
+                <stop offset="0%" stop-color="currentColor" stop-opacity="0.22"></stop>
+                <stop offset="100%" stop-color="currentColor" stop-opacity="0"></stop>
               </linearGradient>
             </defs>
             <path id="best-sparkline-area" class="spark-area" d=""></path>
@@ -93,7 +93,7 @@
         </div>
         <div id="history-tools" class="table-tools" hidden>
           <div class="win-pills" role="group" aria-label="历史时间窗"><button class="win-pill" data-hwin="24h">24小时</button><button class="win-pill active" data-hwin="7d">7天</button><button class="win-pill" data-hwin="30d">30天</button><button class="win-pill" data-hwin="peak">晚高峰</button></div>
-          <button id="history-selected-only" class="quiet toggle-pill selected" aria-pressed="true">仅已选订阅</button>
+          <button id="history-selected-only" class="quiet toggle-pill" aria-pressed="false">仅已选订阅</button>
           <button id="history-select-all" class="quiet">全选</button>
           <button id="history-clear-sel" class="quiet">清空</button>
           <input id="history-search" type="search" placeholder="搜索历史 (Ctrl+F)" aria-label="搜索历史节点或订阅">
@@ -102,8 +102,8 @@
       </div>
       <div id="table-scroll" class="table-scroll">
         <table>
-          <thead id="live-thead"><tr><th scope="col">选择</th><th scope="col"><button class="sort" data-sort="name">节点</button></th><th scope="col"><button class="sort" data-sort="profile">订阅源</button></th><th scope="col"><button class="sort" data-sort="state">状态</button></th><th scope="col" aria-sort="descending"><button class="sort" data-sort="score">综合分</button></th><th scope="col"><button class="sort" data-sort="speed">验证吞吐</button></th><th scope="col"><button class="sort" data-sort="latency">延迟</button></th><th scope="col"><button class="sort" data-sort="jitter">抖动</button></th><th scope="col"><button class="sort" data-sort="successes">成功</button></th></tr></thead>
-          <thead id="history-thead" hidden><tr><th scope="col"><button class="hsort" data-hsort="rank">#</button></th><th scope="col">状态</th><th scope="col"><button class="hsort" data-hsort="name">节点名称</button></th><th scope="col"><button class="hsort" data-hsort="profile">订阅</button></th><th scope="col"><button class="hsort" data-hsort="node_type">协议</button></th><th scope="col"><button class="hsort" data-hsort="weighted_median_speed_bps">稳健吞吐</button></th><th scope="col"><button class="hsort" data-hsort="weighted_median_latency_ms">典型延迟</button></th><th scope="col"><button class="hsort" data-hsort="availability_rate">可用率</button></th><th scope="col"><button class="hsort" data-hsort="total_count">样本</button></th><th scope="col" aria-sort="descending"><button class="hsort" data-hsort="long_term_score">长效稳健分</button></th></tr></thead>
+          <thead id="live-thead"><tr><th scope="col">测速</th><th scope="col">#</th><th scope="col"><button class="sort" data-sort="profile">订阅</button></th><th scope="col"><button class="sort" data-sort="name">节点名称</button></th><th scope="col"><button class="sort" data-sort="node_type">协议</button></th><th scope="col" class="num"><button class="sort" data-sort="speed">验证吞吐</button></th><th scope="col" class="num"><button class="sort" data-sort="latency">延迟</button></th><th scope="col" class="num"><button class="sort" data-sort="loss">丢包率</button></th><th scope="col" class="num"><button class="sort" data-sort="jitter">抖动</button></th><th scope="col" class="num" aria-sort="descending"><button class="sort" data-sort="score">综合评分</button></th></tr></thead>
+          <thead id="history-thead" hidden><tr><th scope="col"><button class="hsort" data-hsort="rank">#</button></th><th scope="col">状态</th><th scope="col"><button class="hsort" data-hsort="name">节点名称</button></th><th scope="col"><button class="hsort" data-hsort="profile">订阅</button></th><th scope="col"><button class="hsort" data-hsort="node_type">协议</button></th><th scope="col" class="num"><button class="hsort" data-hsort="weighted_median_speed_bps">稳健吞吐</button></th><th scope="col" class="num"><button class="hsort" data-hsort="weighted_median_latency_ms">典型延迟</button></th><th scope="col" class="num"><button class="hsort" data-hsort="availability_rate">可用率</button></th><th scope="col" class="num"><button class="hsort" data-hsort="total_count">样本</button></th><th scope="col" class="num" aria-sort="descending"><button class="hsort" data-hsort="long_term_score">长效稳健分</button></th></tr></thead>
           <tbody id="rows"></tbody>
         </table>
         <div id="empty" class="table-empty">
@@ -114,7 +114,7 @@
         </div>
       </div>
     </section>
-    <footer id="dock" class="dock card"><div id="overall-progress" class="overall-progress" aria-hidden="true"><div id="overall-progress-fill" class="progress-fill"></div><div id="overall-progress-pulse" class="progress-pulse" hidden></div></div><div class="dock-status"><span id="dock-dot" class="dock-dot" aria-hidden="true"></span><span id="dock-progress-pill" class="dock-progress-pill" hidden>0/0 · 0%</span><span id="status" role="status" aria-live="polite">准备就绪</span></div><div class="dock-actions"><button id="undo">切回原节点</button><button id="manual">切换选中节点</button><button id="continue">继续应用最优</button><button id="dock-start">开始</button><button id="dock-stop" class="danger">停止</button></div></footer>
+    <footer id="dock" class="dock card"><div id="overall-progress" class="overall-progress" aria-hidden="true"><div id="overall-progress-fill" class="progress-fill"></div><div id="overall-progress-pulse" class="progress-pulse" hidden></div></div><div class="dock-status"><span id="dock-dot" class="dock-dot" aria-hidden="true"></span><span id="dock-progress-pill" class="dock-progress-pill" hidden>0/0 · 0%</span><span id="status" role="status" aria-live="polite">准备就绪</span></div><div class="dock-actions"><button id="undo">切回原节点</button><button id="manual">切换选中节点</button><button id="continue">继续应用最优</button></div></footer>
   </main>
   <div id="row-menu" class="context-menu" role="menu" aria-label="节点快捷操作" hidden>
     <button id="menu-switch" role="menuitem">立即切换至此节点</button>

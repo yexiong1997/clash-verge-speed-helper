@@ -134,11 +134,17 @@ class MultiBatchRunner:
             return "cancelled", None
         if not job.name or not job.yaml or not (1 <= job.streams <= 128) or job.download_bytes < job.streams:
             return "invalid_job", None
+        if self.cancelled.is_set():
+            return "cancelled", None
         try:
             if not self.prelaunch(job):
+                if self.cancelled.is_set():
+                    return "cancelled", None
                 self.cancel()
                 return "profile_changed", None
         except Exception:
+            if self.cancelled.is_set():
+                return "cancelled", None
             self.cancel()
             return "profile_changed", None
         if self.cancelled.is_set():
@@ -289,11 +295,13 @@ class MultiBatchRunner:
                     return ("cancelled" if self.cancelled.is_set() else "timeout"), None
             for thread in threads:
                 thread.join(3)
+            if self.cancelled.is_set():
+                if any(thread.is_alive() for thread in threads):
+                    win32job.TerminateJobObject(job_handle, 1)
+                return "cancelled", None
             if any(thread.is_alive() for thread in threads):
                 win32job.TerminateJobObject(job_handle, 1)
                 return "worker_failed", None
-            if self.cancelled.is_set():
-                return "cancelled", None
             if win32process.GetExitCodeProcess(process) != 0 or not input_ok[0] or overflow[0]:
                 return "worker_failed", None
             measurement = decode_measurement(bytes(stdout), job.name, job.download_bytes, job.streams)
@@ -304,7 +312,7 @@ class MultiBatchRunner:
                     win32process.TerminateProcess(process, 1)
                 except Exception:
                     pass
-            return "worker_failed", None
+            return ("cancelled" if self.cancelled.is_set() else "worker_failed"), None
         finally:
             if main_thread is not None:
                 win32api.CloseHandle(main_thread)

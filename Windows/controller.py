@@ -38,6 +38,8 @@ _AF_UNIX = 1
 _AF_UNIX_REPARSE_TAG = 0x80000023
 _READ_CONTROL = 0x00020000
 _IO_UNRESOLVED = threading.Event()
+_CONFIG_PARSE_LOCK = threading.Lock()
+_CONFIG_PARSE_CACHE = None
 
 
 class ControllerError(Exception):
@@ -84,13 +86,26 @@ class ProxyGroup:
     all: tuple
 
 
+def _parse_verge_config_cached(data, version):
+    """Memoize deterministic strict YAML parsing for identical clash-verge.yaml bytes."""
+    global _CONFIG_PARSE_CACHE
+    with _CONFIG_PARSE_LOCK:
+        cached = _CONFIG_PARSE_CACHE
+        if cached is not None and cached[0] == version and cached[1] == data:
+            return cached[2]
+    doc = parse_yaml(data)
+    with _CONFIG_PARSE_LOCK:
+        _CONFIG_PARSE_CACHE = (version, data, doc)
+    return doc
+
+
 def read_settings(registry):
     try:
         with _pinned(registry.root) as (root, root_id, profiles_id):
             if (root_id, profiles_id) != (registry.root_identity, registry.profiles_identity):
                 raise ControllerError("controller changed")
             data, version = _read(root / "clash-verge.yaml", MAX_REGISTRY)
-        document = parse_yaml(data)
+        document = _parse_verge_config_cached(data, version)
         if not isinstance(document, dict):
             raise ControllerError("controller unavailable")
         pipe = document.get("external-controller-pipe")
@@ -127,13 +142,13 @@ def read_tun_enabled(registry):
         if (root_id, profiles_id) != (registry.root_identity, registry.profiles_identity):
             raise ProfileError("profile changed")
         try:
-            data, _version = _read(root / "clash-verge.yaml", MAX_REGISTRY)
+            data, version = _read(root / "clash-verge.yaml", MAX_REGISTRY)
         except pywintypes.error as exc:
             if exc.winerror in (2, 3):
                 return None
             raise ProfileError("profile unavailable") from None
     try:
-        document = parse_yaml(data)
+        document = _parse_verge_config_cached(data, version)
     except ProfileError:
         return None
     if not isinstance(document, dict):

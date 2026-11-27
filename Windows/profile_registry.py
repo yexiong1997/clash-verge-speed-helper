@@ -26,7 +26,10 @@ class ProfileError(Exception):
     """An intentionally generic profile/registry validation failure."""
 
 
-class _StrictLoader(yaml.SafeLoader):
+_YAML_BASE_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+
+
+class _StrictLoader(_YAML_BASE_LOADER):
     def construct_mapping(self, node, deep=False):
         if not isinstance(node, yaml.MappingNode):
             raise ProfileError("invalid YAML")
@@ -40,9 +43,14 @@ class _StrictLoader(yaml.SafeLoader):
 
 
 def _strict_parse_yaml_text(text):
-    for token in yaml.scan(text, Loader=_StrictLoader):
-        if isinstance(token, (yaml.AliasToken, yaml.AnchorToken, yaml.TagToken)):
-            raise ProfileError("invalid YAML")
+    scanner = _YAML_BASE_LOADER(text)
+    try:
+        while scanner.check_event():
+            ev = scanner.get_event()
+            if isinstance(ev, yaml.AliasEvent) or getattr(ev, "anchor", None) or getattr(ev, "tag", None):
+                raise ProfileError("invalid YAML")
+    finally:
+        scanner.dispose()
     return yaml.load(text, Loader=_StrictLoader)
 
 
@@ -206,6 +214,7 @@ class ProfileSnapshot:
     data: bytes
     version: tuple
     names: tuple
+    node_types: tuple = ()
 
 
 def load_registry(root=None):
@@ -255,7 +264,7 @@ def load_registry(root=None):
         raise ProfileError("registry unavailable") from None
 
 
-def inspect_nodes(raw):
+def _inspect_nodes_and_types(raw):
     if not raw or len(raw) > MAX_PROFILE:
         raise ProfileError("invalid profile")
     document = parse_yaml(raw)
@@ -264,14 +273,21 @@ def inspect_nodes(raw):
     proxies = document.get("proxies")
     if not isinstance(proxies, list) or not 1 <= len(proxies) <= 2000:
         raise ProfileError("invalid profile")
-    names, seen = [], set()
+    names, types, seen = [], [], set()
     for item in proxies:
         name = item.get("name") if isinstance(item, dict) else None
         if not _valid_text(name, 1024) or name.encode() in seen:
             raise ProfileError("invalid profile")
         seen.add(name.encode())
         names.append(name)
-    return tuple(names)
+        raw_type = item.get("type") if isinstance(item, dict) else ""
+        ntype = raw_type.strip() if isinstance(raw_type, str) and len(raw_type.strip()) <= 64 else ""
+        types.append(ntype)
+    return tuple(names), tuple(types)
+
+
+def inspect_nodes(raw):
+    return _inspect_nodes_and_types(raw)[0]
 
 
 def snapshot_profile(registry, profile):
@@ -285,15 +301,27 @@ def snapshot_profile(registry, profile):
         raw, version = _read(root / "profiles" / profile.filename, MAX_PROFILE)
         if version[0] != profile.identity:
             raise ProfileError("profile changed")
-        return ProfileSnapshot(profile, raw, version, inspect_nodes(raw))
+        names, types = _inspect_nodes_and_types(raw)
+        return ProfileSnapshot(profile, raw, version, names, types)
 
 
 def revalidate(registry, snapshots):
-    fresh = load_registry(registry.root)
-    if fresh != registry:
-        raise ProfileError("registry changed")
-    for snapshot in snapshots:
-        if snapshot_profile(registry, snapshot.profile) != snapshot:
-            raise ProfileError("profile changed")
-    if load_registry(registry.root) != registry:
-        raise ProfileError("registry changed")
+    try:
+        with _pinned(registry.root) as (root, root_id, profiles_id):
+            if (root_id, profiles_id) != (registry.root_identity, registry.profiles_identity):
+                raise ProfileError("registry changed")
+            if _read(root / "profiles.yaml", MAX_REGISTRY) != (registry.registry_data, registry.registry_version):
+                raise ProfileError("registry changed")
+            known = set(registry.profiles)
+            for snapshot in snapshots:
+                if snapshot.profile not in known:
+                    raise ProfileError("profile changed")
+                raw, version = _read(root / "profiles" / snapshot.profile.filename, MAX_PROFILE)
+                if version[0] != snapshot.profile.identity or (raw, version) != (snapshot.data, snapshot.version):
+                    raise ProfileError("profile changed")
+            if _read(root / "profiles.yaml", MAX_REGISTRY) != (registry.registry_data, registry.registry_version):
+                raise ProfileError("registry changed")
+    except ProfileError:
+        raise
+    except Exception:
+        raise ProfileError("registry changed") from None

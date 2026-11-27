@@ -2,7 +2,7 @@
 const $ = id => document.getElementById(id);
 let state = {profiles: [], rows: [], groups: [], running: false, status: "准备就绪"};
 let active = null, busy = false, sortColumn = "score", sortAscending = false, groupToRestore = null, lastSelectedGroup = "";
-let viewMode = "live", historyWindow = "7d", historySelectedOnly = true, historySortColumn = "rank", historySortAscending = false;
+let viewMode = "live", historyWindow = "7d", historySelectedOnly = false, historySortColumn = "rank", historySortAscending = false;
 let historySummaries = [], historyActiveKey = null;
 const historySelectedKeys = new Set();
 let refreshSeq = 0, actionEpoch = 0, refreshInFlight = false, historySeq = 0;
@@ -13,6 +13,7 @@ let prefsHydrated = false;
 let wasRunning = false, lastScoreRevision = -1, lastChampSig = "", champDisplayScore = null, champDisplaySpeed = null, champAnimRaf = null, champPulseTimer = null;
 let clearHistoryResetTimer = null, clearHistoryArmedUntil = 0;
 let exportCopiedTimer = null, dockConfirmTimer = null, dockConfirmedUntil = 0, lastStatusSeen = "";
+let stickyNotice = null;
 let lastEmptySig = "", locatedRowKey = null, locatedRowTimer = null;
 let lastIdlePollAt = 0;
 const rowCache = new Map();
@@ -20,6 +21,35 @@ const localCascadeUntil = new Map();
 const key = row => JSON.stringify([row.uid, row.name]);
 const api = () => window.pywebview.api;
 const reducesMotion = () => Boolean(typeof window !== "undefined" && typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+let lastRenderedStateJson = "";
+let lastRenderedActiveUsingKey = null;
+const historyRowMap = new Map();
+
+function setActiveLiveRow(rowKey) {
+  const curIdent = activeUsingIdentity();
+  const curKey = curIdent ? JSON.stringify([curIdent.uid, curIdent.name]) : null;
+  if (curKey !== lastRenderedActiveUsingKey) {
+    active = rowKey;
+    renderRows();
+    return;
+  }
+  if (active === rowKey) return;
+  const prevEntry = active ? rowCache.get(active) : null;
+  if (prevEntry) prevEntry.tr.classList.toggle("active", false);
+  active = rowKey;
+  const nextEntry = active ? rowCache.get(active) : null;
+  if (nextEntry) nextEntry.tr.classList.toggle("active", true);
+}
+
+function setActiveHistoryRow(rowKey) {
+  if (historyActiveKey === rowKey) return;
+  const prevTr = historyActiveKey ? historyRowMap.get(historyActiveKey) : null;
+  if (prevTr) prevTr.classList.toggle("active", false);
+  historyActiveKey = rowKey;
+  const nextTr = historyActiveKey ? historyRowMap.get(historyActiveKey) : null;
+  if (nextTr) nextTr.classList.toggle("active", true);
+  updateChampion();
+}
 
 function activeUsingIdentity() {
   const curProfile = (state.profiles || []).find(p => p.current);
@@ -91,7 +121,7 @@ function updateDockVisual(isError = false) {
   dock.classList.toggle("dock-error", Boolean(isError || state.outcome_unknown));
 }
 
-function notify(message, isError = false) {
+function applyStatusDisplay(message, isError = false) {
   $("status").textContent = message;
   $("status").classList.toggle("error", isError);
   const dot = $("dock-dot");
@@ -102,13 +132,49 @@ function notify(message, isError = false) {
   updateDockVisual(isError);
 }
 
+function notify(message, isError = false) {
+  stickyNotice = {
+    message: String(message || ""),
+    isError: Boolean(isError),
+    baseStatus: state.status || ""
+  };
+  applyStatusDisplay(stickyNotice.message, stickyNotice.isError);
+}
+
+function clearStickyNotice(onlyErrors = false) {
+  if (!stickyNotice) return;
+  if (onlyErrors && !stickyNotice.isError) return;
+  stickyNotice = null;
+}
+
+function clearGroupAttention() {
+  const el = $("group");
+  if (el?.classList) el.classList.toggle("needs-attention", false);
+}
+
+function ensureAutoSwitchGroupReady() {
+  if (state.outcome_unknown) return true;
+  if ($("auto").checked && !$("group").value) {
+    notify("已勾选“自动切换最高分”，请先在上方选择策略组，或取消勾选以纯测速", true);
+    const groupEl = $("group");
+    if (groupEl) {
+      if (groupEl.classList) groupEl.classList.toggle("needs-attention", true);
+      if (typeof groupEl.focus === "function") groupEl.focus();
+    }
+    return false;
+  }
+  clearGroupAttention();
+  return true;
+}
+
 function visible() {
   return RowModel.visibleRows(state.rows, state.profiles, {
     query: $("search").value,
     status: $("status-filter").value,
     sort: sortColumn,
     ascending: sortAscending,
-    freezeOrder: Boolean(state.running)
+    freezeOrder: Boolean(state.running),
+    pinSelectedTop: Boolean(state.running)
   });
 }
 
@@ -146,6 +212,13 @@ function activeHeroRow() {
 function selectedNodes() {
   const profiles = new Set(state.profiles.filter(p => p.selected).map(p => p.uid));
   return state.rows.filter(r => r.selected && profiles.has(r.uid));
+}
+function activeProfileUids() {
+  return state.profiles.filter(p => p.selected && p.compatible !== false).map(p => p.uid);
+}
+function activeSelectedNodeKeys() {
+  const profSet = new Set(activeProfileUids());
+  return new Set(state.rows.filter(r => r.selected && profSet.has(r.uid)).map(key));
 }
 function selectionSignature() { return JSON.stringify(selectedNodes().map(key)); }
 function groupsSignature() { return JSON.stringify((state.groups || []).map(g => [g.name, g.now])); }
@@ -302,7 +375,12 @@ async function runBusy(fn) {
 async function updateSelection(profiles, selected) {
   if (busy || state.running) return false;
   busy = true;
-  render();
+  const profSet = new Set(profiles);
+  for (const p of state.profiles) p.selected = profSet.has(p.uid);
+  for (const r of state.rows) r.selected = profSet.has(r.uid) && selected.has(key(r));
+  lastRenderedStateJson = "";
+  renderProfiles();
+  renderRows();
   let ok = false;
   try {
     ok = await call("set_selection", {
@@ -355,7 +433,7 @@ function profileSelection(uid, selected) {
 
 function renderProfiles() {
   const host = $("profiles");
-  const sig = JSON.stringify([state.running, state.profiles.map(p => [p.uid, p.name, p.selected, p.current, p.compatible !== false])]);
+  const sig = JSON.stringify([state.running, state.profiles.map(p => [p.uid, p.name, p.selected, p.current, p.compatible !== false, p.node_count || 0])]);
   if (sig !== lastProfilesSig) {
     lastProfilesSig = sig;
     host.replaceChildren();
@@ -364,6 +442,10 @@ function renderProfiles() {
       const button = document.createElement("button");
       button.className = `profile-chip${p.selected ? " selected" : ""}${p.current ? " current" : ""}${compatible ? "" : " incompatible"}`;
       button.textContent = compatible ? p.name : `${p.name}（不支持）`;
+      const metaParts = [];
+      if (p.current) metaParts.push("当前");
+      if (compatible && p.node_count > 0) metaParts.push(`${p.node_count} 节点`);
+      if (button.setAttribute && metaParts.length) button.setAttribute("data-meta", metaParts.join(" · "));
       button.setAttribute("aria-pressed", String(p.selected));
       button.title = compatible ? p.uid : `${p.uid}（包含不支持的 proxy-providers 或无内联节点）`;
       button.disabled = state.running || !compatible;
@@ -385,25 +467,28 @@ function createRowEntry(row) {
   tr.tabIndex = 0;
   const entry = {
     tr, row, box: null, cells: [],
-    nameWrap: null, nameText: null, rankBadge: null, currentBadge: null,
-    speedWrap: null, speedText: null, speedBar: null, values: null
+    rankBadge: null, nameWrap: null, nameText: null, currentBadge: null,
+    protoBadge: null,
+    speedWrap: null, speedText: null, speedBar: null, values: null,
+    ariaName: "", lastSpeedWidth: "", lastIsCurrent: null
   };
-  tr.onclick = () => { active = key(entry.row); renderRows(); };
-  tr.ondblclick = () => { active = key(entry.row); renderRows(); confirmManual(tr); };
+  tr.onclick = () => { setActiveLiveRow(key(entry.row)); };
+  tr.ondblclick = () => { setActiveLiveRow(key(entry.row)); confirmManual(tr); };
   const box = document.createElement("input");
   box.type = "checkbox";
   box.onclick = e => e.stopPropagation();
   box.ondblclick = e => e.stopPropagation();
   box.onchange = () => {
-    const nodes = new Set(state.rows.filter(r => r.selected).map(key));
+    const profs = activeProfileUids();
+    const nodes = activeSelectedNodeKeys();
     box.checked ? nodes.add(key(entry.row)) : nodes.delete(key(entry.row));
-    updateSelection(state.profiles.filter(p => p.selected).map(p => p.uid), nodes);
+    return updateSelection(profs, nodes);
   };
   entry.box = box;
   const first = document.createElement("td");
   first.append(box);
   tr.append(first);
-  for (let i = 0; i < 8; i++) {
+  for (let i = 0; i < 9; i++) {
     const td = document.createElement("td");
     entry.cells.push(td);
     tr.append(td);
@@ -411,7 +496,7 @@ function createRowEntry(row) {
   return entry;
 }
 
-function updateRowEntry(entry, row, maxSpeed, isRankOne = false, isCurrent = false) {
+function updateRowEntry(entry, row, maxSpeed, isRankOne = false, isCurrent = false, rowIndex = 0) {
   entry.row = row;
   const rowKey = key(row);
   const nowMs = Date.now();
@@ -425,73 +510,107 @@ function updateRowEntry(entry, row, maxSpeed, isRankOne = false, isCurrent = fal
   entry.tr.classList.toggle("is-cascade", Boolean(row.cascade_highlighted) || localCasc);
   entry.tr.classList.toggle("is-located", locatedRowKey === rowKey);
   entry.box.checked = row.selected;
-  entry.box.disabled = state.running;
-  entry.box.setAttribute("aria-label", `选择 ${row.name}`);
+  entry.box.disabled = Boolean(state.running || busy);
+  if (entry.ariaName !== row.name) {
+    entry.ariaName = row.name;
+    entry.box.setAttribute("aria-label", `选择 ${row.name}`);
+  }
 
   const live = row.live;
-  let stateText = row.state;
   let scoreText = row.score == null ? "—" : row.score.toFixed(1);
+  let scoreTone = "";
   let speedText = row.speed == null ? "—" : `${(row.speed / 1048576).toFixed(2)} MiB/s`;
   if (live) {
     if (live.phase === "head") {
-      stateText = "探测延迟";
       scoreText = "探测中";
+      scoreTone = "testing";
       speedText = "探测延迟…";
     } else {
       const pct = live.expected_bytes > 0 ? Math.min(99, Math.max(0, Math.round(live.received_bytes / live.expected_bytes * 100))) : 0;
-      stateText = "下载中";
       scoreText = pct > 0 ? `下载 ${pct}%` : "下载中…";
+      scoreTone = "testing";
       speedText = live.bps > 0 ? `${(live.bps / 1048576).toFixed(2)} MiB/s` : "连接下载…";
     }
   } else if (row.state === "等待") {
-    stateText = "等待";
     scoreText = "队列中";
+    scoreTone = "waiting";
     speedText = "排队等待";
   } else if (row.score == null && row.stage1_score != null && row.state && row.state.startsWith("初筛")) {
     scoreText = row.state;
+    scoreTone = "stage1";
+  } else if (row.score == null && row.state && !["待测速", "未勾选", "完成"].includes(row.state)) {
+    scoreText = row.state;
+    scoreTone = "failed";
+  } else if (row.score != null && !row.eligible) {
+    scoreTone = "muted";
   }
 
+  const rankText = isRankOne ? "#1" : (row.eligible && row.score != null ? String(rowIndex + 1) : "—");
+  const protoText = row.node_type ? String(row.node_type).toUpperCase() : "—";
+  const lossText = row.successes == null ? "—" : `${Math.round((6 - row.successes) * 100 / 6)}%`;
   const values = [
-    row.name,
+    rankText,
     row.profile,
-    stateText,
-    scoreText,
+    row.name,
+    protoText,
     speedText,
     row.latency == null ? "—" : `${row.latency.toFixed(0)} ms`,
+    lossText,
     row.jitter == null ? "—" : `${row.jitter.toFixed(0)} ms`,
-    row.successes == null ? "—" : `${row.successes}/6`
+    scoreText
   ];
   for (let i = 0; i < values.length; i++) {
     const td = entry.cells[i];
     const v = values[i];
     if (i === 0) {
+      if (!entry.values || entry.values[0] !== v) {
+        td.textContent = v;
+        td.title = v;
+      }
+      td.classList.toggle("rank-cell", true);
+      td.classList.toggle("rank-top", Boolean(isRankOne));
+      continue;
+    }
+    if (i === 2) {
       if (!entry.nameWrap) {
         td.textContent = "";
         const wrap = document.createElement("div");
         wrap.className = "node-name-cell";
-        const rankB = document.createElement("span");
-        rankB.className = "badge badge-rank1";
-        rankB.textContent = "#1";
-        rankB.hidden = true;
         const nameSpan = document.createElement("span");
         nameSpan.className = "node-name-text";
         const curB = document.createElement("span");
         curB.className = "badge badge-current";
         curB.textContent = "当前";
         curB.hidden = true;
-        wrap.append(rankB, nameSpan, curB);
+        wrap.append(nameSpan, curB);
         td.append(wrap);
         entry.nameWrap = wrap;
-        entry.rankBadge = rankB;
         entry.nameText = nameSpan;
         entry.currentBadge = curB;
       }
-      if (!entry.values || entry.values[0] !== v) {
+      if (!entry.values || entry.values[2] !== v) {
         entry.nameText.textContent = v;
       }
-      td.title = isCurrent ? `${v}（当前使用中）` : v;
-      entry.rankBadge.hidden = !isRankOne;
+      if (!entry.values || entry.values[2] !== v || entry.lastIsCurrent !== isCurrent) {
+        td.title = isCurrent ? `${v}（当前使用中）` : v;
+        entry.lastIsCurrent = isCurrent;
+      }
       entry.currentBadge.hidden = !isCurrent;
+      continue;
+    }
+    if (i === 3) {
+      if (!entry.protoBadge) {
+        td.textContent = "";
+        const badge = document.createElement("span");
+        badge.className = "proto-badge";
+        td.append(badge);
+        entry.protoBadge = badge;
+      }
+      if (!entry.values || entry.values[3] !== v) {
+        entry.protoBadge.textContent = v;
+        entry.protoBadge.classList.toggle("empty", v === "—");
+        td.title = v;
+      }
       continue;
     }
     if (i === 4) {
@@ -527,9 +646,16 @@ function updateRowEntry(entry, row, maxSpeed, isRankOne = false, isCurrent = fal
         entry.speedBar.classList.toggle("testing", Boolean(live));
         entry.speedBar.classList.toggle("rank-1", Boolean(isRankOne && !live));
         entry.speedBar.classList.toggle("indeterminate", indet);
-        entry.speedBar.style.width = indet ? "" : `${pct.toFixed(1)}%`;
+        const nextWidth = indet ? "" : `${pct.toFixed(1)}%`;
+        if (entry.lastSpeedWidth !== nextWidth) {
+          entry.lastSpeedWidth = nextWidth;
+          entry.speedBar.style.width = nextWidth;
+        }
       } else {
-        if (entry.speedWrap) entry.speedWrap = entry.speedText = entry.speedBar = null;
+        if (entry.speedWrap) {
+          entry.speedWrap = entry.speedText = entry.speedBar = null;
+          entry.lastSpeedWidth = "";
+        }
         if (!entry.values || entry.values[i] !== v) {
           td.textContent = v;
           td.title = v;
@@ -539,10 +665,15 @@ function updateRowEntry(entry, row, maxSpeed, isRankOne = false, isCurrent = fal
     }
     if (!entry.values || entry.values[i] !== v) {
       td.textContent = v;
-      td.title = v;
+      td.title = i === 6 && row.successes != null ? `${v}（${row.successes}/6 次成功）` : v;
     }
-    if (i === 3) td.classList.toggle("score-top", Boolean(row.eligible && row.score != null));
     if (i === 5) td.classList.toggle("latency-cell", row.latency != null);
+    if (i === 6) td.classList.toggle("loss-warn", row.successes != null && row.successes < 6);
+    if (i === 8) {
+      td.classList.toggle("score-top", Boolean(row.eligible && row.score != null));
+      td.classList.toggle("score-testing", scoreTone === "testing");
+      td.classList.toggle("score-failed", scoreTone === "failed");
+    }
   }
   entry.values = values;
 }
@@ -657,6 +788,7 @@ function renderHistoryRows() {
   updateHistorySelectionUi(false);
   renderEmptyState("history", items.length);
   rowCache.clear();
+  historyRowMap.clear();
   host.replaceChildren();
   const maxBps = Math.max(20 * 1048576, ...items.map(s => s.weighted_median_speed_bps || 0));
   for (let idx = 0; idx < items.length; idx++) {
@@ -664,6 +796,7 @@ function renderHistoryRows() {
     const tr = document.createElement("tr");
     tr.tabIndex = 0;
     const rk = key(s);
+    historyRowMap.set(rk, tr);
     const isCurrent = isActiveUsingRow(s);
     const isTopRank = idx === 0 && historySortColumn === "rank" && s.long_term_score > 0;
     const isChecked = historySelectedKeys.has(rk);
@@ -671,8 +804,8 @@ function renderHistoryRows() {
     tr.classList.toggle("hist-checked", isChecked);
     tr.classList.toggle("is-current-node", isCurrent);
     tr.classList.toggle("is-rank-1", isTopRank);
-    tr.onclick = () => { historyActiveKey = rk; renderHistoryRows(); updateChampion(); };
-    tr.ondblclick = () => { historyActiveKey = rk; renderHistoryRows(); confirmManual(tr); };
+    tr.onclick = () => { setActiveHistoryRow(rk); };
+    tr.ondblclick = () => { setActiveHistoryRow(rk); confirmManual(tr); };
 
     const tdRank = document.createElement("td");
     const rankWrap = document.createElement("div");
@@ -1141,6 +1274,7 @@ function renderRows() {
   renderEmptyState("live", rows.length);
   const maxSpeed = Math.max(25 * 1048576, ...rows.map(r => r.speed || 0));
   const actIdent = activeUsingIdentity();
+  lastRenderedActiveUsingKey = actIdent ? JSON.stringify([actIdent.uid, actIdent.name]) : null;
   if (typeof host.insertBefore === "function") {
     const alive = new Set();
     for (let i = 0; i < rows.length; i++) {
@@ -1154,7 +1288,7 @@ function renderRows() {
       }
       const isRankOne = i === 0 && sortColumn === "score" && !sortAscending && Boolean(row.eligible && row.score != null);
       const isCurrent = Boolean(actIdent && row.uid === actIdent.uid && row.name === actIdent.name);
-      updateRowEntry(entry, row, maxSpeed, isRankOne, isCurrent);
+      updateRowEntry(entry, row, maxSpeed, isRankOne, isCurrent, i);
       const currentAt = host.children[i];
       if (currentAt !== entry.tr) host.insertBefore(entry.tr, currentAt || null);
     }
@@ -1168,10 +1302,12 @@ function renderRows() {
     }
   } else {
     host.replaceChildren();
-    for (const row of rows) {
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
       const entry = createRowEntry(row);
+      const isRankOne = i === 0 && sortColumn === "score" && !sortAscending && Boolean(row.eligible && row.score != null);
       const isCurrent = Boolean(actIdent && row.uid === actIdent.uid && row.name === actIdent.name);
-      updateRowEntry(entry, row, maxSpeed, false, isCurrent);
+      updateRowEntry(entry, row, maxSpeed, isRankOne, isCurrent, i);
       host.append(entry.tr);
     }
   }
@@ -1195,6 +1331,7 @@ function renderGroups() {
     select.value = state.suggested_group;
     lastSelectedGroup = state.suggested_group;
   }
+  if (select.value) clearGroupAttention();
 }
 
 function buildPatrolMeta() {
@@ -1368,8 +1505,10 @@ function render() {
   const blocked = state.running || busy;
   const unknown = Boolean(state.outcome_unknown);
   if (unknown) { $("auto").checked = false; lastSelectedGroup = ""; }
-  $("start").disabled = $("dock-start").disabled = blocked;
-  $("stop").disabled = $("dock-stop").disabled = !state.running;
+  $("start").disabled = blocked;
+  $("stop").disabled = !state.running;
+  if ($("dock-start")) $("dock-start").disabled = blocked;
+  if ($("dock-stop")) $("dock-stop").disabled = !state.running;
   for (const id of ["refresh", "all-profiles", "clear-profiles", "top", "all-nodes", "clear-nodes", "parallel", "size", "mode", "stress", "funnel"]) {
     $(id).disabled = blocked;
   }
@@ -1400,7 +1539,17 @@ function render() {
       flashDockConfirmed();
     }
   }
-  notify(state.status || "准备就绪", unknown);
+  if (stickyNotice) {
+    const backendStatus = state.status || "";
+    if (unknown || state.running || backendStatus !== stickyNotice.baseStatus) {
+      stickyNotice = null;
+    }
+  }
+  if (stickyNotice) {
+    applyStatusDisplay(stickyNotice.message, stickyNotice.isError);
+  } else {
+    applyStatusDisplay(state.status || "准备就绪", unknown);
+  }
   validatePendingConfirm();
 }
 
@@ -1409,11 +1558,20 @@ async function fetchHistory() {
   const seq = ++historySeq;
   try {
     const res = await api().get_history({window: historyWindow});
-    if (seq !== historySeq || !res?.ok) return;
+    if (seq !== historySeq) return;
+    if (!res?.ok) {
+      if (viewMode === "history") notify(res?.error || "读取长效历史失败", true);
+      return;
+    }
     historySummaries = res.summaries || [];
     pruneHistorySelection();
-    if (viewMode === "history") renderHistoryRows();
-  } catch (_) {}
+    if (viewMode === "history") {
+      renderHistoryRows();
+      render();
+    }
+  } catch (_) {
+    if (seq === historySeq && viewMode === "history") notify("读取长效历史失败，请重试", true);
+  }
 }
 
 function setViewMode(mode) {
@@ -1458,9 +1616,17 @@ async function refreshState(background = false) {
   try {
     const nextState = await api().get_state();
     if (seq !== refreshSeq || (background && epoch !== actionEpoch)) return;
+    const nextJson = JSON.stringify(nextState);
+    if (background && nextJson === lastRenderedStateJson && !nextState.running && !stickyNotice) {
+      return;
+    }
     const prevRunning = wasRunning;
     state = nextState;
     wasRunning = Boolean(state.running);
+    if (!prevRunning && wasRunning) {
+      const scroller = typeof document.querySelector === "function" ? document.querySelector(".table-scroll") : null;
+      if (scroller && typeof scroller.scrollTop === "number") scroller.scrollTop = 0;
+    }
     if (prevRunning && !wasRunning) {
       sortColumn = "score";
       sortAscending = false;
@@ -1474,6 +1640,7 @@ async function refreshState(background = false) {
       lastScoreRevision = state.score_revision;
       if (viewMode === "history") fetchHistory();
     }
+    lastRenderedStateJson = nextJson;
     render();
   } catch (_) {
     if (seq === refreshSeq && (!background || epoch === actionEpoch)) notify("无法连接应用核心", true);
@@ -1483,20 +1650,25 @@ async function refreshState(background = false) {
 }
 
 $("refresh").onclick = async () => {
+  clearStickyNotice();
   const ok = await runBusy(async () => await call("refresh"));
   if (ok) await autoSyncGroups(state.status, true);
 };
-$("all-profiles").onclick = () => updateSelection(state.profiles.map(p => p.uid), new Set(state.rows.map(key)));
+$("all-profiles").onclick = () => {
+  const compat = state.profiles.filter(p => p.compatible !== false).map(p => p.uid);
+  const compatSet = new Set(compat);
+  return updateSelection(compat, new Set(state.rows.filter(r => compatSet.has(r.uid)).map(key)));
+};
 $("clear-profiles").onclick = () => updateSelection([], new Set());
 $("all-nodes").onclick = () => {
-  const s = new Set(state.rows.filter(r => r.selected).map(key));
+  const s = activeSelectedNodeKeys();
   visible().forEach(r => s.add(key(r)));
-  updateSelection(state.profiles.filter(p => p.selected).map(p => p.uid), s);
+  return updateSelection(activeProfileUids(), s);
 };
 $("clear-nodes").onclick = () => {
-  const s = new Set(state.rows.filter(r => r.selected).map(key));
+  const s = activeSelectedNodeKeys();
   visible().forEach(r => s.delete(key(r)));
-  updateSelection(state.profiles.filter(p => p.selected).map(p => p.uid), s);
+  return updateSelection(activeProfileUids(), s);
 };
 $("top").onclick = () => {
   const n = Number($("topn").value);
@@ -1505,7 +1677,7 @@ $("top").onclick = () => {
   const chosenKeys = visible().slice(0, n).map(key);
   const exp = Date.now() + 520;
   for (const rk of chosenKeys) localCascadeUntil.set(rk, exp);
-  updateSelection(state.profiles.filter(p => p.selected).map(p => p.uid), new Set(chosenKeys));
+  return updateSelection(state.profiles.filter(p => p.selected).map(p => p.uid), new Set(chosenKeys));
 };
 $("search").oninput = renderRows;
 $("status-filter").onchange = () => { updateFilterPills(); renderRows(); };
@@ -1519,8 +1691,9 @@ $("topn").onchange = () => {
 };
 for (const button of document.querySelectorAll("button[data-sort]")) {
   button.onclick = () => {
+    if (state.running) return;
     const column = button.dataset.sort;
-    sortAscending = sortColumn === column ? !sortAscending : ["name", "profile", "state", "latency", "jitter"].includes(column);
+    sortAscending = sortColumn === column ? !sortAscending : ["name", "profile", "node_type", "state", "latency", "loss", "jitter"].includes(column);
     sortColumn = column;
     for (const other of document.querySelectorAll("button[data-sort]")) other.parentElement.removeAttribute("aria-sort");
     button.parentElement.setAttribute("aria-sort", sortAscending ? "ascending" : "descending");
@@ -1652,6 +1825,10 @@ async function parametersChanged() {
 }
 $("group").onchange = () => {
   lastSelectedGroup = $("group").value;
+  if ($("group").value) {
+    clearGroupAttention();
+    clearStickyNotice(true);
+  }
   renderRows();
   renderPatrolAndHealth();
   return parametersChanged();
@@ -1660,12 +1837,19 @@ $("parallel").onchange = () => { persistPreferences({parallel: Number($("paralle
 $("size").onchange = () => { persistPreferences({download_bytes: Number($("size").value)}); return parametersChanged(); };
 $("mode").onchange = () => { persistPreferences({mode: $("mode").value}); return parametersChanged(); };
 $("interval").onchange = () => { persistPreferences({interval: Number($("interval").value)}); return parametersChanged(); };
-$("auto").onchange = parametersChanged;
+$("auto").onchange = () => {
+  if (!$("auto").checked || $("group").value) {
+    clearGroupAttention();
+    clearStickyNotice(true);
+  }
+  return parametersChanged();
+};
 
 function confirmBatchHistoryStress(targets, trigger) {
   if (busy || state.running) return;
   const resolvable = resolvableHistoryTargets(targets);
   if (!resolvable.length) { notify("已勾选的历史节点不在当前已加载的订阅列表中", true); return; }
+  if (!ensureAutoSwitchGroupReady()) return;
   const count = resolvable.length;
   const locked = Boolean(state.outcome_unknown);
   const auto = locked ? false : $("auto").checked;
@@ -1709,6 +1893,7 @@ $("stress").onclick = () => {
   }
   const count = selectedNodes().length;
   if (!count) { notify("请先选择要测速的节点", true); return; }
+  if (!ensureAutoSwitchGroupReady()) return;
   const locked = Boolean(state.outcome_unknown);
   const auto = locked ? false : $("auto").checked;
   const group = locked ? "" : $("group").value;
@@ -1748,10 +1933,11 @@ $("funnel").onclick = () => {
   const usingHist = histResolvable.length > 0;
   const count = usingHist ? histResolvable.length : selectedNodes().length;
   if (!count) { notify("请先选择要测速的节点", true); return; }
+  if (!ensureAutoSwitchGroupReady()) return;
   const top = 10, estimate = count + Math.min(count, top) * 20;
   const locked = Boolean(state.outcome_unknown);
   const auto = locked ? false : $("auto").checked;
-  const group = locked ? "" : $("group").value;
+  const group = (!locked && auto) ? $("group").value : "";
   const snap = {
     top,
     usingHist,
@@ -1783,9 +1969,10 @@ $("funnel").onclick = () => {
 
 function retestRow(row, trigger = $("retest-best")) {
   if (!row || busy || state.running) return;
+  if (!ensureAutoSwitchGroupReady()) return;
   const locked = Boolean(state.outcome_unknown);
   const auto = locked ? false : $("auto").checked;
-  const group = locked ? "" : $("group").value;
+  const group = (locked || !auto) ? "" : $("group").value;
   const snap = {
     rowKey: key(row),
     auto,
@@ -1800,7 +1987,7 @@ function retestRow(row, trigger = $("retest-best")) {
     validate: () => {
       const currentLocked = Boolean(state.outcome_unknown);
       const currentAuto = currentLocked ? false : $("auto").checked;
-      const currentGroup = currentLocked ? "" : $("group").value;
+      const currentGroup = (currentLocked || !currentAuto) ? "" : $("group").value;
       const exists = viewMode === "history"
         ? historySummaries.some(r => key(r) === snap.rowKey && r.available !== false)
         : state.rows.some(r => key(r) === snap.rowKey);
@@ -1899,21 +2086,28 @@ $("switch-best").onclick = () => {
   else { active = key(best); renderRows(); }
   confirmManual($("switch-best"));
 };
-$("start").onclick = () => runBusy(async () => {
-  if (viewMode === "history") {
-    const histChecked = checkedVisibleHistory();
-    if (histChecked.length) {
-      const synced = await syncHistoryTargetsToLiveRaw(histChecked);
-      if (!synced) return;
+$("start").onclick = () => {
+  if (busy || state.running) return;
+  if (!ensureAutoSwitchGroupReady()) return;
+  return runBusy(async () => {
+    if (viewMode === "history") {
+      const histChecked = checkedVisibleHistory();
+      if (histChecked.length) {
+        const synced = await syncHistoryTargetsToLiveRaw(histChecked);
+        if (!synced) return;
+      }
+      setViewMode("live");
     }
-    setViewMode("live");
-  }
-  await call("start", options());
-});
+    await call("start", options());
+  });
+};
 $("stop").onclick = async () => { await call("stop"); await refreshState(); };
-$("dock-start").onclick = () => $("start").click();
-$("dock-stop").onclick = () => $("stop").click();
-$("refresh-groups").onclick = () => runBusy(async () => { await call("refresh_groups"); });
+if ($("dock-start")) $("dock-start").onclick = () => $("start").click();
+if ($("dock-stop")) $("dock-stop").onclick = () => $("stop").click();
+$("refresh-groups").onclick = () => {
+  clearStickyNotice();
+  return runBusy(async () => { await call("refresh_groups"); });
+};
 $("manual").onclick = () => confirmManual($("manual"));
 $("undo").onclick = () => {
   if (busy || state.running || state.outcome_unknown || !state.undo) return;
@@ -2101,7 +2295,7 @@ if ($("menu-only-node")) {
       return;
     }
     const profs = [...new Set([...state.profiles.filter(p => p.selected).map(p => p.uid), row.uid])];
-    updateSelection(profs, new Set([key(row)]));
+    return updateSelection(profs, new Set([key(row)]));
   };
 }
 if ($("menu-filter-profile")) {
@@ -2282,9 +2476,9 @@ document.addEventListener("keydown", event => {
         const row = state.rows.find(r => key(r) === active);
         if (row) {
           event.preventDefault();
-          const nodes = new Set(state.rows.filter(r => r.selected).map(key));
+          const nodes = activeSelectedNodeKeys();
           row.selected ? nodes.delete(active) : nodes.add(active);
-          updateSelection(state.profiles.filter(p => p.selected).map(p => p.uid), nodes);
+          updateSelection(activeProfileUids(), nodes);
         }
       } else if (viewMode === "history" && historyActiveKey) {
         const row = visibleHistory().find(r => key(r) === historyActiveKey);
@@ -2339,6 +2533,7 @@ $("arm").onclick = async () => {
     return;
   }
   if (state.running) return;
+  if (!ensureAutoSwitchGroupReady()) return;
   const count = selectedNodes().length;
   const traffic = (count * Number($("size").value) / 1048576).toFixed(1);
   const locked = Boolean(state.outcome_unknown);

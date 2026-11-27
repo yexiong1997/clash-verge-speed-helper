@@ -17,6 +17,7 @@ if os.name == "nt":
     from Windows import run as windows_run
     from Windows.desktop import Desktop
     from Windows.measurement import VerifiedMeasurement
+    from Windows.profile_registry import ProfileError
     from Windows.run import PublicApi, resolve_worker
     from Windows.settings import AppSettingsStore
     from Windows.tray import (CMD_EXIT, CMD_SHOW_HIDE, CMD_STOP_PATROL, CMD_STOP_RUN,
@@ -931,6 +932,8 @@ class DesktopTests(unittest.TestCase):
         self.assertTrue(self.app.refresh()["ok"])
         st = self.app.get_state()
         self.assertEqual([(p["uid"], p["selected"]) for p in st["profiles"]], [("u1", False), ("u2", True)])
+        # Unselected profile nodes must not default to selected=True
+        self.assertEqual({(r["uid"], r["selected"]) for r in st["rows"]}, {("u1", False), ("u2", True)})
 
         all_nodes = [{"uid": r["uid"], "name": r["name"]} for r in st["rows"]]
         self.assertTrue(self.app.set_selection({"profiles": ["u1", "u2"], "nodes": all_nodes})["ok"])
@@ -985,6 +988,63 @@ class DesktopTests(unittest.TestCase):
             self.assertFalse(_eligible_name(pseudo), pseudo)
         for real in ("香港 IEPL 01", "Japan Tokyo 02", "US Los Angeles Premium"):
             self.assertTrue(_eligible_name(real), real)
+        # Default read-only health probe prefers a group pointing at a real node over nested group
+        groups_nested_now = [
+            ProxyGroup(name="AI服务", now="沙特总出口", all=("沙特总出口", "alpha", "DIRECT")),
+            ProxyGroup(name="GLOBAL", now="DIRECT", all=("DIRECT", "alpha", "beta")),
+            ProxyGroup(name="TikTok专用", now="alpha", all=("alpha", "beta", "沙特总出口")),
+            ProxyGroup(name="沙特总出口", now="beta", all=("alpha", "beta")),
+        ]
+        self.assertIsNone(Desktop._compute_suggested_group(groups_nested_now, {"alpha", "beta"}))
+        self.assertIn(Desktop._default_probe_group(groups_nested_now, {"alpha", "beta"}), ("TikTok专用", "沙特总出口"))
+
+    def test_refresh_groups_uses_smart_suggestion_and_direct_node_probe_group(self):
+        from Windows.controller import ProxyGroup, Settings
+        self.assertTrue(self.app.refresh()["ok"])
+        fake_settings = Settings(pipe=r"\\.\pipe\test-pipe", secret="", config_data=b"", config_version=(0, 0, 0))
+        class FakeController:
+            identity = "pipe-id"
+            def __init__(self, _settings):
+                pass
+            def groups(self, _names):
+                return [
+                    ProxyGroup("GLOBAL", "DIRECT", ("DIRECT", "alpha", "beta")),
+                    ProxyGroup("🚀 节点选择", "alpha", ("alpha", "beta")),
+                    ProxyGroup("🐟 漏网之鱼", "DIRECT", ("DIRECT", "alpha", "beta")),
+                ]
+        with (
+            patch("Windows.desktop.read_settings", return_value=fake_settings),
+            patch("Windows.desktop.PipeController", FakeController),
+            patch("Windows.desktop.read_tun_enabled", return_value=False),
+            patch.object(self.app, "_trigger_health_probe_async"),
+        ):
+            res = self.app.refresh_groups()
+        self.assertTrue(res["ok"], res)
+        st = self.app.get_state()
+        self.assertEqual(st["suggested_group"], "🚀 节点选择")
+        self.assertIn("已智能选中", st["status"])
+
+        class CustomGroupsController:
+            identity = "pipe-id"
+            def __init__(self, _settings):
+                pass
+            def groups(self, _names):
+                return [
+                    ProxyGroup("AI服务", "沙特总出口", ("沙特总出口", "alpha", "DIRECT")),
+                    ProxyGroup("GLOBAL", "DIRECT", ("DIRECT", "alpha", "beta")),
+                    ProxyGroup("TikTok专用", "alpha", ("alpha", "beta", "沙特总出口")),
+                    ProxyGroup("沙特总出口", "beta", ("alpha", "beta")),
+                ]
+        with (
+            patch("Windows.desktop.read_settings", return_value=fake_settings),
+            patch("Windows.desktop.PipeController", CustomGroupsController),
+            patch("Windows.desktop.read_tun_enabled", return_value=False),
+            patch.object(self.app, "_trigger_health_probe_async"),
+        ):
+            res2 = self.app.refresh_groups()
+        self.assertTrue(res2["ok"], res2)
+        self.assertIsNone(self.app.get_state()["suggested_group"])
+        self.assertIn(self.app.probe_group, ("TikTok专用", "沙特总出口"))
 
     def test_batch_copy_history_subset_export_and_patrol_meta(self):
         from Windows.telemetry_history import TelemetrySampleRecord
@@ -1029,6 +1089,97 @@ class DesktopTests(unittest.TestCase):
         self.assertEqual(len(lines), 2)
         self.assertIn("alpha", lines[1])
         self.assertNotIn("beta", tsv)
+
+    def test_mid_run_profile_error_clears_waiting_rows_instead_of_leaving_queue_stuck(self):
+        self.assertTrue(self.app.refresh()["ok"])
+        exe = self.root / "fixture.exe"
+        exe.touch()
+        self.app.executable = exe
+
+        class RaisingRunner:
+            def __init__(self, _exe, jobs, _parallel, **_kwargs):
+                self.jobs = tuple(jobs)
+                self.cancelled = threading.Event()
+            def run(self, _callback):
+                raise ProfileError("registry changed mid-run")
+            def cancel(self):
+                self.cancelled.set()
+
+        with patch("Windows.desktop.MultiBatchRunner", RaisingRunner):
+            res = self.app.start({"parallel": 2, "download_bytes": 262144, "mode": "fast",
+                                  "auto_switch": False, "group": ""})
+            self.assertTrue(res["ok"], res)
+            deadline = time.monotonic() + 3
+            while self.app.get_state()["running"] and time.monotonic() < deadline:
+                time.sleep(.01)
+        st = self.app.get_state()
+        self.assertFalse(st["running"])
+        self.assertFalse(any(r["state"] == "等待" for r in st["rows"]))
+        self.assertTrue(all(r["state"] == "配置已变更" for r in st["rows"] if r["uid"] == "u1"))
+        self.assertIn("配置已变更", st["status"])
+
+    def test_large_payload_caps_per_stream_chunk_at_5mib(self):
+        self.assertTrue(self.app.refresh()["ok"])
+        exe = self.root / "fixture.exe"
+        exe.touch()
+        self.app.executable = exe
+        captured_streams = []
+
+        class CaptureRunner:
+            def __init__(self, _exe, jobs, _parallel, **_kwargs):
+                self.jobs = tuple(jobs)
+                captured_streams.extend(j.streams for j in self.jobs)
+                self.cancelled = threading.Event()
+            def run(self, callback):
+                for job in self.jobs:
+                    callback(job, "cancelled", None)
+            def cancel(self):
+                self.cancelled.set()
+
+        with patch("Windows.desktop.MultiBatchRunner", CaptureRunner):
+            res = self.app.start({"parallel": 1, "download_bytes": 50 * 1_048_576, "mode": "accurate",
+                                  "auto_switch": False, "group": ""})
+            self.assertTrue(res["ok"], res)
+            deadline = time.monotonic() + 3
+            while self.app.get_state()["running"] and time.monotonic() < deadline:
+                time.sleep(.01)
+        self.assertEqual(captured_streams, [10, 10])
+
+    def test_manual_stop_does_not_record_any_samples_into_long_term_history(self):
+        self.assertTrue(self.app.refresh()["ok"])
+        exe = self.root / "fixture.exe"
+        exe.touch()
+        self.app.executable = exe
+        first_done = threading.Event()
+        release_second = threading.Event()
+
+        class StoppableRunner:
+            def __init__(self, _exe, jobs, _parallel, **_kwargs):
+                self.jobs = tuple(jobs)
+                self.cancelled = threading.Event()
+            def run(self, callback):
+                m = VerifiedMeasurement(self.jobs[0].name, "Synthetic", 6, 6, 20, 1,
+                                        self.jobs[0].download_bytes, self.jobs[0].download_bytes, True, 5_000_000)
+                callback(self.jobs[0], "ok", m)
+                first_done.set()
+                release_second.wait(3)
+                # Even if the interrupted second job reports worker_failed or cancelled after stop(), nothing is stored
+                callback(self.jobs[1], "worker_failed", None)
+            def cancel(self):
+                self.cancelled.set()
+                release_second.set()
+
+        with patch("Windows.desktop.MultiBatchRunner", StoppableRunner):
+            res = self.app.start({"parallel": 1, "download_bytes": 262144, "mode": "fast",
+                                  "auto_switch": False, "group": ""})
+            self.assertTrue(res["ok"], res)
+            self.assertTrue(first_done.wait(3))
+            self.app.stop()
+            deadline = time.monotonic() + 3
+            while self.app.get_state()["running"] and time.monotonic() < deadline:
+                time.sleep(.01)
+        hist = self.app.get_history({"window": "7d"})
+        self.assertEqual(hist["summaries"], [])
 
 
 if __name__ == "__main__":

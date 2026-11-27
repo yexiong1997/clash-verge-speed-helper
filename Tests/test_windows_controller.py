@@ -485,8 +485,64 @@ class ControllerTests(unittest.TestCase):
 
             self.custom_proxies["Main2"] = {"name": "Main2", "type": "Selector", "now": "A", "all": ["A", "B"]}
             self.assertTrue(app.refresh_groups()["ok"])
+            # Main matches primary selector keys while Main2 does not, so smart selection keeps Main
+            self.assertEqual(app.get_state()["suggested_group"], "Main")
+
+            self.custom_proxies["Proxy"] = {"name": "Proxy", "type": "Selector", "now": "A", "all": ["A", "B"]}
+            self.assertTrue(app.refresh_groups()["ok"])
+            # Flat tie between two primary selectors (Main vs Proxy) stays fail-closed (None)
             self.assertIsNone(app.get_state()["suggested_group"])
         finally:
+            app.close()
+
+    def test_switch_syncs_capture_so_subsequent_retest_and_node_selection_work_smoothly(self):
+        worker = self.root / "fixture.exe"
+        worker.touch()
+        app = Desktop(worker, root=self.root)
+        entered = threading.Event()
+        release = threading.Event()
+
+        class FixtureRunner:
+            def __init__(self, _exe, jobs, _parallel, **_kwargs):
+                self.jobs = tuple(jobs)
+                self.cancelled = threading.Event()
+            def run(self, _callback):
+                entered.set()
+                release.wait(3)
+            def cancel(self):
+                self.cancelled.set()
+                release.set()
+
+        try:
+            self.assertTrue(app.refresh()["ok"])
+            self.assertTrue(app.refresh_groups()["ok"])
+            # 1. Changing node checkboxes within the same profile keeps capture & groups intact
+            self.assertTrue(app.set_selection({"profiles": ["uid1"], "nodes": [{"uid": "uid1", "name": "B"}]})["ok"])
+            self.assertTrue(bool(app.get_state()["groups"]))
+            self.assertIsNotNone(app.capture)
+            # 2. Switching node updates capture.now so immediate retest_node succeeds without stale-group error
+            sw = app.switch_manual({"uid": "uid1", "name": "B", "group": "Test"})
+            self.assertTrue(sw["ok"], sw)
+            self.assertEqual(self.now, "B")
+            self.assertEqual(next(g for g in app.capture[4] if g.name == "Test").now, "B")
+            with patch("Windows.desktop.MultiBatchRunner", FixtureRunner):
+                rt = app.retest_node({"uid": "uid1", "name": "B", "auto_switch": True, "group": "Test"})
+                self.assertTrue(rt["ok"], rt)
+                self.assertTrue(entered.wait(3))
+                app.stop()
+                deadline = time.monotonic() + 3
+                while app.running and time.monotonic() < deadline:
+                    time.sleep(.01)
+            # 3. Switching back to A and undoing also updates capture.now so subsequent retest works
+            sw2 = app.switch_manual({"uid": "uid1", "name": "A", "group": "Test"})
+            self.assertTrue(sw2["ok"], sw2)
+            self.assertEqual(self.now, "A")
+            un = app.undo_switch()
+            self.assertTrue(un["ok"], un)
+            self.assertEqual(self.now, "B")
+            self.assertEqual(next(g for g in app.capture[4] if g.name == "Test").now, "B")
+        finally:
+            release.set()
             app.close()
 
     def test_refresh_groups_preserves_tun_enabled_on_offline_pipe_and_resets_on_profile_error(self):
@@ -551,6 +607,80 @@ class ControllerTests(unittest.TestCase):
         finally:
             app.close()
 
+    def test_stale_profiles_yaml_auto_syncs_on_start_and_refresh_groups(self):
+        worker = self.root / "fixture.exe"
+        worker.touch()
+        app = Desktop(worker, root=self.root)
+        entered = threading.Event()
+        release = threading.Event()
+        launched_jobs = []
+
+        class FixtureRunner:
+            def __init__(self, _exe, jobs, _parallel, **_kwargs):
+                self.jobs = tuple(jobs)
+                launched_jobs.extend(j.name for j in self.jobs)
+                self.cancelled = threading.Event()
+            def run(self, callback):
+                entered.set()
+                release.wait(3)
+                for job in self.jobs:
+                    callback(job, "cancelled", None)
+            def cancel(self):
+                self.cancelled.set()
+                release.set()
+
+        try:
+            self.assertTrue(app.refresh()["ok"])
+            self.assertTrue(app.refresh_groups()["ok"])
+            self.assertTrue(app.set_selection({"profiles": ["uid1"], "nodes": [{"uid": "uid1", "name": "B"}]})["ok"])
+            profiles_yaml = self.root / "profiles.yaml"
+            profiles_yaml.write_text(
+                "current: uid1\nitems:\n- uid: uid1\n  type: remote\n  name: Fixture\n  file: test.yaml\n  updated: 1700000999\n",
+                encoding="utf-8",
+            )
+            # 1. refresh_groups auto-syncs stale profiles.yaml and preserves node selection
+            self.assertTrue(app.refresh_groups()["ok"])
+            sel_names = [r["name"] for r in app.get_state()["rows"] if r["selected"]]
+            self.assertEqual(sel_names, ["B"])
+
+            # 2. Mutate profiles.yaml again, then start() auto-syncs seamlessly and launches only node B
+            profiles_yaml.write_text(
+                "current: uid1\nitems:\n- uid: uid1\n  type: remote\n  name: Fixture\n  file: test.yaml\n  updated: 1700001000\n",
+                encoding="utf-8",
+            )
+            with patch("Windows.desktop.MultiBatchRunner", FixtureRunner):
+                res = app.start({"parallel": 1, "download_bytes": 262144, "mode": "fast",
+                                 "auto_switch": True, "group": "Test"})
+                self.assertTrue(res["ok"], res)
+                self.assertTrue(entered.wait(3))
+                self.assertEqual(launched_jobs, ["B"])
+                app.stop()
+                deadline = time.monotonic() + 3
+                while app.running and time.monotonic() < deadline:
+                    time.sleep(.01)
+
+            # 3. If Clash Verge switched active profile to one lacking the old group, start() auto-syncs & prompts cleanly
+            (self.root / "profiles" / "second.yaml").write_text(
+                "proxies:\n- {name: C, type: socks5, server: 127.0.0.1, port: 1236}\n",
+                encoding="utf-8",
+            )
+            profiles_yaml.write_text(
+                "current: uid2\nitems:\n"
+                "- uid: uid1\n  type: remote\n  name: Fixture\n  file: test.yaml\n"
+                "- uid: uid2\n  type: remote\n  name: Second\n  file: second.yaml\n",
+                encoding="utf-8",
+            )
+            self.custom_proxies = {"NewGroup": {"name": "NewGroup", "type": "Selector", "now": "C", "all": ["C"]}}
+            res2 = app.start({"parallel": 1, "download_bytes": 262144, "mode": "fast",
+                              "auto_switch": True, "group": "OldMissingGroup"})
+            self.assertFalse(res2["ok"])
+            self.assertIn("切换订阅", res2["error"])
+            st = app.get_state()
+            self.assertEqual(st["suggested_group"], "NewGroup")
+            self.assertFalse(any(r["state"] == "等待" for r in st["rows"]))
+        finally:
+            release.set()
+            app.close()
 
 if __name__ == "__main__":
     unittest.main()

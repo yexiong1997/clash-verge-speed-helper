@@ -2,7 +2,7 @@
 
 // This module handles only the displayed catalogue; it never changes selections.
 const RowModel = (() => {
-  const columns = new Set(["name", "profile", "state", "score", "speed", "latency", "jitter", "successes"]);
+  const columns = new Set(["name", "profile", "node_type", "state", "score", "speed", "latency", "jitter", "successes", "loss"]);
   const historyColumns = new Set([
     "rank", "name", "profile", "node_type", "long_term_score",
     "weighted_median_speed_bps", "weighted_median_latency_ms",
@@ -20,7 +20,7 @@ const RowModel = (() => {
     const counts = {all: 0, valid: 0, testing: 0, failed: 0};
     for (const row of (rows || [])) {
       if (!selectedProfiles.has(row.uid)) continue;
-      if (query && !`${row.name} ${row.profile} ${row.uid}`.toLocaleLowerCase().includes(query)) continue;
+      if (query && !`${row.name} ${row.profile} ${row.node_type || ""} ${row.uid}`.toLocaleLowerCase().includes(query)) continue;
       counts.all += 1;
       if (isValid(row)) counts.valid += 1;
       if (isTesting(row)) counts.testing += 1;
@@ -36,17 +36,33 @@ const RowModel = (() => {
     const column = columns.has(options.sort) ? options.sort : "score";
     const ascending = options.ascending === true;
     const freezeOrder = options.freezeOrder === true && column === "score" && !ascending;
+    const pinSelectedTop = options.pinSelectedTop === true;
     const filtered = rows.map((row, index) => ({row, index})).filter(({row}) => {
       if (!selectedProfiles.has(row.uid)) return false;
-      if (query && !`${row.name} ${row.profile} ${row.uid}`.toLocaleLowerCase().includes(query)) return false;
+      if (query && !`${row.name} ${row.profile} ${row.node_type || ""} ${row.uid}`.toLocaleLowerCase().includes(query)) return false;
       if (status === "valid") return isValid(row);
       if (status === "testing") return isTesting(row);
       if (status === "failed") return isFailed(row);
       return true;
     });
-    if (freezeOrder) return filtered.map(item => item.row);
+    if (freezeOrder) {
+      if (pinSelectedTop) {
+        const top = [], rest = [];
+        for (const item of filtered) {
+          if (item.row.selected || isTesting(item.row)) top.push(item.row);
+          else rest.push(item.row);
+        }
+        return top.concat(rest);
+      }
+      return filtered.map(item => item.row);
+    }
     return filtered.sort((a, b) => {
-      const value = row => column === "score" && !row.eligible ? null : row[column];
+      const value = row => {
+        if (column === "score") return row.eligible ? row.score : null;
+        if (column === "loss") return row.successes == null ? null : Math.max(0, 6 - row.successes);
+        if (column === "node_type") return row.node_type ? String(row.node_type).toUpperCase() : null;
+        return row[column];
+      };
       const x = value(a.row), y = value(b.row);
       if (x == null && y != null) return 1;
       if (x != null && y == null) return -1;
@@ -57,6 +73,8 @@ const RowModel = (() => {
           if (s1a != null && s1b == null) return -1;
           if (s1a == null && s1b != null) return 1;
           if (s1a != null && s1b != null && s1a !== s1b) return s1b - s1a;
+          const selA = a.row.selected === true, selB = b.row.selected === true;
+          if (selA !== selB) return selA ? -1 : 1;
         }
         return a.index - b.index;
       }

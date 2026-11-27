@@ -119,7 +119,8 @@ const doc = {
   get activeElement() { return activeElement; }
 };
 const calls = [], dialogs = []; let prevented = false;
-const scenario = process.argv[2] || 'funnel';
+const _argOff = process.argv[1] === '-' ? 1 : 0;
+const scenario = process.argv[2 + _argOff] || 'funnel';
 const initial = {profiles:[{uid:'p',name:'Fixture',selected:true,current:true}],
   rows:[{uid:'p',profile:'Fixture',name:'node',selected:true,state:'完成',eligible:true,
     score:90,speed:1000,latency:10,jitter:1,successes:6},
@@ -195,7 +196,7 @@ get('topn').value='2'; get('status-filter').value='all'; get('interval').value='
 get('patrol-quota').value='83886080';
 if (['retest', 'cancel-retest', 'escape-retest'].includes(scenario)) {get('group').value='Test'; get('auto').checked=true;}
 if (scenario === 'countdown') {initial.schedule_minutes=15; initial.schedule_remaining=125; initial.schedule_active=false;}
-const root=process.argv[1];
+const root=process.argv[1 + _argOff];
 vm.runInContext(fs.readFileSync(path.join(root,'row_model.js'),'utf8'),context);
 vm.runInContext(fs.readFileSync(path.join(root,'app.js'),'utf8'),context);
 vm.runInContext('state = JSON.parse(JSON.stringify(initial)); render();',context);
@@ -626,6 +627,77 @@ function cancelDialog() { snapDialog(); get('confirm-cancel').onclick(); }
     }));
     return;
   }
+  if (scenario === 'sticky-error-and-group-guard') {
+    initial.status = '策略组已刷新，请选择目标组';
+    initial.groups = [{name: 'TikTok专用', now: 'node'}, {name: '沙特总出口', now: 'other'}];
+    initial.suggested_group = null;
+    vm.runInContext('state = JSON.parse(JSON.stringify(initial)); render();', context);
+    get('group').value = '';
+    get('auto').checked = true;
+    // 1. Clicking start/stress/funnel without a group blocks with visible error & highlights group, preserving params
+    await get('start').onclick();
+    const statusAfterStart = get('status').textContent;
+    const errorAfterStart = get('status').classList.contains('error');
+    const groupFocused = doc.activeElement?.id === 'group';
+    const groupAttention = get('group').classList.contains('needs-attention');
+    get('stress').onclick();
+    const stressDialogHidden = get('confirm-dialog').hidden;
+    const paramsPreserved = [get('parallel').value, get('size').value, get('mode').value];
+    // 2. Background poll does NOT wipe sticky error while backend status is unchanged
+    await vm.runInContext('refreshState(true)', context);
+    const statusAfterPoll = get('status').textContent;
+    const errorAfterPoll = get('status').classList.contains('error');
+    // 3. Selecting a group clears attention & error; backend failure inside runBusy survives refreshState()
+    get('group').value = '沙特总出口';
+    await get('group').onchange();
+    const attentionAfterPick = get('group').classList.contains('needs-attention');
+    const origStart = api.start;
+    api.start = async value => { calls.push({fn:'start', value}); return {ok:false, error:'后端拒绝示例'}; };
+    await get('start').onclick();
+    const statusAfterBackendErr = get('status').textContent;
+    const errorAfterBackendErr = get('status').classList.contains('error');
+    await vm.runInContext('refreshState(true)', context);
+    const statusAfterBackendErrPoll = get('status').textContent;
+    // 4. New backend status supersedes sticky error
+    initial.status = '测速已开始';
+    await vm.runInContext('refreshState(true)', context);
+    const statusAfterNewBackend = get('status').textContent;
+    const errorAfterNewBackend = get('status').classList.contains('error');
+    api.start = origStart;
+    process.stdout.write(JSON.stringify({
+      calls, statusAfterStart, errorAfterStart, groupFocused, groupAttention,
+      stressDialogHidden, paramsPreserved, statusAfterPoll, errorAfterPoll,
+      attentionAfterPick, statusAfterBackendErr, errorAfterBackendErr,
+      statusAfterBackendErrPoll, statusAfterNewBackend, errorAfterNewBackend
+    }));
+    return;
+  }
+  if (scenario === 'multi-profile-node-toggle-and-history-default') {
+    initial.profiles = [
+      {uid: 'p1', name: 'Unselected', selected: false, current: false, compatible: true},
+      {uid: 'p', name: 'Fixture', selected: true, current: true, compatible: true}
+    ];
+    initial.rows = [
+      {uid: 'p1', profile: 'Unselected', name: 'ghost-selected', selected: true, state: '待测速', eligible: true, score: null, speed: null, latency: null, jitter: null, successes: null},
+      {uid: 'p', profile: 'Fixture', name: 'node', selected: true, state: '完成', eligible: true, score: 90, speed: 1000, latency: 10, jitter: 1, successes: 6},
+      {uid: 'p', profile: 'Fixture', name: 'other', selected: true, state: '完成', eligible: true, score: 50, speed: 500, latency: 20, jitter: 1, successes: 6}
+    ];
+    vm.runInContext('state = JSON.parse(JSON.stringify(initial)); render();', context);
+    // Toggle first visible checkbox (uncheck "node") -> must ONLY send nodes from selected profile "p"
+    const box0 = get('rows').children[0].children[0].children[0];
+    box0.checked = false;
+    await box0.onchange();
+    // Clear nodes button -> must send empty nodes for profile "p", never leaking p1
+    await get('clear-nodes').onclick();
+    // History default shows ALL subscriptions (historySelectedOnly === false)
+    const defaultSelectedOnly = vm.runInContext('historySelectedOnly', context);
+    // Pure retest with auto_switch=false sends group="" even when a group is picked
+    get('group').value = 'Test'; get('auto').checked = false;
+    get('retest-best').onclick();
+    await acceptDialog();
+    process.stdout.write(JSON.stringify({calls, defaultSelectedOnly}));
+    return;
+  }
   process.stdout.write(JSON.stringify({
     calls,
     dialogs,
@@ -639,6 +711,12 @@ function cancelDialog() { snapDialog(); get('confirm-cancel').onclick(); }
   .catch(error=>{console.error(error);process.exitCode=1;});
 """
 
+
+def _run_bridge_driver(scenario=None):
+    args = [NODE, "-", str(ROOT / "Windows/ui")]
+    if scenario is not None:
+        args.append(scenario)
+    return subprocess.run(args, input=BRIDGE_DRIVER.encode("utf-8"), capture_output=True, timeout=5, check=True)
 
 @unittest.skipUnless(NODE, "Node.js is required for the Windows UI logic test")
 class WindowsRowModelTests(unittest.TestCase):
@@ -682,8 +760,7 @@ class WindowsRowModelTests(unittest.TestCase):
         self.assertNotIn("beta", self.visible())
 
     def test_funnel_button_requires_confirmation_and_calls_desktop_bridge(self):
-        result = subprocess.run([NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui")],
-                                capture_output=True, timeout=5, check=True)
+        result = _run_bridge_driver()
         value = json.loads(result.stdout)
         self.assertEqual(len(value["dialogs"]), 1)
         self.assertFalse(value["dialogs"][0]["hidden"])
@@ -696,8 +773,7 @@ class WindowsRowModelTests(unittest.TestCase):
         self.assertFalse(value["calls"][0]["value"]["auto_switch"])
 
     def test_retest_best_preserves_original_group_and_auto_switch(self):
-        result = subprocess.run([NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "retest"],
-                                capture_output=True, timeout=5, check=True)
+        result = _run_bridge_driver("retest")
         value = json.loads(result.stdout)
         self.assertEqual(len(value["dialogs"]), 1)
         self.assertEqual(value["calls"], [{"fn": "retest_node", "value": {"uid": "p", "name": "node",
@@ -705,13 +781,11 @@ class WindowsRowModelTests(unittest.TestCase):
         self.assertEqual(value["group"], "Test")
 
     def test_schedule_countdown_is_visible(self):
-        result = subprocess.run([NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "countdown"],
-                                capture_output=True, timeout=5, check=True)
+        result = _run_bridge_driver("countdown")
         self.assertIn("2:05", json.loads(result.stdout)["note"])
 
     def test_cancelled_retest_does_not_call_backend(self):
-        result = subprocess.run([NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "cancel-retest"],
-                                capture_output=True, timeout=5, check=True)
+        result = _run_bridge_driver("cancel-retest")
         value = json.loads(result.stdout)
         self.assertEqual(len(value["dialogs"]), 1)
         self.assertTrue(value["dialogHidden"])
@@ -719,8 +793,7 @@ class WindowsRowModelTests(unittest.TestCase):
         self.assertEqual(value["calls"], [])
 
     def test_escape_closes_confirm_restores_focus_and_skips_bridge(self):
-        result = subprocess.run([NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "escape-retest"],
-                                capture_output=True, timeout=5, check=True)
+        result = _run_bridge_driver("escape-retest")
         value = json.loads(result.stdout)
         self.assertTrue(value["prevented"])
         self.assertEqual(len(value["dialogs"]), 1)
@@ -731,8 +804,7 @@ class WindowsRowModelTests(unittest.TestCase):
         self.assertEqual(value["calls"], [])
 
     def test_context_menu_retests_target_and_requires_confirmation(self):
-        result = subprocess.run([NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "menu-retest"],
-                                capture_output=True, timeout=5, check=True)
+        result = _run_bridge_driver("menu-retest")
         value = json.loads(result.stdout)
         self.assertTrue(value["prevented"])
         self.assertEqual(len(value["dialogs"]), 1)
@@ -740,15 +812,13 @@ class WindowsRowModelTests(unittest.TestCase):
                                            "auto_switch": False, "group": ""}}])
 
     def test_context_menu_copies_only_its_target(self):
-        result = subprocess.run([NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "menu-copy"],
-                                capture_output=True, timeout=5, check=True)
+        result = _run_bridge_driver("menu-copy")
         value = json.loads(result.stdout)
         self.assertTrue(value["prevented"])
         self.assertEqual(value["calls"], [{"fn": "copy_node_name", "value": {"uid": "p", "name": "node"}}])
 
     def test_stress_requires_confirmation_preserves_params_on_cancel_and_runs_20m_on_accept(self):
-        result = subprocess.run([NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "stress"],
-                                capture_output=True, timeout=5, check=True)
+        result = _run_bridge_driver("stress")
         value = json.loads(result.stdout)
         self.assertEqual(value["preserved"], ["4", "3145728", "fast", 0])
         self.assertEqual(len(value["dialogs"]), 2)
@@ -760,16 +830,14 @@ class WindowsRowModelTests(unittest.TestCase):
         ])
 
     def test_all_manual_switch_entrypoints_require_confirmation(self):
-        result = subprocess.run([NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "manual-matrix"],
-                                capture_output=True, timeout=5, check=True)
+        result = _run_bridge_driver("manual-matrix")
         value = json.loads(result.stdout)
         self.assertEqual(len(value["dialogs"]), 4)
         self.assertEqual([c["value"]["name"] for c in value["calls"]], ["node", "other", "other", "other"])
         self.assertTrue(all(c["fn"] == "switch_manual" and c["value"]["group"] == "Test" for c in value["calls"]))
 
     def test_undo_continue_and_schedule_arm_confirmation_rules(self):
-        result = subprocess.run([NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "undo-continue-arm"],
-                                capture_output=True, timeout=5, check=True)
+        result = _run_bridge_driver("undo-continue-arm")
         value = json.loads(result.stdout)
         self.assertEqual(value["dialogsBeforeDisarm"], 3)
         self.assertEqual(len(value["dialogs"]), 3)
@@ -779,30 +847,26 @@ class WindowsRowModelTests(unittest.TestCase):
         self.assertEqual(value["calls"][3]["value"]["minutes"], 0)
 
     def test_double_clicking_confirm_accept_submits_only_once(self):
-        result = subprocess.run([NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "double-accept"],
-                                capture_output=True, timeout=5, check=True)
+        result = _run_bridge_driver("double-accept")
         value = json.loads(result.stdout)
         self.assertEqual(len(value["dialogs"]), 1)
         self.assertEqual(len(value["calls"]), 1)
 
     def test_parameter_or_state_changes_invalidate_open_confirmation(self):
-        result = subprocess.run([NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "invalidate-matrix"],
-                                capture_output=True, timeout=5, check=True)
+        result = _run_bridge_driver("invalidate-matrix")
         value = json.loads(result.stdout)
         self.assertTrue(value["funnelStayedOpenOnTopn"])
         self.assertEqual(value["results"], [True, True, True, True])
         self.assertEqual([c for c in value["calls"] if c["fn"] != "save_preferences"], [])
 
     def test_tun_notice_renders_strictly_for_boolean_true_without_blocking(self):
-        result = subprocess.run([NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "tun-notice"],
-                                capture_output=True, timeout=5, check=True)
+        result = _run_bridge_driver("tun-notice")
         value = json.loads(result.stdout)
         self.assertEqual([s["hidden"] for s in value["states"]], [True, True, True, False, True])
         self.assertTrue(all(not s["startDisabled"] for s in value["states"]))
 
     def test_outcome_unknown_disables_writes_and_forces_pure_speedtest_params(self):
-        result = subprocess.run([NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "outcome-unknown"],
-                                capture_output=True, timeout=5, check=True)
+        result = _run_bridge_driver("outcome-unknown")
         value = json.loads(result.stdout)
         for locked_id in ("manual", "switch-best", "undo", "continue", "auto", "group", "refresh-groups"):
             self.assertTrue(value["disabled"][locked_id], locked_id)
@@ -816,15 +880,13 @@ class WindowsRowModelTests(unittest.TestCase):
             self.assertEqual(call_entry["value"]["group"], "", call_entry)
 
     def test_stale_background_poll_does_not_overwrite_newer_action_state(self):
-        result = subprocess.run([NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "stale-poll"],
-                                capture_output=True, timeout=5, check=True)
+        result = _run_bridge_driver("stale-poll")
         value = json.loads(result.stdout)
         self.assertEqual(value["status"], "FRESH_AFTER_ACTION")
         self.assertEqual(len(value["calls"]), 1)
 
     def test_incompatible_profile_chip_is_disabled_with_label(self):
-        result = subprocess.run([NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "incompatible-profile"],
-                                capture_output=True, timeout=5, check=True)
+        result = _run_bridge_driver("incompatible-profile")
         value = json.loads(result.stdout)
         self.assertEqual(value["chips"], [
             {"text": "Fixture", "disabled": False},
@@ -834,8 +896,7 @@ class WindowsRowModelTests(unittest.TestCase):
     def test_startup_auto_loads_subscriptions_and_suggests_group_and_defaults_auto_checked(self):
         html = (ROOT / "Windows/ui/index.html").read_text(encoding="utf-8")
         self.assertIn('id="auto" checked', html)
-        result = subprocess.run([NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "startup-auto-sync"],
-                                capture_output=True, timeout=5, check=True)
+        result = _run_bridge_driver("startup-auto-sync")
         value = json.loads(result.stdout)
         self.assertEqual([c["fn"] for c in value["calls"]], ["refresh", "refresh_groups"])
         self.assertEqual(value["group"], "Main")
@@ -863,6 +924,26 @@ class WindowsRowModelTests(unittest.TestCase):
             input=json.dumps(ranked_data).encode(), capture_output=True, timeout=5, check=True,
         ).stdout)
         self.assertEqual(ranked, ["second", "s1_high", "first"])
+
+        # Pinning selected rows to the top while running keeps bottom-of-list selections immediately visible
+        pin_rows = [
+            {"uid": "p1", "profile": "One", "name": "unsel_1", "selected": False, "state": "未勾选", "eligible": True, "score": None},
+            {"uid": "p1", "profile": "One", "name": "unsel_2", "selected": False, "state": "未勾选", "eligible": True, "score": None},
+            {"uid": "p1", "profile": "One", "name": "sel_a", "selected": True, "state": "等待", "eligible": True, "score": None},
+            {"uid": "p1", "profile": "One", "name": "sel_b", "selected": True, "state": "等待", "eligible": True, "score": None},
+        ]
+        pinned_running = json.loads(subprocess.run(
+            [NODE, "-e", DRIVER, str(ROOT / "Windows/ui/row_model.js")],
+            input=json.dumps({"rows": pin_rows, "profiles": profiles, "options": {"freezeOrder": True, "pinSelectedTop": True}}).encode(),
+            capture_output=True, timeout=5, check=True,
+        ).stdout)
+        self.assertEqual(pinned_running, ["sel_a", "sel_b", "unsel_1", "unsel_2"])
+        after_failed = json.loads(subprocess.run(
+            [NODE, "-e", DRIVER, str(ROOT / "Windows/ui/row_model.js")],
+            input=json.dumps({"rows": pin_rows, "profiles": profiles, "options": {"freezeOrder": False}}).encode(),
+            capture_output=True, timeout=5, check=True,
+        ).stdout)
+        self.assertEqual(after_failed, ["sel_a", "sel_b", "unsel_1", "unsel_2"])
 
     def test_history_row_model_filtering_and_sorting(self):
         script = """
@@ -902,11 +983,10 @@ process.stdin.on('end', () => {
         self.assertEqual(all_by_lat, ["beta", "alpha", "dead"])
 
     def test_live_progress_and_sparkline_rendering(self):
-        result = subprocess.run([NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "live-progress"],
-                                capture_output=True, timeout=5, check=True)
+        result = _run_bridge_driver("live-progress")
         value = json.loads(result.stdout)
-        self.assertEqual(value["rowsDom"][0][3:6], ["探测延迟", "探测中", "探测延迟…"])
-        self.assertEqual(value["rowsDom"][1][3:6], ["下载中", "下载 50%", "10.00 MiB/s"])
+        self.assertEqual((value["rowsDom"][0][5], value["rowsDom"][0][9]), ("探测延迟…", "探测中"))
+        self.assertEqual((value["rowsDom"][1][5], value["rowsDom"][1][9]), ("10.00 MiB/s", "下载 50%"))
         self.assertTrue(value["progressActive"])
         self.assertIn("scaleX(", value["progressTransform"])
         self.assertFalse(value["sparklineHidden"])
@@ -916,8 +996,7 @@ process.stdin.on('end', () => {
         self.assertEqual(value["bestSpeed"], "10.00 MiB/s")
 
     def test_history_view_clear_confirm_and_patrol_toggle(self):
-        result = subprocess.run([NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "history-and-patrol"],
-                                capture_output=True, timeout=5, check=True)
+        result = _run_bridge_driver("history-and-patrol")
         value = json.loads(result.stdout)
         self.assertFalse(value["histToolsHidden"])
         self.assertTrue(value["liveToolsHidden"])
@@ -938,8 +1017,7 @@ process.stdin.on('end', () => {
         self.assertIn('id="minimize-to-tray" checked', html)
         self.assertIn('id="hide-tray"', html)
         self.assertIn("支持托盘后台运行，退出应用后停止", html)
-        result = subprocess.run([NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "tray-controls"],
-                                capture_output=True, timeout=5, check=True)
+        result = _run_bridge_driver("tray-controls")
         value = json.loads(result.stdout)
         self.assertFalse(value["syncedFalse"])
         self.assertEqual(value["idleNote"], "支持托盘后台运行，退出应用后停止")
@@ -950,8 +1028,7 @@ process.stdin.on('end', () => {
         ])
 
     def test_active_node_highlighting_real_sparkline_and_group_switch_preserves_selection(self):
-        result = subprocess.run([NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "active-node-and-group"],
-                                capture_output=True, timeout=5, check=True)
+        result = _run_bridge_driver("active-node-and-group")
         value = json.loads(result.stdout)
         self.assertTrue(value["firstIsCurrent"])
         self.assertEqual(value["heroReadyUsing"], "● 当前使用中")
@@ -962,8 +1039,7 @@ process.stdin.on('end', () => {
         self.assertTrue(value["secondIsCurrentAfter"])
 
     def test_preferences_hydration_safe_persistence_and_lossless_retest_ui(self):
-        result = subprocess.run([NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "prefs-and-lossless-retest"],
-                                capture_output=True, timeout=5, check=True)
+        result = _run_bridge_driver("prefs-and-lossless-retest")
         value = json.loads(result.stdout)
         self.assertEqual(value["hydrated"], {
             "parallel": "5", "size": "5242880", "mode": "accurate",
@@ -975,10 +1051,9 @@ process.stdin.on('end', () => {
         self.assertFalse(any("auto_switch" in c.get("value", {}) for c in pref_calls))
 
     def test_dynamic_menu_shortcuts_waiting_copy_bucket_counts_health_click_and_empty_state(self):
-        result = subprocess.run([NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "menu-shortcuts-health-export"],
-                                capture_output=True, timeout=5, check=True)
+        result = _run_bridge_driver("menu-shortcuts-health-export")
         value = json.loads(result.stdout)
-        self.assertEqual(value["waitingRowCells"][3:6], ["等待", "队列中", "排队等待"])
+        self.assertEqual((value["waitingRowCells"][5], value["waitingRowCells"][9]), ("排队等待", "队列中"))
         self.assertEqual(value["counts"], {"all": "3", "valid": "2", "testing": "1", "failed": "0"})
         self.assertEqual(value["healthText"], "● 探测中…")
         self.assertEqual(value["exportText"], "✓ 已复制")
@@ -997,10 +1072,7 @@ process.stdin.on('end', () => {
         self.assertIn("set_selection", fns)
 
     def test_runtime_bridge_pill_cross_profile_switch_and_history_tsv_export(self):
-        result = subprocess.run(
-            [NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "bridge-hot-switch-and-history-export"],
-            capture_output=True, timeout=5, check=True,
-        )
+        result = _run_bridge_driver("bridge-hot-switch-and-history-export")
         value = json.loads(result.stdout)
         self.assertEqual(value["pillNotConfigured"], "○ 跨订阅热切")
         self.assertIn("--remote-debugging-port=0", value["enableDialogMsg"])
@@ -1021,10 +1093,7 @@ process.stdin.on('end', () => {
         html = (ROOT / "Windows/ui/index.html").read_text(encoding="utf-8")
         self.assertIn('id="patrol-info"', html)
         self.assertIn('id="patrol-popover"', html)
-        result = subprocess.run(
-            [NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "patrol-info-popover"],
-            capture_output=True, timeout=5, check=True,
-        )
+        result = _run_bridge_driver("patrol-info-popover")
         value = json.loads(result.stdout)
         self.assertTrue(value["hiddenBefore"])
         self.assertFalse(value["hiddenOpen"])
@@ -1045,10 +1114,7 @@ process.stdin.on('end', () => {
         html = (ROOT / "Windows/ui/index.html").read_text(encoding="utf-8")
         self.assertIn('id="history-select-all"', html)
         self.assertIn('id="history-clear-sel"', html)
-        result = subprocess.run(
-            [NODE, "-e", BRIDGE_DRIVER, str(ROOT / "Windows/ui"), "history-multi-select"],
-            capture_output=True, timeout=5, check=True,
-        )
+        result = _run_bridge_driver("history-multi-select")
         value = json.loads(result.stdout)
         self.assertEqual(value["countAfterAll"], "2 候选 · 已选 2")
         self.assertEqual(value["menuLabels"], {
@@ -1076,6 +1142,73 @@ process.stdin.on('end', () => {
         start_calls = [c for c in value["calls"] if c["fn"] == "start"]
         self.assertEqual(start_calls[0]["value"]["download_bytes"], 20971520)
         self.assertEqual(start_calls[0]["value"]["mode"], "accurate")
+
+    def test_missing_group_guard_and_sticky_error_survive_refresh_and_poll(self):
+        result = _run_bridge_driver("sticky-error-and-group-guard")
+        value = json.loads(result.stdout)
+        self.assertIn("请先在上方选择策略组", value["statusAfterStart"])
+        self.assertTrue(value["errorAfterStart"])
+        self.assertTrue(value["groupFocused"])
+        self.assertTrue(value["groupAttention"])
+        self.assertTrue(value["stressDialogHidden"])
+        self.assertEqual(value["paramsPreserved"], ["4", "3145728", "fast"])
+        self.assertEqual(value["statusAfterPoll"], value["statusAfterStart"])
+        self.assertTrue(value["errorAfterPoll"])
+        self.assertFalse(value["attentionAfterPick"])
+        self.assertEqual(value["statusAfterBackendErr"], "后端拒绝示例")
+        self.assertTrue(value["errorAfterBackendErr"])
+        self.assertEqual(value["statusAfterBackendErrPoll"], "后端拒绝示例")
+        self.assertEqual(value["statusAfterNewBackend"], "测速已开始")
+        self.assertFalse(value["errorAfterNewBackend"])
+        self.assertEqual(len(value["calls"]), 1)
+
+    def test_graphite_theme_ten_column_layout_and_protocol_loss_sort(self):
+        html = (ROOT / "Windows/ui/index.html").read_text(encoding="utf-8")
+        css = (ROOT / "Windows/ui/styles.css").read_text(encoding="utf-8")
+        self.assertIn("Mihomo · Graphite", html)
+        self.assertNotIn("Clear Prism Glass", html)
+        self.assertNotIn("id=\"dock-start\"", html)
+        self.assertNotIn("id=\"dock-stop\"", html)
+        self.assertIn("prefers-color-scheme:dark", css)
+        for col_label in ("测速", "#", "订阅", "节点名称", "协议", "验证吞吐", "延迟", "丢包率", "抖动", "综合评分"):
+            self.assertIn(col_label, html)
+        rows = [
+            {"uid": "p1", "profile": "SubA", "name": "n-vless", "node_type": "vless", "state": "完成",
+             "eligible": True, "score": 80, "speed": 10, "latency": 40, "jitter": 2, "successes": 5, "selected": True},
+            {"uid": "p1", "profile": "SubA", "name": "n-hy2", "node_type": "hysteria2", "state": "完成",
+             "eligible": True, "score": 90, "speed": 15, "latency": 30, "jitter": 1, "successes": 6, "selected": True},
+            {"uid": "p1", "profile": "SubA", "name": "n-ss", "node_type": "ss", "state": "待测速",
+             "eligible": True, "score": None, "speed": None, "latency": None, "jitter": None, "successes": None, "selected": True},
+        ]
+        profiles = [{"uid": "p1", "selected": True}]
+        by_proto = json.loads(subprocess.run(
+            [NODE, "-e", DRIVER, str(ROOT / "Windows/ui/row_model.js")],
+            input=json.dumps({"rows": rows, "profiles": profiles, "options": {"sort": "node_type", "ascending": True}}).encode(),
+            capture_output=True, timeout=5, check=True,
+        ).stdout)
+        self.assertEqual(by_proto, ["n-hy2", "n-ss", "n-vless"])
+        by_loss = json.loads(subprocess.run(
+            [NODE, "-e", DRIVER, str(ROOT / "Windows/ui/row_model.js")],
+            input=json.dumps({"rows": rows, "profiles": profiles, "options": {"sort": "loss", "ascending": True}}).encode(),
+            capture_output=True, timeout=5, check=True,
+        ).stdout)
+        self.assertEqual(by_loss, ["n-hy2", "n-vless", "n-ss"])
+        search_proto = json.loads(subprocess.run(
+            [NODE, "-e", DRIVER, str(ROOT / "Windows/ui/row_model.js")],
+            input=json.dumps({"rows": rows, "profiles": profiles, "options": {"query": "hysteria2"}}).encode(),
+            capture_output=True, timeout=5, check=True,
+        ).stdout)
+        self.assertEqual(search_proto, ["n-hy2"])
+
+    def test_multi_profile_single_node_toggle_pure_retest_and_history_default(self):
+        result = _run_bridge_driver("multi-profile-node-toggle-and-history-default")
+        value = json.loads(result.stdout)
+        self.assertFalse(value["defaultSelectedOnly"])
+        sel_calls = [c["value"] for c in value["calls"] if c["fn"] == "set_selection"]
+        self.assertEqual(sel_calls[0], {"profiles": ["p"], "nodes": [{"uid": "p", "name": "other"}]})
+        self.assertEqual(sel_calls[1], {"profiles": ["p"], "nodes": []})
+        rt_calls = [c["value"] for c in value["calls"] if c["fn"] == "retest_node"]
+        self.assertEqual(rt_calls, [{"uid": "p", "name": "node", "auto_switch": False, "group": ""}])
 
 
 if __name__ == "__main__":
